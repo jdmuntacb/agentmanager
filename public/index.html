@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Manager</title>
+    <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">◆</span>
+        <h1>Agent Manager</h1>
+        <span id="conn" class="conn" title="Daemon connection">connecting…</span>
+      </div>
+      <div class="top-actions">
+        <input id="filter" type="search" placeholder="Filter agents" aria-label="Filter agents" />
+        <button id="new-btn" class="primary">+ New agents</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <div class="counts" id="counts"></div>
+        <ul id="agent-list" class="agent-list" aria-label="Agents"></ul>
+        <div id="empty" class="empty" hidden>
+          <p>No agents yet.</p>
+          <p>Add one or more intents and a repo or folder to get started.</p>
+        </div>
+      </aside>
+
+      <section class="detail" id="detail">
+        <div class="placeholder" id="placeholder">Select an agent to see its session, folder, repo, PRs and bugs.</div>
+        <div id="detail-body" hidden></div>
+        <div class="term-wrap" id="term-wrap" hidden>
+          <div class="term-bar">
+            <span id="term-title"></span>
+            <span class="spacer"></span>
+            <button id="term-fit" class="ghost small" title="Refit the terminal to the panel">Fit</button>
+            <button id="term-close" class="ghost small" title="Hide the terminal (the agent keeps running)">Hide terminal</button>
+          </div>
+          <div id="terminal" class="terminal"></div>
+          <div id="term-overlay" class="term-overlay" hidden>
+            <p>This agent's session is closed.</p>
+            <button id="term-resume" class="primary">Resume session</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="new-dialog">
+      <form id="new-form" method="dialog">
+        <h2>New agents</h2>
+        <label>
+          Intents <span class="hint">one per line; each gets its own agent</span>
+          <textarea name="intents" rows="6" required placeholder="Fix the flaky test in auth/login_test.go&#10;Add pagination to the /users API&#10;Investigate MB-12345 and open a PR with a fix"></textarea>
+        </label>
+        <div class="row">
+          <label>
+            Git repository URL
+            <input name="repo" placeholder="https://github.com/org/repo.git" />
+          </label>
+          <label>
+            or working folder
+            <input name="dir" placeholder="~/projects/my-repo" />
+          </label>
+        </div>
+        <div class="row">
+          <label>
+            Permission mode
+            <select name="permissionMode">
+              <option value="">Default</option>
+              <option value="acceptEdits">Accept edits</option>
+              <option value="plan">Plan</option>
+              <option value="auto">Auto</option>
+              <option value="bypassPermissions">Bypass permissions</option>
+            </select>
+          </label>
+          <label>
+            Model <span class="hint">optional</span>
+            <input name="model" placeholder="e.g. opus" />
+          </label>
+        </div>
+        <label class="check">
+          <input type="checkbox" name="worktree" />
+          Give each agent its own git worktree and branch <span class="hint">(always on when cloning a repo URL, and when several intents share a folder)</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="start" checked />
+          Launch immediately
+        </label>
+        <p id="new-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="new-cancel" class="ghost">Cancel</button>
+          <button type="submit" class="primary">Create agents</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
