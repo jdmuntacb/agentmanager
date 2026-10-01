@@ -60,7 +60,8 @@ export class Backlog extends EventEmitter {
     });
     const projects = {};
     for (const it of items) {
-      const p = (projects[it.projectKey] ??= { key: it.projectKey, name: it.projectName, limit: this.limitFor(it.projectKey), counts: {} });
+      const shortcut = Object.values(this.store.data.projects ?? {}).find((x) => x.key === it.projectKey)?.shortcut ?? null;
+      const p = (projects[it.projectKey] ??= { key: it.projectKey, name: it.projectName, shortcut, limit: this.limitFor(it.projectKey), counts: {} });
       p.counts[it.status] = (p.counts[it.status] ?? 0) + 1;
     }
     return {
@@ -90,6 +91,16 @@ export class Backlog extends EventEmitter {
     const list = titles.map((t) => String(t ?? '').trim()).filter(Boolean);
     if (!list.length) throw err(400, 'At least one item is required');
     const pr = parsePriority(priority);
+    // A project shortcut fills in the repo / folder / base branch.
+    const entry = project ? this.manager.resolveProject(project) : null;
+    if (entry) {
+      if (!repo && !dir) {
+        repo = entry.repo ?? undefined;
+        dir = entry.dir ?? undefined;
+      }
+      base ??= entry.base ?? undefined;
+      project = entry.key.startsWith('custom:') ? entry.name : undefined;
+    }
     const p = projectOf({ project: project?.trim() || null, repo: repo?.trim() || null, requestedDir: dir?.trim() || null });
     const order = Math.max(0, ...Object.values(this.data.items).map((i) => i.order ?? 0)) + 1;
     const added = list.map((title, i) => {
@@ -165,7 +176,10 @@ export class Backlog extends EventEmitter {
     if (typeof autoRun === 'boolean') this.data.autoRun = autoRun;
     if (limits && typeof limits === 'object') Object.assign(this.data.limits, limits);
     if (project !== undefined && limit !== undefined) {
-      const key = this.items().find((x) => x.projectKey === project || x.projectName === project)?.projectKey ?? project;
+      const key =
+        this.manager.resolveProject(project)?.key ??
+        this.items().find((x) => x.projectKey === project || x.projectName === project)?.projectKey ??
+        project;
       const n = Number(limit);
       if (!(n >= 0 && n <= 20)) throw err(400, 'limit must be 0-20');
       this.data.limits[key] = n;
@@ -286,7 +300,7 @@ export class Backlog extends EventEmitter {
 
   /** Start queued items wherever a project has a free slot (and the global cap allows). */
   async dispatch() {
-    if (!this.data.autoRun || this.dispatching) return [];
+    if (!this.data.autoRun || this.dispatching || this.manager.closing) return [];
     this.dispatching = true;
     try {
       const started = [];

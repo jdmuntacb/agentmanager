@@ -16,6 +16,7 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
   - **Problem**, **Solution**, a **design / flow diagram** (Mermaid) and **Checks** (passed / failed / running / pending);
   - when the intent links a Jira issue, **References** with its **PRD** and **Tech Spec** links and the points that matter.
 - **Projects.** The sidebar is a tree, project → agents, so you see how many projects are in flight and how many parallel sessions each has.
+- **Project shortcuts.** Each project gets a short name, such as `cc` for couchbase-cloud. Use it instead of the repo URL: `agentmgr add @cc "…"`, `agentmgr ls cc`, `@cc` in the UI filter.
 - **Backlog.** Queue asks as work orders. Agents pick them up one by one, up to N in parallel per project, until each is done. You accept or reopen each one.
 - **Slack alerts.** A message in your channel when an agent needs input, finishes a backlog item, or fails.
 - **Priority.** Mark agents P0–P3. P0 and P1 are highlighted, and lists sort by priority.
@@ -53,7 +54,9 @@ agentmgr add -f intents.txt -r git@github.com:org/repo.git -p acceptEdits
 agentmgr add --plan -a -r https://github.com/org/big-repo.git "Fix MB-123"   # plan with Claude while it clones
 agentmgr add -d ~/src/big-repo -w -b release-1 "Backport the fix"          # worktree of your clone, branched from release-1
 
-agentmgr ls                                   # status, branch, PR/bug counts, session
+agentmgr ls [cc]                              # status, branch, PR/bug counts, session (optionally one project)
+agentmgr add @cc "Fix the flaky test"         # use a project shortcut instead of -r / -d
+agentmgr project ls | add | rename | base | rm  # manage project shortcuts
 agentmgr show <agent>                         # everything tracked for one agent
 agentmgr attach <agent>                       # live terminal here; Ctrl-] detaches (resumes a closed agent)
 agentmgr shell <agent>                        # a shell in the agent's folder; Ctrl-] detaches
@@ -272,6 +275,15 @@ The sidebar groups agents into projects, shown as a tree:
   - General sessions under *General*, scratch work under *Other*.
   - Set your own name with `--project` or the ✎ next to *Project* in the agent's Workspace card.
 - **Counts.** Each project shows running/total agents and how many need input.
+- **Shortcuts.** Every project gets a **shortcut**, shown as a badge in the tree.
+  - **Assignment:** from the name's initials (`couchbase-cloud` → `cc`, `ai-gateway` → `ag`) or its first letters (`agentmanager` → `age`), with a number added when two would clash. Click the badge, or run `agentmgr project rename cc cbc`, to change it.
+  - **Where it works:**
+    - `agentmgr add @cc "…"` or `--project cc` uses the project's repo or clone and its default base branch. A local clone always gets a new worktree.
+    - `agentmgr ls cc` lists that project.
+    - Type `@cc` in the UI filter to show just it.
+    - The New agents **Project** field suggests your shortcuts.
+    - `backlog add --project cc` queues work for it.
+  - **Ahead of time:** register a project before it has agents with `agentmgr project add cc -r <url> [-b main]`. Set a default base branch with `agentmgr project base cc release-1`.
 - **Ordering.** Projects needing you sort first. Collapsed projects stay collapsed.
 - **CLI.** `agentmgr ls` groups by project too.
 

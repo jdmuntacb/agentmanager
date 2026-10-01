@@ -111,6 +111,21 @@ export function projectOf(agent) {
   return { key: 'other', name: 'Other', source: 'other' };
 }
 
+/** A short, memorable shortcut for a project name: initials of its parts, or its first letters. */
+export function suggestShortcut(name, taken = new Set()) {
+  const parts = String(name ?? '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  let base = parts.length > 1 ? parts.map((p) => p[0]).join('').slice(0, 4) : (parts[0] ?? 'p').slice(0, 3);
+  if (base.length < 2) base = (parts.join('') || 'proj').slice(0, 3);
+  let candidate = base;
+  for (let i = 2; taken.has(candidate); i++) candidate = `${base}${i}`;
+  return candidate;
+}
+
+export const validShortcut = (s) => /^[a-z][a-z0-9-]{0,15}$/.test(s);
+
 export function slugify(text, max = 30) {
   return (
     text
@@ -176,6 +191,9 @@ export class AgentManager extends EventEmitter {
       }
     }
     this.preparing = new Map(); // agent id -> { controller, done } for workspace setup in flight
+    // Project shortcuts ("cc" -> couchbase-cloud), keyed by shortcut; every project gets one.
+    store.data.projects ??= {};
+    for (const agent of store.list()) this.registerProject(agent);
 
     this.timer = setInterval(() => this.tick(), 1000);
     this.timer.unref();
@@ -208,7 +226,7 @@ export class AgentManager extends EventEmitter {
     return {
       ...agent,
       priority: agent.priority ?? 2,
-      projectInfo: projectOf(agent),
+      projectInfo: this.projectInfo(agent),
       usage,
       // Claude Code's own cost figure from the transcripts (absent until it records one).
       costUsd: costs.length ? costs.reduce((a, b) => a + b, 0) : null,
@@ -234,6 +252,119 @@ export class AgentManager extends EventEmitter {
     const agent = this.store.patch(id, fields);
     if (agent) this.changed(agent);
     return agent;
+  }
+
+  // --------------------------------------------------------------- projects
+
+  projectInfo(agent) {
+    const info = projectOf(agent);
+    const entry = Object.values(this.store.data.projects).find((p) => p.key === info.key);
+    return { ...info, shortcut: entry?.shortcut ?? null };
+  }
+
+  /** Make sure the agent's project has a shortcut; remember where it lives for "add @cc". */
+  registerProject(agent) {
+    if (!agent || agent.kind === 'general') return null;
+    const info = projectOf(agent);
+    if (info.key === 'other') return null;
+    const reg = this.store.data.projects;
+    let entry = Object.values(reg).find((p) => p.key === info.key);
+    if (!entry) {
+      const shortcut = suggestShortcut(info.name, new Set(Object.keys(reg)));
+      entry = reg[shortcut] = { shortcut, name: info.name, key: info.key, repo: null, dir: null, base: null, auto: true, createdAt: now() };
+    }
+    let changed = !entry.updatedAt;
+    const fill = { repo: agent.repo && git.isRemoteUrl(agent.repo) ? agent.repo : null, dir: agent.repo ? null : agent.sourceDir || agent.requestedDir || null };
+    for (const [k, v] of Object.entries(fill)) {
+      if (v && !entry[k]) {
+        entry[k] = v;
+        changed = true;
+      }
+    }
+    if (changed) {
+      entry.updatedAt = now();
+      this.store.save();
+    }
+    return entry;
+  }
+
+  /** Find a project by shortcut, name or full name (case-insensitive). */
+  resolveProject(ref) {
+    const r = String(ref ?? '').trim().replace(/^@/, '').toLowerCase();
+    if (!r) return null;
+    const all = Object.values(this.store.data.projects);
+    return all.find((p) => p.shortcut === r) ?? all.find((p) => p.name.toLowerCase() === r) ?? null;
+  }
+
+  listProjects() {
+    const agents = this.store.list();
+    return Object.values(this.store.data.projects)
+      .map((p) => {
+        const mine = agents.filter((a) => projectOf(a).key === p.key);
+        return { ...p, agents: mine.length, running: mine.filter((a) => this.runtimes.get(a.id)?.pty).length };
+      })
+      .sort((a, b) => a.shortcut.localeCompare(b.shortcut));
+  }
+
+  /** Register a project ahead of time: `{ shortcut, name?, repo? | dir?, base? }`. */
+  addProject({ shortcut, name, repo, dir, base }) {
+    const sc = String(shortcut ?? '').trim().toLowerCase();
+    if (!validShortcut(sc)) throw Object.assign(new Error('Shortcut: 1-16 lowercase letters, digits or "-", starting with a letter'), { status: 400 });
+    if (this.store.data.projects[sc]) throw Object.assign(new Error(`Shortcut "${sc}" is taken`), { status: 409 });
+    if (!repo && !dir && !name) throw Object.assign(new Error('Give a repo URL, a folder, or a name'), { status: 400 });
+    const pseudo = { project: repo || dir ? null : name, repo: repo || null, requestedDir: dir ? path.resolve(expandHome(dir)) : null };
+    const info = projectOf(pseudo);
+    const clash = Object.values(this.store.data.projects).find((p) => p.key === info.key);
+    if (clash) throw Object.assign(new Error(`That project already has the shortcut "${clash.shortcut}"`), { status: 409 });
+    this.store.data.projects[sc] = {
+      shortcut: sc,
+      name: name || info.name,
+      key: info.key,
+      repo: repo || null,
+      dir: pseudo.requestedDir,
+      base: base || null,
+      auto: false,
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    this.store.save();
+    this.emitAll();
+    return this.store.data.projects[sc];
+  }
+
+  updateProject(ref, { shortcut, base }) {
+    const entry = this.resolveProject(ref);
+    if (!entry) throw Object.assign(new Error(`No project "${ref}"`), { status: 404 });
+    const reg = this.store.data.projects;
+    if (shortcut !== undefined && shortcut !== entry.shortcut) {
+      const sc = String(shortcut).trim().toLowerCase();
+      if (!validShortcut(sc)) throw Object.assign(new Error('Shortcut: 1-16 lowercase letters, digits or "-", starting with a letter'), { status: 400 });
+      if (reg[sc]) throw Object.assign(new Error(`Shortcut "${sc}" is taken`), { status: 409 });
+      delete reg[entry.shortcut];
+      entry.shortcut = sc;
+      reg[sc] = entry;
+    }
+    if (base !== undefined) entry.base = base || null;
+    entry.auto = false;
+    entry.updatedAt = now();
+    this.store.save();
+    this.emitAll();
+    return entry;
+  }
+
+  removeProject(ref) {
+    const entry = this.resolveProject(ref);
+    if (!entry) throw Object.assign(new Error(`No project "${ref}"`), { status: 404 });
+    delete this.store.data.projects[entry.shortcut];
+    this.store.save();
+    this.emitAll();
+    return { shortcut: entry.shortcut };
+  }
+
+  /** Re-broadcast every agent (their project shortcut may have changed). */
+  emitAll() {
+    for (const a of this.store.list()) this.changed(a);
+    this.emit('projects', this.listProjects());
   }
 
   // --------------------------------------------------------------- creation
@@ -271,6 +402,18 @@ export class AgentManager extends EventEmitter {
   }) {
     intent = (intent ?? '').trim();
     const general = kind === 'general';
+    // A project shortcut (or name) fills in the repo / folder / base branch.
+    const entry = !general && project ? this.resolveProject(project) : null;
+    if (entry) {
+      if (!repo && !dir) {
+        repo = entry.repo ?? undefined;
+        dir = entry.dir ?? undefined;
+        // Agents started from a project's own clone always get their own worktree.
+        if (dir) worktree = true;
+      }
+      base ??= entry.base ?? undefined;
+      project = entry.key.startsWith('custom:') ? entry.name : null;
+    }
     if (!intent && !general) throw Object.assign(new Error('Intent is required'), { status: 400 });
     const id = crypto.randomBytes(3).toString('hex');
     const sessionId = crypto.randomUUID();
@@ -316,6 +459,7 @@ export class AgentManager extends EventEmitter {
     for (const pr of refs.prs) agent.prs[pr.url] = { ...pr, source: 'intent' };
     for (const bug of refs.bugs) agent.bugs[bug.key] = { ...bug, source: 'intent' };
     this.store.put(agent);
+    this.registerProject(agent);
     this.changed(agent);
 
     this.prepare(agent, { start }).catch(() => {});
@@ -356,7 +500,9 @@ export class AgentManager extends EventEmitter {
           progress: null,
           setupInterrupted: undefined,
         });
+        this.registerProject(this.store.get(agent.id));
         const rt = this.runtimes.get(agent.id);
+        if (this.closing) return; // shutting down: it resumes on the next start (desired is kept)
         if (rt?.pty && rt.planning) this.maybeHandoff(agent.id).catch(() => {});
         else if (this.store.get(agent.id)?.desired === 'running') this.start(agent.id);
       } catch (err) {
@@ -492,6 +638,7 @@ export class AgentManager extends EventEmitter {
    */
   start(ref, { fresh = false, sessionId } = {}) {
     const agent = this.mustGet(ref);
+    if (this.closing) throw Object.assign(new Error('Agent Manager is shutting down'), { status: 503 });
     const live = this.runtimes.get(agent.id);
     if (live?.pty) {
       // "Start" on a planning session whose workspace is ready means: move it into the repo.
@@ -753,7 +900,9 @@ export class AgentManager extends EventEmitter {
   }
 
   /** Daemon shutdown: close everything but remember which agents should come back. */
-  async stopAll() {
+  async stopAll({ final = false } = {}) {
+    // On a real shutdown, a workspace that finishes preparing afterwards must not launch its agent.
+    if (final) this.closing = true;
     for (const id of this.shells.keys()) this.closeShell(id);
     await Promise.all(
       [...this.runtimes.entries()].filter(([, rt]) => rt.pty).map(([id]) => this.stop(id, { keepDesired: true })),

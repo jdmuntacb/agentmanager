@@ -120,6 +120,8 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
   background: var(--panel-2); font-weight: 600; text-align: left; position: sticky; top: 0; z-index: 1;
 }
 .project-head:hover { border: 0; filter: brightness(0.97); }
+.shortcut { flex: none; font: 600 11px/16px var(--mono); padding: 0 6px; border-radius: 4px; background: var(--accent); color: var(--accent-text); cursor: pointer; }
+.bl-head .shortcut { cursor: default; }
 .project-head .caret { width: 12px; color: var(--muted); flex: none; }
 .project-head .pname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-head .pcounts { display: flex; gap: 6px; align-items: center; color: var(--muted); font-weight: 500; font-size: 12px; }

@@ -198,6 +198,12 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     }),
   );
 
+  // ---------------------------------------------------------- project shortcuts
+  api.get('/projects', wrap(() => manager.listProjects()));
+  api.post('/projects', wrap((req) => manager.addProject(req.body ?? {})));
+  api.patch('/projects/:ref', wrap((req) => manager.updateProject(req.params.ref, req.body ?? {})));
+  api.delete('/projects/:ref', wrap((req) => manager.removeProject(req.params.ref)));
+
   // ---------------------------------------------------------- backlog
   api.get('/backlog', wrap(() => backlog.view()));
   api.post(
@@ -324,7 +330,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   const eventSinks = new Set();
   api.get('/events/stream', (req, res) => {
     const send = sse(req, res);
-    send({ t: 'snapshot', agents: manager.list(), backlog: backlog.view() });
+    send({ t: 'snapshot', agents: manager.list(), backlog: backlog.view(), projects: manager.listProjects() });
     eventSinks.add(send);
     req.on('close', () => eventSinks.delete(send));
   });
@@ -412,12 +418,16 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   manager.on('change', (agent) => broadcast({ t: 'agent', agent }));
   manager.on('removed', (id) => broadcast({ t: 'removed', id }));
   backlog.on('change', (view) => broadcast({ t: 'backlog', backlog: view }));
+  manager.on('projects', (projects) => {
+    broadcast({ t: 'projects', projects });
+    broadcast({ t: 'backlog', backlog: backlog.view() });
+  });
 
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, 'http://x');
     if (url.pathname === '/ws/events') {
       eventClients.add(ws);
-      ws.send(JSON.stringify({ t: 'snapshot', agents: manager.list(), backlog: backlog.view() }));
+      ws.send(JSON.stringify({ t: 'snapshot', agents: manager.list(), backlog: backlog.view(), projects: manager.listProjects() }));
       ws.on('close', () => eventClients.delete(ws));
       return;
     }
@@ -495,7 +505,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     if (closing) return;
     closing = true;
     console.log(`[agentmgr] shutting down (${reason}); closing agents so their sessions are saved`);
-    await manager.stopAll();
+    await manager.stopAll({ final: true });
     await manager.flush().catch((err) => console.error(`[agentmgr] final flush failed: ${err.message}`));
     try {
       if (fs.readFileSync(paths.pid, 'utf8').trim() === String(process.pid)) fs.unlinkSync(paths.pid);

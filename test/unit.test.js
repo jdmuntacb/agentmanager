@@ -250,3 +250,17 @@ test('parseBrief reads the status line', async () => {
   assert.equal(parseBrief('**Status:** Blocked\n## Problem\nx').status, 'blocked');
   assert.equal(parseBrief('## Problem\nStatus: done is not the status line').status, null);
 });
+
+test('suggestShortcut makes short, unique project shortcuts', async () => {
+  const { suggestShortcut } = await import('../src/manager.js');
+  const taken = new Set();
+  const take = (n) => {
+    const s = suggestShortcut(n, taken);
+    taken.add(s);
+    return s;
+  };
+  assert.equal(take('couchbase-cloud'), 'cc');
+  assert.equal(take('ai-gateway'), 'ag');
+  assert.equal(take('agentmanager'), 'age');
+  assert.equal(take('code-coverage'), 'cc2', 'collisions get a number');
+});

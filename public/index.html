@@ -118,8 +118,9 @@
           </label>
         </div>
         <label>
-          Project <span class="hint">optional; agents are grouped by their repo unless you name a project</span>
-          <input name="project" placeholder="(from the repo)" />
+          Project <span class="hint">optional; a shortcut like <code>cc</code> fills in its repo, or name a new project</span>
+          <input name="project" placeholder="shortcut or name (default: from the repo)" list="project-options" autocomplete="off" />
+          <datalist id="project-options"></datalist>
         </label>
         <label>
           Base branch <span class="hint">optional; each agent branches from this. Default: the repo's default branch, freshly fetched</span>

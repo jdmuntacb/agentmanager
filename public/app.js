@@ -7,6 +7,7 @@ import { openStream, post, REMOTE } from '/transport.js';
 const $ = (sel) => document.querySelector(sel);
 const agents = new Map();
 let backlogState = { items: [], projects: [], autoRun: true, defaultLimit: 2 };
+let projectsState = [];
 let sideTab = 'agents';
 let showCompleted = false;
 // #<id> selects an agent; #<id>/term also opens its terminal.
@@ -426,6 +427,7 @@ function projectGroups(list) {
   for (const a of list) {
     const p = a.projectInfo ?? { key: 'other', name: 'Other' };
     if (!groups.has(p.key)) groups.set(p.key, { ...p, agents: [] });
+    if (p.shortcut) groups.get(p.key).shortcut = p.shortcut;
     groups.get(p.key).agents.push(a);
   }
   const out = [...groups.values()];
@@ -452,10 +454,16 @@ function projectGroups(list) {
 function renderList() {
   const waiting = [...agents.values()].filter((a) => a.runtime.attention).length;
   document.title = waiting ? `(${waiting}) Agent Manager` : 'Agent Manager';
-  const list = [...agents.values()].filter(
-    (a) =>
-      !filterText ||
-      `${a.name} ${a.intent} ${a.repo ?? ''} ${a.workdir ?? ''} ${a.id} ${a.projectInfo?.name ?? ''}`.toLowerCase().includes(filterText),
+  // "@cc" shows one project; any other text also matches shortcuts.
+  const at = filterText.startsWith('@') ? filterText.slice(1) : null;
+  const list = [...agents.values()].filter((a) =>
+    !filterText
+      ? true
+      : at !== null
+        ? (a.projectInfo?.shortcut ?? '') === at || (at && (a.projectInfo?.shortcut ?? '').startsWith(at))
+        : `${a.name} ${a.intent} ${a.repo ?? ''} ${a.workdir ?? ''} ${a.id} ${a.projectInfo?.name ?? ''} ${a.projectInfo?.shortcut ?? ''}`
+            .toLowerCase()
+            .includes(filterText),
   );
   $('#empty').hidden = agents.size > 0;
 
@@ -475,6 +483,7 @@ function renderList() {
       return `<li class="project ${open ? 'open' : ''}">
         <button class="project-head" data-toggle="${esc(g.key)}" aria-expanded="${open}" title="${esc(g.full || g.name)}">
           <span class="caret">${open ? '▾' : '▸'}</span>
+          ${g.shortcut ? `<span class="shortcut" data-rename="${esc(g.shortcut)}" title="Shortcut: type @${esc(g.shortcut)} to filter, or use it as the project when adding agents (click to rename)">${esc(g.shortcut)}</span>` : ''}
           <span class="pname">${esc(g.label)}</span>
           <span class="pcounts">
             ${g.top <= 1 ? prioChip(g.top) : ''}
@@ -529,6 +538,7 @@ function renderBacklog() {
             const p = proj[g.key] ?? { limit: backlogState.defaultLimit };
             return `<li class="project open">
               <div class="project-head bl-head">
+                ${p.shortcut ? `<span class="shortcut">${esc(p.shortcut)}</span>` : ''}
                 <span class="pname">${esc(g.name)}</span>
                 <button class="link" data-bl="limit" data-project="${esc(g.key)}" data-name="${esc(g.name)}" title="How many items of this project agents work on at once">${p.limit} at a time ✎</button>
               </div>
@@ -978,6 +988,14 @@ $('#counts').addEventListener('click', (e) => {
 });
 
 $('#agent-list').addEventListener('click', (e) => {
+  const rename = e.target.closest('[data-rename]');
+  if (rename) {
+    e.stopPropagation();
+    const old = rename.dataset.rename;
+    const next = prompt(`New shortcut for this project (lowercase letters, digits, "-"):`, old);
+    if (!next || next === old) return;
+    return act(() => api('PATCH', `/projects/${encodeURIComponent(old)}`, { shortcut: next.trim().toLowerCase() }), `Shortcut is now ${next}`);
+  }
   const head = e.target.closest('[data-toggle]');
   if (head) {
     const key = head.dataset.toggle;
@@ -1142,7 +1160,14 @@ $('#filter').addEventListener('input', (e) => {
 // ------------------------------------------------------------------ new agents dialog
 
 const dialog = $('#new-dialog');
+function renderProjectOptions() {
+  $('#project-options').innerHTML = projectsState
+    .map((p) => `<option value="${esc(p.shortcut)}">${esc(p.name)}${p.repo ? ` · ${esc(p.repo)}` : p.dir ? ` · ${esc(p.dir)}` : ''}</option>`)
+    .join('');
+}
+
 function openNewDialog(mode = 'now') {
+  renderProjectOptions();
   $('#new-error').hidden = true;
   dialog.querySelector(`input[name="when"][value="${mode}"]`).checked = true;
   syncWhen();
@@ -1260,6 +1285,7 @@ function handleEvent(msg) {
     agents.clear();
     msg.agents.forEach((a) => agents.set(a.id, a));
     if (msg.backlog) backlogState = msg.backlog;
+    if (msg.projects) projectsState = msg.projects;
     msg.agents.forEach(watchDocs);
     if (selectedId && !agents.has(selectedId)) selectedId = null;
     if (openTermOnLoad && selectedId) {
@@ -1275,6 +1301,9 @@ function handleEvent(msg) {
     if (selectedId === msg.id) select(null);
   } else if (msg.t === 'backlog') {
     backlogState = msg.backlog;
+  } else if (msg.t === 'projects') {
+    projectsState = msg.projects;
+    renderProjectOptions();
   }
   render();
 }

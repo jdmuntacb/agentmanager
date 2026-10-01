@@ -227,7 +227,7 @@ export async function main(argv) {
   program
     .command('add')
     .description('Spawn one agent per intent')
-    .argument('[intents...]', 'intents, each a quoted string')
+    .argument('[intents...]', 'intents, each a quoted string; start with @<shortcut> to use a project, e.g. @cc')
     .option('-r, --repo <url>', 'git repository URL to clone (each agent gets its own worktree)')
     .option('-d, --dir <path>', 'existing working folder')
     .option('-f, --file <path>', 'read intents from a file, one per line ("-" for stdin)')
@@ -251,6 +251,7 @@ export async function main(argv) {
     .option('--no-start', 'create without launching')
     .option('-a, --attach', 'attach to the agent after launch (single intent only)')
     .action(async (intents, opts, cmd) => {
+      if (intents[0]?.startsWith('@')) opts.project ??= intents.shift().slice(1);
       if (opts.file) intents = [...intents, ...readIntentsFile(opts.file)];
       if (!intents.length) throw new Error('Give at least one intent, or --file');
       await daemon();
@@ -409,6 +410,64 @@ export async function main(argv) {
     .action(async (ref) => {
       await daemon();
       await attach(ref, { kind: 'shell' });
+    });
+
+  const projCmd = program.command('project').description('Project shortcuts: short names like "cc" for repos you work on');
+  projCmd
+    .command('ls')
+    .alias('list')
+    .description('List projects and their shortcuts')
+    .action(async () => {
+      await daemon();
+      const ps = await api('GET', '/projects');
+      if (!ps.length) return console.log(dim('No projects yet. They appear as you add agents, or: agentmgr project add cc -r <repo-url>'));
+      table(
+        ps.map((p) => [bold(p.shortcut), p.name, `${p.running}/${p.agents}`, p.repo ?? p.dir ?? dim('(name only)'), p.base ?? '']),
+        ['SHORTCUT', 'PROJECT', 'RUNNING', 'REPO / FOLDER', 'BASE'],
+      );
+      console.log(dim('\nUse a shortcut: agentmgr add @cc "intent"   ·   agentmgr ls cc   ·   @cc in the UI filter'));
+    });
+  projCmd
+    .command('add')
+    .description('Register a project shortcut ahead of time')
+    .argument('<shortcut>')
+    .option('-r, --repo <url>', 'git repository URL')
+    .option('-d, --dir <path>', 'local clone or folder')
+    .option('-b, --base <ref>', 'default base branch for its agents')
+    .option('-n, --name <name>', 'display name')
+    .action(async (shortcut, opts) => {
+      await daemon();
+      const p = await api('POST', '/projects', { shortcut, ...opts });
+      console.log(`${green('+')} ${bold(p.shortcut)} → ${p.name} ${dim(p.repo ?? p.dir ?? '')}`);
+    });
+  projCmd
+    .command('rename')
+    .description('Change a project shortcut')
+    .argument('<shortcut>')
+    .argument('<new>')
+    .action(async (sc, next) => {
+      await daemon();
+      const p = await api('PATCH', `/projects/${encodeURIComponent(sc)}`, { shortcut: next });
+      console.log(`${bold(p.shortcut)} → ${p.name}`);
+    });
+  projCmd
+    .command('base')
+    .description('Set the default base branch for a project (empty to clear)')
+    .argument('<shortcut>')
+    .argument('[ref]')
+    .action(async (sc, ref) => {
+      await daemon();
+      const p = await api('PATCH', `/projects/${encodeURIComponent(sc)}`, { base: ref ?? '' });
+      console.log(`${bold(p.shortcut)} base: ${p.base ?? dim('(repo default branch)')}`);
+    });
+  projCmd
+    .command('rm')
+    .description('Forget a shortcut (agents are not touched; a new shortcut is assigned when one is next used)')
+    .argument('<shortcut>')
+    .action(async (sc) => {
+      await daemon();
+      await api('DELETE', `/projects/${encodeURIComponent(sc)}`);
+      console.log(`removed ${sc}`);
     });
 
   const bl = program.command('backlog').description('Work orders that agents pick up one by one, per project, until done');
@@ -671,14 +730,19 @@ export async function main(argv) {
   program
     .command('ls')
     .alias('list')
-    .description('List agents')
+    .description('List agents, grouped by project (optionally just one project by shortcut or name)')
+    .argument('[project]', 'project shortcut or name, e.g. cc')
     .option('--json', 'machine-readable output')
-    .action(async (opts) => {
+    .action(async (project, opts) => {
       await daemon();
-      const agents = await api('GET', '/agents');
+      let agents = await api('GET', '/agents');
+      if (project) {
+        const p = project.replace(/^@/, '').toLowerCase();
+        agents = agents.filter((a) => a.projectInfo?.shortcut === p || a.projectInfo?.name?.toLowerCase() === p);
+      }
       if (opts.json) return console.log(JSON.stringify(agents, null, 2));
       if (!agents.length) return console.log('No agents yet. Try: agentmgr add "fix the flaky login test" -d .');
-      const proj = (a) => a.projectInfo?.name ?? 'Other';
+      const proj = (a) => (a.projectInfo?.shortcut ? `${a.projectInfo.name} [${a.projectInfo.shortcut}]` : (a.projectInfo?.name ?? 'Other'));
       const order = (p) => (p === 'General' ? 1 : p === 'Other' ? 2 : 0);
       agents.sort(
         (a, b) =>
@@ -691,7 +755,7 @@ export async function main(argv) {
       console.log(dim(`${groups.size} project${groups.size === 1 ? '' : 's'}, ${agents.length} agents, ${agents.filter((a) => a.runtime.running).length} running`));
       table(
         agents.map((a, i) => [
-          i === 0 || proj(agents[i - 1]) !== proj(a) ? bold(truncate(proj(a), 24)) : '',
+          i === 0 || proj(agents[i - 1]) !== proj(a) ? bold(truncate(proj(a), 30)) : '',
           a.priority === 0 ? red(bold('P0')) : a.priority === 1 ? red('P1') : a.priority === 3 ? dim('P3') : 'P2',
           a.id,
           truncate(a.kind === 'general' ? `${a.name} (general)` : a.name, 28),

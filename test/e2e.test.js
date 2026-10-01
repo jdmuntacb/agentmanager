@@ -55,7 +55,8 @@ const agentNow = async (id) => (await call('GET', `/agents/${id}`)).body;
 const launches = () => (fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, 'utf8') : '').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
 
 test.after(async () => {
-  await manager.stopAll();
+  await manager.stopAll({ final: true });
+  server.closeAllConnections?.();
   server.close();
 });
 
@@ -925,4 +926,38 @@ test('documents in the background: returns at once, all four, at most two Claude
   // A single kind in the background too.
   assert.ok((await call('POST', `/agents/${a.id}/docs/design?background=1`)).body.docs.design.pending);
   await waitFor(async () => !(await agentNow(a.id)).docs.design.pending, 10000, 'design rewritten');
+});
+
+test('project shortcuts: auto-assigned, "@cc"-style use fills the repo, rename, register ahead, backlog', async () => {
+  const origin = makeOrigin('short-cut');
+  const url = `file://${origin}`;
+  const [a] = (await call('POST', '/agents', { intent: 'First on the repo', repo: url, start: false })).body;
+  const ready = await waitFor(async () => ((await agentNow(a.id)).status === 'stopped' ? agentNow(a.id) : null), 15000, 'ready');
+  const sc = ready.projectInfo.shortcut;
+  assert.equal(sc, 'sc', 'short-cut -> sc');
+  const listed = (await call('GET', '/projects')).body.find((p) => p.shortcut === sc);
+  assert.equal(listed.repo, url);
+
+  // Use the shortcut instead of the repo URL.
+  const [b] = (await call('POST', '/agents', { intent: 'Second via shortcut', project: '@sc', start: false })).body;
+  const b2 = await waitFor(async () => ((await agentNow(b.id)).status === 'stopped' ? agentNow(b.id) : null), 15000, 'second ready');
+  assert.equal(b2.repo, url);
+  assert.equal(b2.projectInfo.key, ready.projectInfo.key, 'same project');
+  assert.equal(b2.project, null, 'not turned into a custom project name');
+
+  // Rename; agents follow.
+  assert.equal((await call('PATCH', `/projects/${sc}`, { shortcut: 'Bad Name' })).status, 400);
+  assert.equal((await call('PATCH', `/projects/${sc}`, { shortcut: 'shc' })).body.shortcut, 'shc');
+  assert.equal((await agentNow(a.id)).projectInfo.shortcut, 'shc');
+
+  // Register ahead of time and use it from the backlog.
+  const origin2 = makeOrigin('later-proj');
+  assert.equal((await call('POST', '/projects', { shortcut: 'lp', repo: `file://${origin2}`, base: 'main' })).status, 200);
+  assert.equal((await call('POST', '/projects', { shortcut: 'lp', repo: 'https://x/y.git' })).status, 409);
+  await call('POST', '/backlog/settings', { autoRun: false }); // only checking how it is queued
+  const [it] = (await call('POST', '/backlog', { items: ['queued via shortcut'], project: 'lp' })).body;
+  assert.equal(it.repo, `file://${origin2}`);
+  assert.equal(it.base, 'main');
+  await call('POST', `/backlog/${it.id}/cancel`);
+  await call('POST', '/backlog/settings', { autoRun: true });
 });
