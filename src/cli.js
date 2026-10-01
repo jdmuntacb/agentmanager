@@ -217,6 +217,9 @@ export async function main(argv) {
     .action(async () => {
       await daemon();
       console.log(BASE);
+      const st = await api('GET', '/remote').catch(() => null);
+      const phone = st?.running ? st.urls.find((u) => !u.vpn) : null;
+      if (phone) console.log(dim(`phone: ${phone.url}  (sign-in QR: agentmgr remote status)`));
       execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [BASE], () => {});
     });
 
@@ -228,6 +231,7 @@ export async function main(argv) {
     .option('-d, --dir <path>', 'existing working folder')
     .option('-f, --file <path>', 'read intents from a file, one per line ("-" for stdin)')
     .option('-n, --name <name>', 'display name')
+    .option('--project <name>', 'group under this project (default: from the repo)')
     .option('-w, --worktree', 'give each agent its own git worktree of --dir')
     .option('-b, --base <ref>', "branch each agent from this branch, tag or SHA (default: the repo's default branch, fetched)")
     .option('--no-worktree', 'run all agents directly in --dir')
@@ -257,6 +261,7 @@ export async function main(argv) {
         name: opts.name,
         worktree: worktreeSource === 'cli' ? opts.worktree : undefined,
         base: opts.base,
+        project: opts.project,
         permissionMode: opts.permissionMode,
         model: opts.model,
         start: opts.start,
@@ -307,7 +312,7 @@ export async function main(argv) {
 
   program
     .command('explain')
-    .description("Explain the agent's intent, problem and solution in plain language (one-off Claude call)")
+    .description('Brief me on what the agent is doing: ask, status, planned work, solution, conclusions, needs (one-off Claude call)')
     .argument('<agent>')
     .action(async (ref) => {
       await daemon();
@@ -346,6 +351,166 @@ export async function main(argv) {
     .action(async (ref) => {
       await daemon();
       await attach(ref, { kind: 'shell' });
+    });
+
+  const bl = program.command('backlog').description('Work orders that agents pick up one by one, per project, until done');
+  const ST = { queued: dim('queued'), active: green('active'), review: yellow('review'), blocked: red('blocked'), done: dim('done'), cancelled: dim('cancelled') };
+  const printBacklog = (v, { all = false } = {}) => {
+    const items = v.items.filter((i) => all || !['done', 'cancelled'].includes(i.status));
+    console.log(`${v.autoRun ? green('running') : yellow('paused')}  ${dim(`${v.defaultLimit} per project by default, ${v.maxActive} overall`)}`);
+    if (!items.length) return console.log(dim('Backlog is empty. Add: agentmgr backlog add "ask" -r <repo>'));
+    const lim = Object.fromEntries(v.projects.map((p) => [p.key, p.limit]));
+    let last = null;
+    for (const it of items) {
+      if (it.projectKey !== last) {
+        console.log(`\n${bold(it.projectName)} ${dim(`(${lim[it.projectKey] ?? v.defaultLimit} at a time)`)}`);
+        last = it.projectKey;
+      }
+      const agent = it.agent ? dim(` → ${it.agent.name} (${it.agent.id})${it.agent.briefStatus ? ` brief: ${it.agent.briefStatus}` : ''}`) : '';
+      console.log(`  ${it.id}  P${it.priority}  ${(ST[it.status] ?? it.status).padEnd(18)} ${truncate(it.title, 60)}${agent}`);
+    }
+  };
+  bl.command('ls')
+    .alias('list')
+    .description('Show the backlog')
+    .option('-a, --all', 'include done and cancelled items')
+    .option('--json', 'machine-readable output')
+    .action(async (opts) => {
+      await daemon();
+      const v = await api('GET', '/backlog');
+      if (opts.json) return console.log(JSON.stringify(v, null, 2));
+      printBacklog(v, opts);
+    });
+  bl.command('add')
+    .description('Queue asks (each becomes one agent when its turn comes)')
+    .argument('[items...]')
+    .option('-f, --file <path>', 'read items from a file, one per line ("-" for stdin)')
+    .option('-r, --repo <url>', 'git repository URL')
+    .option('-d, --dir <path>', 'existing working folder (each item gets its own worktree)')
+    .option('-b, --base <ref>', 'branch each item from this ref')
+    .option('--project <name>', 'project name (default: from the repo)')
+    .option('-p, --priority <1|2|3>', '1 high, 2 normal, 3 low', '2')
+    .option('--plan', 'plan with Claude while the repo clones')
+    .option('-m, --model <model>', 'claude model')
+    .action(async (items, opts) => {
+      if (opts.file) items = [...items, ...readIntentsFile(opts.file)];
+      if (!items.length) throw new Error('Give at least one item, or --file');
+      await daemon();
+      const added = await api('POST', '/backlog', { items, ...opts, priority: Number(opts.priority) });
+      for (const it of added) console.log(`${green('+')} ${it.id}  P${it.priority}  ${it.title}`);
+      printBacklog(await api('GET', '/backlog'));
+    });
+  const itemCmd = (name, desc, route, body) =>
+    bl.command(name)
+      .description(desc)
+      .argument('<item>')
+      .action(async (id, ...rest) => {
+        await daemon();
+        const it = await api('POST', `/backlog/${id}/${route}`, body ? await body(id, ...rest) : undefined);
+        console.log(`${it.id}  ${ST[it.status] ?? it.status}  ${it.title}`);
+      });
+  itemCmd('start', 'Start an item now (even past its project limit or while paused)', 'start');
+  itemCmd('accept', "Accept an item's work: done", 'accept').alias('done');
+  itemCmd('cancel', 'Cancel an item', 'cancel');
+  bl.command('reopen')
+    .description('Send an item back to the same agent with a note')
+    .argument('<item>')
+    .argument('[note...]')
+    .action(async (id, note) => {
+      await daemon();
+      const it = await api('POST', `/backlog/${id}/reopen`, { note: note.join(' ') });
+      console.log(`${it.id}  ${ST[it.status]}  ${it.title}`);
+    });
+  bl.command('move')
+    .description('Reorder a queued item')
+    .argument('<item>')
+    .argument('<where>', 'up, down, top or bottom')
+    .action(async (id, where) => {
+      await daemon();
+      await api('POST', `/backlog/${id}/move`, { where });
+      printBacklog(await api('GET', '/backlog'));
+    });
+  bl.command('priority')
+    .description('Set an item priority (1 high, 2 normal, 3 low)')
+    .argument('<item>')
+    .argument('<priority>')
+    .action(async (id, p) => {
+      await daemon();
+      await api('PATCH', `/backlog/${id}`, { priority: Number(p) });
+      printBacklog(await api('GET', '/backlog'));
+    });
+  bl.command('rm')
+    .description('Remove an item (not while active)')
+    .argument('<item>')
+    .action(async (id) => {
+      await daemon();
+      await api('DELETE', `/backlog/${id}`);
+      console.log(`removed ${id}`);
+    });
+  bl.command('limit')
+    .description('How many items of a project agents work on at once')
+    .argument('<project>', 'project name as shown in "backlog ls"')
+    .argument('<n>')
+    .action(async (project, n) => {
+      await daemon();
+      printBacklog(await api('POST', '/backlog/settings', { project, limit: Number(n) }));
+    });
+  bl.command('pause')
+    .description('Stop starting new items (active ones continue)')
+    .action(async () => {
+      await daemon();
+      printBacklog(await api('POST', '/backlog/settings', { autoRun: false }));
+    });
+  bl.command('resume')
+    .description('Start picking up queued items again')
+    .action(async () => {
+      await daemon();
+      printBacklog(await api('POST', '/backlog/settings', { autoRun: true }));
+    });
+
+  const notifyCmd = program.command('notify').description('Slack alerts when an agent needs you');
+  const printNotify = (n) => {
+    console.log(`alerts ${n.enabled && n.configured ? green('on') : dim('off')}  ${n.configured ? (n.slack.channel ? `bot → ${n.slack.channel}` : `webhook ${n.slack.webhookUrl}`) : dim('Slack not configured')}`);
+    console.log(`  events: ${Object.entries(n.events).map(([k, v]) => `${k} ${v ? green('on') : dim('off')}`).join(', ')}`);
+    console.log(dim(`  needs input after ${n.needsInputDelaySec}s, waiting after ${n.waitingDelaySec}s, skip while you watch: ${n.skipWhenWatching}`));
+    for (const r of n.recent ?? []) console.log(dim(`  ${r.at} ${r.kind} ${r.agent} ${r.error ? red(r.error) : 'sent'}`));
+  };
+  notifyCmd
+    .command('slack')
+    .description('Send alerts to Slack: an incoming webhook URL, or a bot token and channel')
+    .option('--webhook <url>', 'incoming webhook URL (https://hooks.slack.com/services/...)')
+    .option('--token <token>', 'bot token (xoxb-...) for chat.postMessage')
+    .option('--channel <channel>', 'channel for the bot token, e.g. #agents')
+    .action(async (opts) => {
+      if (!opts.webhook && !(opts.token && opts.channel)) throw new Error('Give --webhook, or --token and --channel');
+      await daemon();
+      printNotify(await api('POST', '/notify', { webhookUrl: opts.webhook, botToken: opts.token, channel: opts.channel }));
+      console.log(dim('Send a test: agentmgr notify test'));
+    });
+  notifyCmd.command('test').description('Send a test message').action(async () => {
+    await daemon();
+    await api('POST', '/notify/test');
+    console.log(`${green('✓')} test message sent`);
+  });
+  notifyCmd.command('status').description('Show alert settings and recent alerts').action(async () => {
+    await daemon();
+    printNotify(await api('GET', '/notify'));
+  });
+  for (const [cmd, on] of [['on', true], ['off', false]]) {
+    notifyCmd.command(cmd).description(`Turn alerts ${cmd}`).action(async () => {
+      await daemon();
+      printNotify(await api('POST', '/notify', { enabled: on }));
+    });
+  }
+  notifyCmd
+    .command('event')
+    .description('Turn one alert on or off: needsInput, review, error, waiting')
+    .argument('<event>')
+    .argument('<onoff>')
+    .action(async (event, onoff) => {
+      if (!['needsInput', 'review', 'error', 'waiting'].includes(event)) throw new Error('event must be needsInput, review, error or waiting');
+      await daemon();
+      printNotify(await api('POST', '/notify', { events: { [event]: onoff === 'on' } }));
     });
 
   const remoteCmd = program.command('remote').description('Open Agent Manager from a phone or another computer on the same network');
@@ -455,8 +620,14 @@ export async function main(argv) {
       const agents = await api('GET', '/agents');
       if (opts.json) return console.log(JSON.stringify(agents, null, 2));
       if (!agents.length) return console.log('No agents yet. Try: agentmgr add "fix the flaky login test" -d .');
+      const proj = (a) => a.projectInfo?.name ?? 'Other';
+      const order = (p) => (p === 'General' ? 1 : p === 'Other' ? 2 : 0);
+      agents.sort((a, b) => order(proj(a)) - order(proj(b)) || proj(a).localeCompare(proj(b)) || a.createdAt.localeCompare(b.createdAt));
+      const groups = new Set(agents.map(proj));
+      console.log(dim(`${groups.size} project${groups.size === 1 ? '' : 's'}, ${agents.length} agents, ${agents.filter((a) => a.runtime.running).length} running`));
       table(
-        agents.map((a) => [
+        agents.map((a, i) => [
+          i === 0 || proj(agents[i - 1]) !== proj(a) ? bold(truncate(proj(a), 24)) : '',
           a.id,
           truncate(a.kind === 'general' ? `${a.name} (general)` : a.name, 28),
           statusLabel(a),
@@ -467,7 +638,7 @@ export async function main(argv) {
           a.sessionId.slice(0, 8),
           truncate(a.workdir ?? '', 50),
         ]),
-        ['ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'TOKENS', 'SESSION', 'FOLDER'],
+        ['PROJECT', 'ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'TOKENS', 'SESSION', 'FOLDER'],
       );
     });
 
@@ -613,8 +784,14 @@ export async function main(argv) {
     .action(async () => {
       const svc = await import('./service.js');
       if (await isRunning()) {
-        const r = await api('POST', '/flush');
-        console.log(dim(`saved ${r.agents} agents, scrollback for ${r.scrollback}`));
+        try {
+          const r = await api('POST', '/flush');
+          console.log(dim(`saved ${r.agents} agents, scrollback for ${r.scrollback}`));
+        } catch (err) {
+          // A daemon from an older version has no /flush; its shutdown still saves the agents.
+          if (!/HTTP 404/.test(err.message)) throw err;
+          console.log(dim('running daemon is an older version (no flush); restarting it to upgrade'));
+        }
         await api('POST', '/shutdown');
         for (let i = 0; i < 100 && (await isRunning()); i++) await new Promise((res) => setTimeout(res, 200));
       }

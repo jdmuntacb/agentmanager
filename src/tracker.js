@@ -233,3 +233,78 @@ export async function prDetails(url) {
     return null;
   }
 }
+
+// ---------------------------------------------------------------- session digest (for Explain)
+
+const stripNoise = (s) =>
+  s
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/<(command-[\w-]+|local-command-[\w-]+)>[\s\S]*?<\/\1>/g, '')
+    .trim();
+const cap = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** One line for a tool call: what the agent did, not its raw output. */
+function describeTool(name, input = {}) {
+  if (name === 'Bash') return `ran: ${cap(input.description || input.command || '', 160)}`;
+  if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(name)) return `edited ${input.file_path ?? input.notebook_path ?? ''}`;
+  if (name === 'AskUserQuestion') return `asked the user: ${(input.questions ?? []).map((q) => q.question).join(' / ')}`;
+  if (name === 'Skill') return `used skill ${input.skill ?? ''}`;
+  if (name === 'Agent' || name === 'Task') return `delegated to a subagent: ${cap(input.description || input.prompt || '', 160)}`;
+  if (name === 'TodoWrite') return `updated plan: ${(input.todos ?? []).map((t) => `[${t.status}] ${t.content}`).join('; ')}`;
+  if (name === 'ExitPlanMode') return `proposed plan: ${cap(input.plan ?? '', 1500)}`;
+  if (name.startsWith('mcp__')) return `called ${name.split('__').slice(-1)[0]} (${name.split('__')[1]})`;
+  if (['Read', 'Grep', 'Glob', 'ToolSearch', 'Monitor', 'TaskStop', 'LS'].includes(name)) return null; // too noisy to matter
+  return `used ${name}`;
+}
+
+/**
+ * A compact, chronological digest of a session for a model to summarize: the
+ * user's messages, the agent's own words (where plans and conclusions live) and
+ * one line per meaningful action. Keeps the first request in full and fills the
+ * rest of the budget with the most recent events.
+ */
+export function sessionDigest(file, { maxChars = 24_000 } = {}) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return { digest: '', events: 0, edited: [], asked: [] };
+  }
+  const events = [];
+  const edited = new Set();
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if ((rec.type !== 'user' && rec.type !== 'assistant') || rec.isMeta || rec.isSidechain) continue;
+    const content = rec.message?.content;
+    const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
+    for (const b of blocks) {
+      if (b.type === 'text' && b.text) {
+        const t = stripNoise(b.text);
+        if (t) events.push(rec.type === 'user' ? `[user] ${cap(t, 1200)}` : `[agent] ${cap(t, 1800)}`);
+      } else if (b.type === 'tool_use' && rec.type === 'assistant') {
+        if (['Edit', 'Write', 'MultiEdit'].includes(b.name) && b.input?.file_path) edited.add(b.input.file_path);
+        const d = describeTool(b.name, b.input);
+        if (d) events.push(`[action] ${d}`);
+      }
+    }
+  }
+  const firstUser = events.findIndex((e) => e.startsWith('[user]'));
+  const head = firstUser >= 0 ? [events[firstUser]] : [];
+  const tail = [];
+  let used = head.join('\n').length;
+  for (let i = events.length - 1; i > firstUser; i--) {
+    if (used + events[i].length + 1 > maxChars) {
+      tail.unshift(`… (${i - firstUser} earlier events omitted) …`);
+      break;
+    }
+    tail.unshift(events[i]);
+    used += events[i].length + 1;
+  }
+  return { digest: [...head, ...tail].join('\n'), events: events.length, edited: [...edited] };
+}

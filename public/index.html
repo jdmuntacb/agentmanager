@@ -18,6 +18,7 @@
       </div>
       <div class="top-actions">
         <input id="filter" type="search" placeholder="Filter agents" aria-label="Filter agents" />
+        <button id="alerts-btn" class="local-only" title="Slack alerts when an agent needs you">Alerts</button>
         <button id="remote-btn" class="local-only" title="Open Agent Manager from your phone">Remote access</button>
         <button id="ask-btn" title="A general Claude session with no repo or folder">Ask Claude</button>
         <button id="new-btn" class="primary">+ New agents</button>
@@ -26,8 +27,15 @@
 
     <main class="layout">
       <aside class="sidebar">
-        <div class="counts" id="counts"></div>
-        <ul id="agent-list" class="agent-list" aria-label="Agents"></ul>
+        <div class="side-tabs" role="tablist">
+          <button class="side-tab active" data-tab="agents" role="tab">Agents</button>
+          <button class="side-tab" data-tab="backlog" role="tab">Backlog <span id="backlog-count" class="badge"></span></button>
+        </div>
+        <div id="agents-view">
+          <div class="counts" id="counts"></div>
+          <ul id="agent-list" class="agent-list" aria-label="Agents"></ul>
+        </div>
+        <div id="backlog-view" hidden></div>
         <div id="empty" class="empty" hidden>
           <p>No agents yet.</p>
           <p>Add one or more intents and a repo or folder to get started.</p>
@@ -110,6 +118,10 @@
           </label>
         </div>
         <label>
+          Project <span class="hint">optional; agents are grouped by their repo unless you name a project</span>
+          <input name="project" placeholder="(from the repo)" />
+        </label>
+        <label>
           Base branch <span class="hint">optional; each agent branches from this. Default: the repo's default branch, freshly fetched</span>
           <input name="base" placeholder="main" />
         </label>
@@ -121,7 +133,17 @@
           <input type="checkbox" name="plan" checked />
           Plan with Claude while the repo clones <span class="hint">(repo URLs only; the session moves into the repo when it's ready)</span>
         </label>
-        <label class="check">
+        <div class="row when">
+          <label class="check"><input type="radio" name="when" value="now" checked /> Start now</label>
+          <label class="check"><input type="radio" name="when" value="backlog" /> Queue in backlog
+            <select name="priority" aria-label="Priority">
+              <option value="1">P1 high</option>
+              <option value="2" selected>P2 normal</option>
+              <option value="3">P3 low</option>
+            </select>
+          </label>
+        </div>
+        <label class="check now-only">
           <input type="checkbox" name="start" checked />
           Launch immediately
         </label>
@@ -160,6 +182,37 @@
         <input name="token" placeholder="Access token" autocomplete="off" autocapitalize="off" spellcheck="false" required />
         <p id="login-error" class="error" hidden></p>
         <div class="dialog-actions"><button class="primary">Sign in</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="alerts-dialog">
+      <form id="alerts-form" method="dialog" class="alerts-body">
+        <h2>Slack alerts</h2>
+        <p class="hint">Get a Slack message when an agent needs you. Use a channel's <b>incoming webhook</b> URL, or a <b>bot token</b> and channel. Stored only on this computer.</p>
+        <label>Incoming webhook URL <input name="webhookUrl" type="password" autocomplete="off" placeholder="https://hooks.slack.com/services/…" /></label>
+        <div class="row">
+          <label>or bot token <input name="botToken" type="password" autocomplete="off" placeholder="xoxb-…" /></label>
+          <label>channel <input name="channel" placeholder="#agents" /></label>
+        </div>
+        <p class="hint" id="alerts-current"></p>
+        <fieldset>
+          <legend>Alert when an agent…</legend>
+          <label class="check"><input type="checkbox" name="ev_needsInput" /> needs input (a prompt or question is unanswered) after <input name="needsInputDelaySec" type="number" min="0" class="num" />s</label>
+          <label class="check"><input type="checkbox" name="ev_review" /> finishes a backlog item (ready for review)</label>
+          <label class="check"><input type="checkbox" name="ev_error" /> fails (setup or launch error)</label>
+          <label class="check"><input type="checkbox" name="ev_waiting" /> finished its turn and is idle after <input name="waitingDelaySec" type="number" min="0" class="num" />s</label>
+          <label class="check"><input type="checkbox" name="skipWhenWatching" /> not while I have its terminal open</label>
+          <label class="check"><input type="checkbox" name="includeIntent" /> include the intent text in the message</label>
+          <label class="check"><input type="checkbox" name="enabled" /> <b>Alerts on</b></label>
+        </fieldset>
+        <div id="alerts-recent" class="hint"></div>
+        <p id="alerts-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="alerts-test">Send test</button>
+          <span class="spacer"></span>
+          <button type="button" id="alerts-close" class="ghost">Close</button>
+          <button class="primary">Save</button>
+        </div>
       </form>
     </dialog>
 

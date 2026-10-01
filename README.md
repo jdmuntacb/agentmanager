@@ -15,8 +15,11 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Brief per agent.** Each agent keeps a living brief that the UI shows next to its terminal:
   - **Problem**, **Solution**, a **design / flow diagram** (Mermaid) and **Checks** (passed / failed / running / pending);
   - when the intent links a Jira issue, **References** with its **PRD** and **Tech Spec** links and the points that matter.
+- **Projects.** The sidebar is a tree, project → agents, so you see how many projects are in flight and how many parallel sessions each has.
+- **Backlog.** Queue asks as work orders. Agents pick them up one by one, up to N in parallel per project, until each is done. You accept or reopen each one.
+- **Slack alerts.** A message in your channel when an agent needs input, finishes a backlog item, or fails.
 - **Explain.** One click gives a plain-language explanation of the intent and the insight behind the problem and solution. It comes from a separate tool-less Claude call, so the agent isn't interrupted.
-- **From your phone.** Opt-in HTTPS access on your local network at a plain `https://<ip>:<port>`. Sign in with a QR code, and answer Claude's prompts with a key bar and reply box. Nothing to install.
+- **From your phone.** On by default: HTTPS access on your local network at a plain `https://<ip>:<port>`. Sign in with a QR code, and answer Claude's prompts with a key bar and reply box. Nothing to install.
 - **Never loses state.** `agentmgr flush` (also every 30 s and on shutdown) saves session IDs, terminal scrollback and usage. `agentmgr restart` brings everything back.
 - **Follows your conventions.** Before changing anything, agents review `CLAUDE.md` / `AGENTS.md`, skills, hooks and settings (repo and `~/.claude`), and follow them.
 - **Tokens and cost.** Input, output and cache tokens are tracked per session, subagents included, alongside the cost Claude Code reports.
@@ -54,6 +57,8 @@ agentmgr shell <agent>                        # a shell in the agent's folder; C
 agentmgr brief <agent>                        # print the agent's brief (Markdown)
 agentmgr explain <agent>                      # plain-language explanation of intent, problem and solution
 agentmgr remote on | off | status | rotate    # phone / remote access (see below)
+agentmgr backlog add "ask" -r <repo> [-p 1]   # queue work; also: ls, start, accept, reopen, move, limit, pause
+agentmgr notify slack --webhook <url>         # Slack alerts; also: test, status, on, off, event <name> on|off
 agentmgr flush                                # save session IDs, scrollback, usage and state now
 agentmgr restart                              # flush, stop and start the daemon; agents resume
 agentmgr plan <agent>                         # plan with Claude while the workspace is still being prepared
@@ -172,17 +177,96 @@ How it behaves:
 
 ## Explain
 
-**Explain** in the Brief panel, or `agentmgr explain <agent>`, writes a short plain-language explanation from the intent and the brief:
+**Explain** in the Brief panel, or `agentmgr explain <agent>`, briefs you on what the agent is doing, built from its live context.
 
-- **Sections:** *In one line*, *The intent*, *The problem, explained*, *The solution, explained*, *Terms* and *Open questions & risks*.
-- **How it runs:** a separate one-shot call, `claude -p --tools "" --strict-mcp-config --no-session-persistence`. It has no tools and no MCP servers, and it never runs inside the agent's session, so the agent isn't interrupted and its context doesn't grow.
-- **Stale flag:** the explanation is stored with the agent and marked out of date when the brief changes.
-- **Model:** set `"explainModel"` to use a specific one.
+**Context it reads:**
+
+- **The conversation:** your requests and the agent's own replies.
+- **Its actions:** commands run, files edited, questions asked, skills and subagents used, Jira and Drive calls.
+- **The repository:** commits and changes since its base branch.
+- **Live status:** working, waiting on you, or blocked.
+- **The brief.**
+
+**What it writes:**
+
+| Section | Contents |
+| --- | --- |
+| The ask | What was requested, including later changes of direction |
+| Where it stands | Phase (planning / investigating / implementing / testing / done / blocked), what it's doing now, whether it's waiting on you |
+| Planned work | Checklist with ✅ done, 🔄 in progress, ⏳ next |
+| Solution | The approach and the concrete changes so far (files, commits, PRs) |
+| Conclusions so far | Findings, decisions, results |
+| Needs from you | Questions or decisions it's waiting on, risks, blockers |
+
+**How it runs:**
+
+- **Separate call.** `claude -p --tools "" --strict-mcp-config --no-session-persistence`, with no tools and no MCP servers. It never runs inside the agent's session, so the agent isn't interrupted and its context doesn't grow.
+- **Large sessions.** They are condensed to the first request plus the most recent activity, about 24k characters.
+- **Stale flag.** The result is stored with the agent and marked out of date when the brief changes.
+- **Model.** Set `"explainModel"` to pick one.
+
+## Projects
+
+The sidebar groups agents into projects, shown as a tree:
+
+- **How agents are grouped.**
+  - By repo: a URL and a local clone of the same repo land together.
+  - Otherwise by folder.
+  - General sessions under *General*, scratch work under *Other*.
+  - Set your own name with `--project` or the ✎ next to *Project* in the agent's Workspace card.
+- **Counts.** Each project shows running/total agents and how many need input.
+- **Ordering.** Projects needing you sort first. Collapsed projects stay collapsed.
+- **CLI.** `agentmgr ls` groups by project too.
+
+## Backlog
+
+Queue asks instead of starting them. Use **+ Add** in the Backlog tab, **Queue in backlog** in the New agents dialog, or `agentmgr backlog add`. Each item is one ask, plus where to do it (repo or folder, base branch, project) and a priority from P1 (high) to P3 (low).
+
+**How items flow:**
+
+1. **Queued → active.** Items are picked up by priority, then queue order. Up to `backlogParallel` (2) items per project run at once, and `backlogMaxActive` (4) overall. Change a project's limit with "*N at a time* ✎" or `agentmgr backlog limit <project> <n>`. Each item gets its own agent, worktree and branch.
+2. **Active → review.** When the agent sets its brief's first line to `Status: done` (its checks pass), the item moves to **review** and frees its slot for the next one. An agent that exits or that you close also sends its item to review. Setup errors make it **blocked** (Retry restarts it).
+3. **Review → done.** **Accept** marks it done. **Reopen** types your note into the same agent session and puts the item back to work.
+
+**Other controls:**
+
+- **Pause / Resume** stops or restarts picking up new items. Active ones continue.
+- **Start now** starts an item regardless of limits.
+- **Reorder** with ▲▼, or `backlog move`. Click **P1–P3** to change priority.
+- Deleting an agent cancels its item.
+
+The backlog is saved with the rest of the state.
+
+## Slack alerts
+
+```sh
+agentmgr notify slack --webhook https://hooks.slack.com/services/…   # a channel's incoming webhook
+agentmgr notify slack --token xoxb-… --channel '#agents'            # or a bot token + channel
+agentmgr notify test
+```
+
+Or use **Alerts** in the header (on this computer only). Settings, including the webhook or token, are stored in `~/.agentmanager/notify.json` (mode 0600) and masked in the UI and API.
+
+| Alert | Default | When |
+| --- | --- | --- |
+| needs input | on | A trust or permission prompt or a question menu is still unanswered after 60 s |
+| review | on | A backlog item finished and is ready for your review |
+| error | on | Workspace setup or launch failed |
+| waiting | off | The agent finished its turn and has been idle 2 min |
+
+**Message behaviour:**
+
+- **Once per episode.** Each alert is sent once, and again only after the condition clears and comes back.
+- **Skipped while watching.** Alerts are skipped while you have that agent's terminal open.
+- **Contents.** Messages include the agent, project, the intent (optional) and a link. The link uses your phone address when remote access is on.
 
 ## Phone and remote access
 
+Remote access is **on by default**. Each daemon listens on its local port + 1 (4717 → 4718). If you turn it off, it stays off.
+
 ```sh
-agentmgr remote on        # prints https://<this-mac-ip>:4718/ and a QR code
+agentmgr remote status    # prints https://<this-mac-ip>:4718/ and the sign-in QR code
+agentmgr remote off       # turn it off (agentmgr remote on to turn it back on)
 ```
 
 Or use **Remote access** in the header of the UI on this computer.
@@ -201,7 +285,7 @@ Or use **Remote access** in the header of the UI on this computer.
 
 **Security.**
 
-- **Separate listener.** Remote access is a second listener (HTTPS, all interfaces, port 4718 by default). The local `127.0.0.1:4717` listener is unchanged.
+- **Separate listener.** Remote access is a second listener on HTTPS, all interfaces, with the local port + 1 by default. The local `127.0.0.1:4717` listener is unchanged. Set `AGENTMGR_REMOTE=0` in the environment to start a daemon with it off when you haven't chosen either way.
 - **What needs sign-in.** Every API call except sign-in needs a device session (HttpOnly, Secure, SameSite=Strict cookie, 30 days, sliding). Only this machine's own addresses are accepted as `Host`, and cross-site origins are refused. Failed sign-ins are rate limited.
 - **Local only.** Turning remote access on or off, the token and devices, and shutting down can only be done from this computer.
 - **Devices.** `agentmgr remote rotate` (or **New access token**) signs every device out. Devices are listed with their address and last-seen time and can be signed out one by one.
@@ -250,6 +334,8 @@ State lives in `~/.agentmanager/` (`state.json`, `daemon.log`, `repos/` for shar
   "brief": true,
   "explainModel": null,
   "flushSec": 30,
+  "backlogParallel": 2,
+  "backlogMaxActive": 4,
   "reviewConventions": true,
   "handoffIdleSec": 5,
   "cloneFilter": "blob:none",

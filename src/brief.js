@@ -16,7 +16,9 @@ export function briefPath(agentId) {
 
 export const briefPrompt = (file) =>
   `Keep a short, living brief of this task in ${file} (Markdown). Agent Manager shows it to the user ` +
-  'next to your terminal. Use exactly these four sections:\n' +
+  'next to your terminal. Start it with one status line, then use exactly these four sections:\n' +
+  'Status: planning | working | blocked | done\n' +
+  'Set "done" only when the task is complete and its checks pass; set "blocked" when you need the user.\n' +
   '## Problem\nWhat is wrong or what is needed, and why (2-5 sentences).\n' +
   '## Solution\nThe approach and the key changes (files, components). Keep it current as the plan evolves.\n' +
   '## Diagram\nOne ```mermaid code block showing the flow, sequence or architecture of the solution. ' +
@@ -67,7 +69,9 @@ const CHECK_STATES = { ' ': 'pending', '~': 'running', x: 'passed', X: 'passed',
 
 /** Parse the brief Markdown into its four sections. Unknown sections are ignored. */
 export function parseBrief(markdown) {
-  const out = { problem: '', solution: '', diagram: null, diagramNotes: '', checks: [], references: [] };
+  const out = { status: null, problem: '', solution: '', diagram: null, diagramNotes: '', checks: [], references: [] };
+  const st = markdown.split(/^##\s/m)[0].match(/^\s*\**status\**\s*:\s*\**\s*(planning|working|blocked|done)\b/im);
+  if (st) out.status = st[1].toLowerCase();
   const parts = markdown.split(/^##\s+(.+?)\s*#*\s*$/m);
   for (let i = 1; i < parts.length; i += 2) {
     const key = sectionKey(parts[i]);
@@ -131,33 +135,49 @@ export const conventionsPrompt = ({ withBrief }) =>
       '"- [x] Reviewed conventions: skills go-testing, release-notes; hooks: gofmt on edit".'
     : '');
 
-/** Prompt for a one-off, tool-less "explain this task" call. */
-export function explainPrompt({ intent, briefMarkdown }) {
+/**
+ * Prompt for a one-off, tool-less "explain what this agent is doing" call, built
+ * from the agent's live context: its conversation and actions, repository
+ * changes, status and brief.
+ */
+export function explainPrompt({ intent, status, digest, repo, briefMarkdown }) {
   return [
-    'You are helping someone quickly understand a software task that an AI agent is working on.',
-    "Explain it in plain language for a busy engineer or manager who hasn't read the details.",
+    "You are briefing a busy engineer on an AI coding agent's work so far. Use the context below (the agent's",
+    'actual conversation, actions and repository changes) and explain in plain language what it is doing.',
     '',
     'Write Markdown with exactly these sections:',
-    '### In one line',
-    '### The intent',
-    'What is being asked and why it matters: who benefits and what changes for them.',
-    '### The problem, explained',
-    'The key insight: the root cause or core constraint, in simple terms. Use an analogy only if it really helps.',
-    '### The solution, explained',
-    "Why this approach works, the main trade-offs, and what it deliberately doesn't do.",
-    '### Terms',
-    'A short glossary of the jargon and acronyms used above (omit the section if there are none).',
-    '### Open questions & risks',
-    'What is still uncertain or could go wrong.',
+    '### The ask',
+    'What the user asked for, in one or two sentences, including any later change of direction.',
+    '### Where it stands',
+    'One or two lines: the phase (planning, investigating, implementing, testing, done, blocked), what it is',
+    'doing right now, and whether it is waiting for the user and on what.',
+    '### Planned work',
+    'The plan as a short checklist, each step marked ✅ done, 🔄 in progress or ⏳ next, based on what the agent',
+    'said it would do and what it actually did.',
+    '### Solution',
+    'The approach and why, and the concrete changes so far: files or components touched, commits, PRs.',
+    '### Conclusions so far',
+    'Findings, decisions, answers and results (including test results). Write "None yet." if nothing is settled.',
+    '### Needs from you',
+    'Questions or decisions the agent is waiting on, plus risks and blockers. Write "Nothing right now." if none.',
     '',
-    'Rules: use only the information below. If something is unclear or missing (for example the agent has not',
-    'worked out a solution yet), say so plainly instead of guessing. Keep it under about 350 words.',
+    'Rules: rely only on the context. Clearly separate what was done from what was only planned. If the',
+    'context is thin or unclear, say so instead of guessing. No preamble. Keep it under about 400 words.',
     '',
+    '<agent_status>',
+    status,
+    '</agent_status>',
     '<intent>',
     intent || '(none)',
     '</intent>',
+    '<conversation>',
+    digest || '(no conversation recorded yet)',
+    '</conversation>',
+    '<repository>',
+    repo || '(no repository changes recorded)',
+    '</repository>',
     '<brief>',
-    briefMarkdown || '(the agent has not written its brief yet)',
+    briefMarkdown || '(the agent has not written a brief yet)',
     '</brief>',
   ].join('\n');
 }

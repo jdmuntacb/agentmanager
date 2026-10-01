@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import QRCode from 'qrcode';
-import { paths } from './config.js';
+import { paths, PORT } from './config.js';
 
 const DIR = path.join(paths.home, 'remote');
 const STATE = path.join(DIR, 'state.json');
@@ -119,9 +119,18 @@ export function certificateFingerprint() {
 
 // ------------------------------------------------------------- settings, token, sessions
 
+/**
+ * Remote access is on unless you turned it off. Its port defaults to the local
+ * port + 1 (4717 -> 4718), so several daemons (e.g. a test one) don't collide.
+ */
 export function loadSettings() {
   const s = load();
-  return { enabled: Boolean(s.enabled), port: s.port ?? 4718, extraHosts: s.extraHosts ?? [] };
+  const envDefault = process.env.AGENTMGR_REMOTE === '0' ? false : process.env.AGENTMGR_REMOTE === '1' ? true : null;
+  return {
+    enabled: s.enabled ?? envDefault ?? true,
+    port: s.port ?? PORT + 1,
+    extraHosts: s.extraHosts ?? [],
+  };
 }
 
 export function saveSettings(patch) {

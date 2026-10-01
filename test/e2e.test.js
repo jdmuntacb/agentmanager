@@ -18,6 +18,7 @@ process.env.AGENTMGR_PORT = String(port);
 process.env.CLAUDE_CONFIG_DIR = path.join(home, 'claude');
 process.env.FAKE_CLAUDE_LOG = claudeLog;
 process.env.AGENTMGR_NO_GH = '1';
+process.env.AGENTMGR_REMOTE = '0'; // the remote-access test turns it on explicitly
 fs.writeFileSync(
   path.join(home, 'config.json'),
   JSON.stringify({
@@ -720,14 +721,120 @@ test('flush saves terminal scrollback so a restarted daemon shows it again', asy
   resumed.detach();
 });
 
-test('Explain runs a separate tool-less Claude call and stores the result', async () => {
-  const [a] = (await call('POST', '/agents', { intent: 'Explain me please', start: false })).body;
-  await waitFor(async () => (await agentNow(a.id)).status === 'stopped', 8000, 'ready');
+test("Explain summarizes the agent's live session in a separate tool-less Claude call", async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Explain me please' })).body;
+  await waitFor(() => launches().some((l) => l.args.includes(a.sessionId)), 8000, 'launch');
+  await waitFor(async () => {
+    const { transcriptPath } = await import('../src/tracker.js');
+    const ag = await agentNow(a.id);
+    return ag.workdir && fs.existsSync(transcriptPath(ag.workdir, a.sessionId));
+  }, 8000, 'transcript');
+  await call('POST', `/agents/${a.id}/stop`);
   const res = await call('POST', `/agents/${a.id}/explain`);
   assert.equal(res.status, 200, JSON.stringify(res.body));
-  assert.match(res.body.explanation.markdown, /^### In one line\nSafe call\. Intent: Explain me please/);
+  const md = res.body.explanation.markdown;
+  assert.match(md, /^### The ask\nSafe call\. Intent: Explain me please/);
+  assert.match(md, /### Where it stands\nstatus: stopped/);
+  assert.match(md, /saw agent text: true/, 'the conversation digest reached the explainer');
   assert.equal(res.body.explanation.pending, false);
-  assert.ok(res.body.explanation.at);
-  assert.equal(res.body.status, 'stopped', 'the agent itself was not started');
+  assert.equal(res.body.status, 'stopped', 'explaining did not restart the agent');
   assert.ok(!launches().some((l) => l.args.includes(a.sessionId) && l.args.includes('-p')), 'not run inside the agent session');
+});
+
+test('backlog: per-project limit, done → review frees a slot, accept, reopen, pause, priority', async () => {
+  const bl = async () => (await call('GET', '/backlog')).body;
+  const item = async (id) => (await bl()).items.find((i) => i.id === id);
+  const added = (await call('POST', '/backlog', { items: ['task one #done', 'task two', 'task three'], project: 'BL' })).body;
+  assert.equal(added.length, 3);
+  const [one, two, three] = added.map((i) => i.id);
+  assert.ok(added.every((i) => i.projectName === 'BL' && i.worktree === true));
+
+  // Two at a time per project (the default): one and two start, three waits.
+  await waitFor(async () => (await item(one)).status !== 'queued' && (await item(two)).status === 'active', 8000, 'two active');
+  assert.equal((await item(three)).status, 'queued');
+  const a1 = (await item(one)).agent.id;
+  assert.equal((await agentNow(a1)).backlogItem, one);
+  assert.equal((await agentNow(a1)).projectInfo.name, 'BL');
+
+  // Item one's agent reports done in its brief: review, and three takes the free slot.
+  await waitFor(async () => (await item(one)).status === 'review', 10000, 'one in review');
+  await waitFor(async () => (await item(three)).status === 'active', 8000, 'three started');
+
+  const accepted = (await call('POST', `/backlog/${one}/accept`)).body;
+  assert.equal(accepted.status, 'done');
+  assert.ok(accepted.doneAt);
+
+  // Reopen: the same agent session gets the note (typed in; it is still running).
+  const reopened = (await call('POST', `/backlog/${one}/reopen`, { note: 'add a test' })).body;
+  assert.equal(reopened.status, 'active');
+  await waitFor(() => {
+    const t = manager.attach(a1, { send() {} });
+    t.detach();
+    return t.backlog.includes('echo:Reopened from review: add a test');
+  }, 8000, 'note typed into the session');
+
+  // Pause: new items wait; "start" overrides; P1 sorts first.
+  await call('POST', '/backlog/settings', { autoRun: false });
+  const [four] = (await call('POST', '/backlog', { items: ['task four'], project: 'BL', priority: 1 })).body;
+  const [five] = (await call('POST', '/backlog', { items: ['task five'], project: 'BL', priority: 3 })).body;
+  await new Promise((r) => setTimeout(r, 2500));
+  assert.equal((await item(four.id)).status, 'queued');
+  const order = (await bl()).items.map((i) => i.id);
+  assert.ok(order.indexOf(four.id) < order.indexOf(five.id), 'P1 before P3');
+  assert.equal((await call('POST', `/backlog/${four.id}/start`)).body.status, 'active');
+
+  // Removing an agent cancels its item; cancelled items can be removed.
+  const a2 = (await item(two)).agent.id;
+  await call('DELETE', `/agents/${a2}`);
+  assert.equal((await item(two)).status, 'cancelled');
+  assert.equal((await call('DELETE', `/backlog/${two}`)).status, 200);
+  assert.equal((await call('DELETE', `/backlog/${three}`)).status, 409, 'active items must be cancelled first');
+
+  // Limit per project.
+  const v = (await call('POST', '/backlog/settings', { project: 'BL', limit: 1, autoRun: true })).body;
+  assert.equal(v.projects.find((p) => p.name === 'BL').limit, 1);
+  // Persisted with the rest of the state.
+  const saved = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+  assert.ok(saved.backlog.items[four.id]);
+  for (const it of (await bl()).items) if (['queued', 'active', 'review', 'blocked'].includes(it.status)) await call('POST', `/backlog/${it.id}/cancel`);
+});
+
+test('Slack alerts: needs input after the delay, once per episode; review; settings are local-only', async () => {
+  const http = await import('node:http');
+  const got = [];
+  const hook = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      got.push(JSON.parse(b));
+      res.end('ok');
+    });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${hook.address().port}/services/T/B/x`;
+  try {
+    const set = (await call('POST', '/notify', { webhookUrl: url, needsInputDelaySec: 0 })).body;
+    assert.equal(set.enabled, true, 'configuring Slack turns alerts on');
+    assert.ok(!JSON.stringify(set).includes('/services/T/B/x'), 'webhook masked in responses');
+    assert.equal((await call('POST', '/notify', { webhookUrl: 'ftp://nope' })).status, 400);
+    assert.equal((await call('POST', '/notify/test')).status, 200);
+    await waitFor(() => got.some((m) => /Test from Agent Manager/.test(m.text)), 5000, 'test message');
+
+    const [a] = (await call('POST', '/agents', { intent: 'Please #ask me', project: 'Alerts' })).body;
+    await waitFor(() => got.some((m) => m.text.includes(a.name) && /needs input: Permission prompt/.test(m.text)), 15000, 'needs-input alert');
+    const msg = got.find((m) => m.text.includes(a.name)).text;
+    assert.match(msg, /\(Alerts\)/);
+    assert.match(msg, new RegExp(`#${a.id}/term\\|Open in Agent Manager`));
+    await new Promise((r) => setTimeout(r, 6000));
+    assert.equal(got.filter((m) => m.text.includes(a.name) && /needs input/.test(m.text)).length, 1, 'once per episode');
+    await call('POST', `/agents/${a.id}/stop`);
+
+    // A backlog item reaching review is announced.
+    const [it] = (await call('POST', '/backlog', { items: ['alert me #done'], project: 'Alerts' })).body;
+    await waitFor(() => got.some((m) => /ready for your review/.test(m.text) && m.text.includes('alert me')), 15000, 'review alert');
+    await call('POST', `/backlog/${it.id}/accept`);
+  } finally {
+    await call('POST', '/notify', { enabled: false });
+    hook.close();
+  }
 });

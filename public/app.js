@@ -6,6 +6,9 @@ import { openStream, post, REMOTE } from '/transport.js';
 
 const $ = (sel) => document.querySelector(sel);
 const agents = new Map();
+let backlogState = { items: [], projects: [], autoRun: true, defaultLimit: 2 };
+let sideTab = 'agents';
+let showCompleted = false;
 // #<id> selects an agent; #<id>/term also opens its terminal.
 const loginHash = location.hash.match(/(?:^#|&)login=([\w-]+)/)?.[1] ?? null;
 const [hashId, hashView] = loginHash ? [null, null] : location.hash.slice(1).split('/');
@@ -133,7 +136,7 @@ function explainBox(a) {
   const ex = a.explanation;
   const label = ex?.pending ? 'Explaining…' : ex?.markdown ? 'Explain again' : 'Explain';
   const button = `<button class="small ${ex?.markdown ? '' : 'primary'}" data-act="explain" ${ex?.pending ? 'disabled' : ''}
-    title="A plain-language explanation of the intent and the problem / solution, from a separate one-off Claude call (does not interrupt the agent)">${label}</button>`;
+    title="What this agent is doing: the ask, where it stands, planned work, solution, conclusions and what it needs from you. Built from its live session by a separate one-off Claude call (does not interrupt the agent)">${label}</button>`;
   if (!ex?.markdown && !ex?.error) return { button, box: '' };
   const stale = ex.markdown && a.brief?.updatedAt && ex.briefUpdatedAt !== a.brief.updatedAt;
   const box = `<div class="explain">
@@ -220,48 +223,235 @@ const copyBtn = (value) => `<button class="link" data-copy="${esc(value)}" title
 /** Agents waiting on you first, then running ones, then the rest. */
 const rank = (a) => (a.runtime.attention ? 0 : a.runtime.running ? 1 : 2);
 
+// Projects the user collapsed in the tree (kept per browser).
+const collapsed = new Set(
+  (() => {
+    try {
+      return JSON.parse(localStorage.getItem('agentmgr.collapsed') || '[]');
+    } catch {
+      return [];
+    }
+  })(),
+);
+function saveCollapsed() {
+  try {
+    localStorage.setItem('agentmgr.collapsed', JSON.stringify([...collapsed]));
+  } catch {}
+}
+
+function agentItem(a) {
+  const st = statusOf(a);
+  return `<li data-id="${a.id}" class="agent ${a.id === selectedId ? 'selected' : ''}">
+    <div class="line1"><span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
+    <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${esc(a.intent || 'General session')}</div>
+    ${a.status === 'preparing' && a.progress ? `<div class="progress-line">${esc(progressText(a.progress))}</div>` : ''}
+    <div class="meta">
+      <span class="mono">${a.id}</span>
+      ${a.git?.branch ? `<span class="branch" title="${esc(a.git.branch)}">⎇ ${esc(a.git.branch)}</span>` : ''}
+      ${a.prs.length ? `<span>${a.prs.length} PR</span>` : ''}
+      ${a.bugs.length ? `<span>${a.bugs.length} bug</span>` : ''}
+      ${a.usage?.total ? `<span title="${esc(usageTitle(a.usage))}">${fmtTokens(a.usage.total)} tok</span>` : ''}
+      ${(a.brief?.references ?? []).filter((r) => r.key && r.url).map((r) => `<span class="tag key-ref" title="${esc(r.title || r.url)}">${esc(r.label)}</span>`).join('')}
+      ${a.brief?.summary?.total
+        ? `<span class="${a.brief.summary.failed ? 'fail' : ''}" title="${esc(checksSummary(a.brief))}">✓${a.brief.summary.passed}/${a.brief.summary.total}${a.brief.summary.failed ? ` ✗${a.brief.summary.failed}` : ''}</span>`
+        : ''}
+      ${a.runtime.clients ? `<span title="terminals attached">◉ ${a.runtime.clients}</span>` : ''}
+    </div>
+  </li>`;
+}
+
+/** Agents grouped into projects, busiest and most urgent first. */
+function projectGroups(list) {
+  const groups = new Map();
+  for (const a of list) {
+    const p = a.projectInfo ?? { key: 'other', name: 'Other' };
+    if (!groups.has(p.key)) groups.set(p.key, { ...p, agents: [] });
+    groups.get(p.key).agents.push(a);
+  }
+  const out = [...groups.values()];
+  for (const g of out) {
+    g.agents.sort((a, b) => rank(a) - rank(b) || b.createdAt.localeCompare(a.createdAt));
+    g.running = g.agents.filter((a) => a.runtime.running).length;
+    g.waiting = g.agents.filter((a) => a.runtime.attention).length;
+    g.tokens = g.agents.reduce((n, a) => n + (a.usage?.total ?? 0), 0);
+  }
+  // Two different repos with the same name: show org/name to tell them apart.
+  const byName = Map.groupBy ? Map.groupBy(out, (g) => g.name) : null;
+  for (const g of out) {
+    const same = byName ? byName.get(g.name).length : out.filter((x) => x.name === g.name).length;
+    g.label = same > 1 && g.full ? g.full : g.name;
+  }
+  const special = (g) => (g.key === 'general' ? 1 : g.key === 'other' ? 2 : 0);
+  return out.sort((a, b) => special(a) - special(b) || b.waiting - a.waiting || b.running - a.running || a.label.localeCompare(b.label));
+}
+
 function renderList() {
   const waiting = [...agents.values()].filter((a) => a.runtime.attention).length;
   document.title = waiting ? `(${waiting}) Agent Manager` : 'Agent Manager';
-  const list = [...agents.values()]
-    .filter((a) => !filterText || `${a.name} ${a.intent} ${a.repo ?? ''} ${a.workdir ?? ''} ${a.id}`.toLowerCase().includes(filterText))
-    .sort((a, b) => rank(a) - rank(b) || b.createdAt.localeCompare(a.createdAt));
+  const list = [...agents.values()].filter(
+    (a) =>
+      !filterText ||
+      `${a.name} ${a.intent} ${a.repo ?? ''} ${a.workdir ?? ''} ${a.id} ${a.projectInfo?.name ?? ''}`.toLowerCase().includes(filterText),
+  );
   $('#empty').hidden = agents.size > 0;
 
-  const counts = { running: 0, stopped: 0, other: 0 };
-  for (const a of agents.values()) {
-    if (a.status === 'running') counts.running++;
-    else if (a.status === 'stopped' || a.status === 'exited') counts.stopped++;
-    else counts.other++;
-  }
+  const all = [...agents.values()];
+  const projects = new Set(all.map((a) => a.projectInfo?.key ?? 'other')).size;
+  const running = all.filter((a) => a.runtime.running).length;
   $('#counts').innerHTML = agents.size
-    ? `<span>${agents.size} agents</span><span>${counts.running} running</span><span>${counts.stopped} closed</span>
+    ? `<span title="Projects">${projects} project${projects === 1 ? '' : 's'}</span><span>${agents.size} agents</span><span>${running} running</span>
+       ${waiting ? `<span class="fail">${waiting} need${waiting === 1 ? 's' : ''} input</span>` : ''}
        <span class="spacer"></span><button class="link" id="flush-btn" title="Save session IDs, terminal scrollback and state to disk now (also automatic every 30s)">Save now</button>`
     : '';
 
-  $('#agent-list').innerHTML = list
-    .map((a) => {
-      const st = statusOf(a);
-      return `<li data-id="${a.id}" class="${a.id === selectedId ? 'selected' : ''}">
-        <div class="line1"><span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
-        <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${esc(a.intent || 'General session')}</div>
-        ${a.status === 'preparing' && a.progress ? `<div class="progress-line">${esc(progressText(a.progress))}</div>` : ''}
-        <div class="meta">
-          <span class="mono">${a.id}</span>
-          ${a.git?.branch ? `<span>⎇ ${esc(a.git.branch)}</span>` : ''}
-          ${a.prs.length ? `<span>${a.prs.length} PR</span>` : ''}
-          ${a.bugs.length ? `<span>${a.bugs.length} bug</span>` : ''}
-          ${a.usage?.total ? `<span title="${esc(usageTitle(a.usage))}">${fmtTokens(a.usage.total)} tok</span>` : ''}
-          ${(a.brief?.references ?? []).filter((r) => r.key && r.url).map((r) => `<span class="tag key-ref" title="${esc(r.title || r.url)}">${esc(r.label)}</span>`).join('')}
-          ${a.brief?.summary?.total
-            ? `<span class="${a.brief.summary.failed ? 'fail' : ''}" title="${esc(checksSummary(a.brief))}">✓${a.brief.summary.passed}/${a.brief.summary.total}${a.brief.summary.failed ? ` ✗${a.brief.summary.failed}` : ''}</span>`
-            : ''}
-          ${a.runtime.clients ? `<span title="terminals attached">◉ ${a.runtime.clients}</span>` : ''}
-        </div>
+  $('#agent-list').innerHTML = projectGroups(list)
+    .map((g) => {
+      // While filtering, show every match; otherwise respect collapsed projects.
+      const open = filterText || !collapsed.has(g.key) || g.agents.some((a) => a.id === selectedId);
+      return `<li class="project ${open ? 'open' : ''}">
+        <button class="project-head" data-toggle="${esc(g.key)}" aria-expanded="${open}" title="${esc(g.full || g.name)}">
+          <span class="caret">${open ? '▾' : '▸'}</span>
+          <span class="pname">${esc(g.label)}</span>
+          <span class="pcounts">
+            ${g.waiting ? `<span class="pill attention" title="needs input">${g.waiting}</span>` : ''}
+            <span title="running / agents">${g.running}/${g.agents.length}</span>
+          </span>
+        </button>
+        ${open ? `<ul class="project-agents">${g.agents.map(agentItem).join('')}</ul>` : ''}
       </li>`;
     })
     .join('');
 }
+
+// ------------------------------------------------------------------ backlog
+
+const ITEM_ACTIONS = {
+  queued: [['up', '▲', 'Move up'], ['down', '▼', 'Move down'], ['start', 'Start now', 'Start now, even if the project is at its limit'], ['cancel', 'Cancel', '']],
+  active: [['open', 'Open', 'Open its agent'], ['accept', 'Done', 'Mark done now'], ['cancel', 'Cancel', '']],
+  review: [['accept', 'Accept', 'Accept the work: done'], ['reopen', 'Reopen', 'Send it back to the same agent with a note'], ['open', 'Open', 'Open its agent']],
+  blocked: [['start', 'Retry', 'Retry the agent'], ['open', 'Open', 'Open its agent'], ['cancel', 'Cancel', '']],
+  done: [['reopen', 'Reopen', ''], ['open', 'Open', ''], ['remove', '✕', 'Remove from the list']],
+  cancelled: [['remove', '✕', 'Remove from the list']],
+};
+
+function renderBacklog() {
+  const open = backlogState.items.filter((i) => ['queued', 'active', 'review', 'blocked'].includes(i.status));
+  const review = backlogState.items.filter((i) => i.status === 'review').length;
+  $('#backlog-count').textContent = open.length ? String(open.length) : '';
+  $('#backlog-count').className = `badge ${review ? 'attention' : ''}`;
+  if (sideTab !== 'backlog') return;
+
+  const items = backlogState.items.filter((i) => showCompleted || !['done', 'cancelled'].includes(i.status));
+  const groups = new Map();
+  for (const it of items) {
+    if (!groups.has(it.projectKey)) groups.set(it.projectKey, { key: it.projectKey, name: it.projectName, items: [] });
+    groups.get(it.projectKey).items.push(it);
+  }
+  const proj = Object.fromEntries(backlogState.projects.map((p) => [p.key, p]));
+  const count = (s) => backlogState.items.filter((i) => i.status === s).length;
+  $('#backlog-view').innerHTML = `
+    <div class="counts">
+      <span>${count('queued')} queued</span><span>${count('active')} active</span>
+      ${count('review') ? `<span class="fail">${count('review')} to review</span>` : '<span>0 to review</span>'}
+      <span class="spacer"></span>
+      <button class="link" data-bl="toggle-run" title="${backlogState.autoRun ? 'Stop starting new items (running ones continue)' : 'Start picking up queued items again'}">${backlogState.autoRun ? '⏸ Pause' : '▶ Resume'}</button>
+      <button class="link" data-bl="add">+ Add</button>
+    </div>
+    ${!backlogState.autoRun ? '<p class="hint bl-paused">Paused: queued items wait until you resume.</p>' : ''}
+    ${items.length
+      ? `<ul class="agent-list">${[...groups.values()]
+          .map((g) => {
+            const p = proj[g.key] ?? { limit: backlogState.defaultLimit };
+            return `<li class="project open">
+              <div class="project-head bl-head">
+                <span class="pname">${esc(g.name)}</span>
+                <button class="link" data-bl="limit" data-project="${esc(g.key)}" data-name="${esc(g.name)}" title="How many items of this project agents work on at once">${p.limit} at a time ✎</button>
+              </div>
+              <ul class="project-agents">${g.items.map(itemRow).join('')}</ul>
+            </li>`;
+          })
+          .join('')}</ul>`
+      : `<div class="empty"><p>The backlog is empty.</p><p>Add asks with <b>+ Add</b> (or <b>+ New agents</b> → Queue in backlog). Agents pick them up one by one, ${backlogState.defaultLimit} at a time per project, until each is done.</p></div>`}
+    <p class="hint bl-foot"><label><input type="checkbox" data-bl="completed" ${showCompleted ? 'checked' : ''}/> Show done and cancelled</label></p>`;
+}
+
+function itemRow(it) {
+  const a = it.agent;
+  const st = it.status === 'active' && a?.attention ? 'attention' : it.status;
+  return `<li class="agent bl-item ${it.status}" data-item="${it.id}">
+    <div class="line1">
+      <button class="prio p${it.priority}" data-bl="prio" title="Priority (click to change)">P${it.priority}</button>
+      <span class="name">${esc(it.title)}</span>
+      <span class="pill ${st === 'review' ? 'waiting' : st === 'active' ? 'working' : st}">${st === 'attention' ? 'needs input' : st}</span>
+    </div>
+    <div class="meta">
+      <span class="mono">${it.id}</span>
+      ${a ? `<span>agent <a href="#${a.id}" data-bl="open">${esc(a.name)}</a>${a.briefStatus ? ` · brief: ${esc(a.briefStatus)}` : ''}</span>` : ''}
+      ${it.base ? `<span>⎇ from ${esc(it.base)}</span>` : ''}
+      ${it.doneAt ? `<span>done ${ago(it.doneAt)}</span>` : it.reviewAt ? `<span>ready ${ago(it.reviewAt)}</span>` : it.startedAt ? `<span>started ${ago(it.startedAt)}</span>` : `<span>added ${ago(it.createdAt)}</span>`}
+    </div>
+    <div class="bl-actions">${(ITEM_ACTIONS[it.status] ?? []).map(([act, label, title]) => `<button class="small" data-bl="${act}" title="${esc(title)}">${label}</button>`).join('')}</div>
+  </li>`;
+}
+
+function showTab(tab) {
+  sideTab = tab;
+  for (const b of document.querySelectorAll('.side-tab')) b.classList.toggle('active', b.dataset.tab === tab);
+  $('#agents-view').hidden = tab !== 'agents';
+  $('#backlog-view').hidden = tab !== 'backlog';
+  renderBacklog();
+}
+for (const b of document.querySelectorAll('.side-tab')) b.onclick = () => showTab(b.dataset.tab);
+
+$('#backlog-view').addEventListener('click', async (e) => {
+  const el = e.target.closest('[data-bl]');
+  if (!el) return;
+  const what = el.dataset.bl;
+  const id = el.closest('[data-item]')?.dataset.item;
+  const it = backlogState.items.find((x) => x.id === id);
+  if (what === 'completed') {
+    showCompleted = el.checked;
+    return renderBacklog();
+  }
+  e.preventDefault();
+  const blApi = (method, route, body) => act(() => api(method, route, body));
+  switch (what) {
+    case 'toggle-run':
+      return blApi('POST', '/backlog/settings', { autoRun: !backlogState.autoRun });
+    case 'add':
+      return openNewDialog('backlog');
+    case 'limit': {
+      const n = prompt(`How many "${el.dataset.name}" items should agents work on at once?`, el.textContent.split(' ')[0]);
+      if (n === null) return;
+      return blApi('POST', '/backlog/settings', { project: el.dataset.project, limit: Number(n) });
+    }
+    case 'prio':
+      return blApi('PATCH', `/backlog/${id}`, { priority: (it.priority % 3) + 1 });
+    case 'up':
+    case 'down':
+      return blApi('POST', `/backlog/${id}/move`, { where: what });
+    case 'start':
+      return blApi('POST', `/backlog/${id}/start`);
+    case 'accept':
+      return blApi('POST', `/backlog/${id}/accept`);
+    case 'reopen': {
+      const note = prompt('What still needs doing? (sent to the same agent)', '');
+      if (note === null) return;
+      return blApi('POST', `/backlog/${id}/reopen`, { note });
+    }
+    case 'cancel':
+      if (!confirm('Cancel this item? Its agent (if any) keeps its session; close or delete it separately.')) return;
+      return blApi('POST', `/backlog/${id}/cancel`);
+    case 'remove':
+      return blApi('DELETE', `/backlog/${id}`);
+    case 'open': {
+      const agentId = it?.agent?.id;
+      if (!agentId) return;
+      showTab('agents');
+      return select(agentId);
+    }
+  }
+});
 
 // ------------------------------------------------------------------ detail
 
@@ -327,6 +517,12 @@ function renderDetail() {
         <button class="danger" data-act="delete">Delete</button>
       </div>
     </div>
+    ${(() => {
+      const it = a.backlogItem && backlogState.items.find((x) => x.id === a.backlogItem);
+      if (!it) return '';
+      return `<div class="bl-banner ${it.status}">Backlog item <code>${it.id}</code>: <b>${esc(it.status)}</b>
+        ${it.status === 'review' ? `<span class="spacer"></span><button class="small primary" data-backlog-accept="${it.id}">Accept</button> <button class="small" data-backlog-reopen="${it.id}">Reopen</button>` : ''}</div>`;
+    })()}
     ${a.error ? `<div class="error-box">${esc(a.error)}</div>` : ''}
     ${a.status === 'preparing'
       ? `<div class="progress-box">
@@ -367,6 +563,7 @@ function renderDetail() {
         <h3>Workspace</h3>
         <dl class="kv">
           <dt>Folder</dt><dd><code>${esc(a.workdir ?? (a.status === 'preparing' ? 'preparing…' : '—'))}</code>${a.workdir ? copyBtn(a.workdir) : ''}</dd>
+          <dt>Project</dt><dd>${esc(a.projectInfo?.full || a.projectInfo?.name || '—')} <button class="link" data-act="project" title="Group this agent under a different project name">✎</button></dd>
           <dt>Repo</dt><dd>${a.repo ? `<code>${esc(a.repo)}</code>` : '—'}</dd>
           <dt>Branch</dt><dd>${a.git?.branch ? `<code>${esc(a.git.branch)}</code>` : '—'}${a.git?.dirtyFiles ? ` <span class="tag">${a.git.dirtyFiles} changed</span>` : ''}</dd>
           <dt>Head</dt><dd>${a.git?.head ? `<code>${esc(a.git.head.sha)}</code> ${esc(a.git.head.subject)}` : '—'}</dd>
@@ -433,6 +630,7 @@ function renderDetail() {
 
 function render() {
   renderList();
+  renderBacklog();
   renderDetail();
   term.syncOverlay();
 }
@@ -606,6 +804,14 @@ $('#counts').addEventListener('click', (e) => {
 });
 
 $('#agent-list').addEventListener('click', (e) => {
+  const head = e.target.closest('[data-toggle]');
+  if (head) {
+    const key = head.dataset.toggle;
+    if (collapsed.has(key)) collapsed.delete(key);
+    else collapsed.add(key);
+    saveCollapsed();
+    return renderList();
+  }
   const li = e.target.closest('li[data-id]');
   if (li) select(li.dataset.id);
 });
@@ -616,6 +822,12 @@ $('#detail-body').addEventListener('click', async (e) => {
   const btn = e.target.closest('button');
   if (!btn) return;
 
+  if (btn.dataset.backlogAccept) return act(() => api('POST', `/backlog/${btn.dataset.backlogAccept}/accept`), 'Accepted: done');
+  if (btn.dataset.backlogReopen) {
+    const note = prompt('What still needs doing? (sent to this agent)', '');
+    if (note === null) return;
+    return act(() => api('POST', `/backlog/${btn.dataset.backlogReopen}/reopen`, { note }), 'Reopened');
+  }
   if (btn.dataset.more) {
     const key = btn.dataset.more;
     if (expanded.has(key)) expanded.delete(key);
@@ -655,6 +867,12 @@ $('#detail-body').addEventListener('click', async (e) => {
         term.open(a.id);
       }, 'Moved into the repository');
       break;
+    case 'project': {
+      const name = prompt('Project name for this agent (leave empty to use its repo):', a.project ?? a.projectInfo?.name ?? '');
+      if (name === null) return;
+      act(async () => upsert(await api('PATCH', `/agents/${a.id}`, { project: name })));
+      break;
+    }
     case 'explain':
       btn.disabled = true;
       btn.textContent = 'Explaining…';
@@ -726,11 +944,20 @@ $('#filter').addEventListener('input', (e) => {
 // ------------------------------------------------------------------ new agents dialog
 
 const dialog = $('#new-dialog');
-$('#new-btn').onclick = () => {
+function openNewDialog(mode = 'now') {
   $('#new-error').hidden = true;
+  dialog.querySelector(`input[name="when"][value="${mode}"]`).checked = true;
+  syncWhen();
   dialog.showModal();
   dialog.querySelector('textarea').focus();
-};
+}
+function syncWhen() {
+  const queue = dialog.querySelector('input[name="when"]:checked').value === 'backlog';
+  dialog.querySelector('.now-only').hidden = queue;
+  dialog.querySelector('button[type=submit]').textContent = queue ? 'Add to backlog' : 'Create agents';
+}
+for (const r of dialog.querySelectorAll('input[name="when"]')) r.addEventListener('change', syncWhen);
+$('#new-btn').onclick = () => openNewDialog('now');
 $('#new-cancel').onclick = () => dialog.close();
 $('#new-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -739,6 +966,30 @@ $('#new-form').addEventListener('submit', async (e) => {
     .split('\n')
     .map((s) => s.trim())
     .filter(Boolean);
+  if (f.get('when') === 'backlog') {
+    try {
+      const added = await api('POST', '/backlog', {
+        items: intents,
+        repo: f.get('repo') || undefined,
+        dir: f.get('dir') || undefined,
+        base: f.get('base') || undefined,
+        project: f.get('project') || undefined,
+        permissionMode: f.get('permissionMode') || undefined,
+        model: f.get('model') || undefined,
+        worktree: f.get('worktree') ? true : undefined,
+        plan: Boolean(f.get('plan')),
+        priority: Number(f.get('priority')),
+      });
+      dialog.close();
+      e.target.reset();
+      showTab('backlog');
+      toast(`Queued ${added.length} item${added.length > 1 ? 's' : ''}`);
+    } catch (err) {
+      $('#new-error').textContent = err.message;
+      $('#new-error').hidden = false;
+    }
+    return;
+  }
   try {
     const created = await api('POST', '/agents', {
       intents,
@@ -748,6 +999,7 @@ $('#new-form').addEventListener('submit', async (e) => {
       model: f.get('model') || undefined,
       worktree: f.get('worktree') ? true : undefined,
       base: f.get('base') || undefined,
+      project: f.get('project') || undefined,
       plan: Boolean(f.get('plan')),
       start: Boolean(f.get('start')),
     });
@@ -808,6 +1060,7 @@ function handleEvent(msg) {
   if (msg.t === 'snapshot') {
     agents.clear();
     msg.agents.forEach((a) => agents.set(a.id, a));
+    if (msg.backlog) backlogState = msg.backlog;
     if (selectedId && !agents.has(selectedId)) selectedId = null;
     if (openTermOnLoad && selectedId) {
       if (hashView === 'shell') term.open(selectedId, 'shell');
@@ -819,6 +1072,8 @@ function handleEvent(msg) {
   } else if (msg.t === 'removed') {
     agents.delete(msg.id);
     if (selectedId === msg.id) select(null);
+  } else if (msg.t === 'backlog') {
+    backlogState = msg.backlog;
   }
   render();
 }
@@ -959,6 +1214,69 @@ $('#remote-content').addEventListener('click', async (e) => {
   }
   renderRemote();
 });
+
+// ------------------------------------------------------------------ Slack alerts (from this computer)
+
+async function loadAlerts() {
+  const n = await api('GET', '/notify');
+  const f = $('#alerts-form');
+  f.webhookUrl.value = '';
+  f.botToken.value = '';
+  f.channel.value = n.slack.channel ?? '';
+  f.webhookUrl.placeholder = n.slack.webhookUrl ?? 'https://hooks.slack.com/services/…';
+  f.botToken.placeholder = n.slack.botToken ?? 'xoxb-…';
+  for (const k of Object.keys(n.events)) f[`ev_${k}`].checked = n.events[k];
+  f.needsInputDelaySec.value = n.needsInputDelaySec;
+  f.waitingDelaySec.value = n.waitingDelaySec;
+  f.skipWhenWatching.checked = n.skipWhenWatching;
+  f.includeIntent.checked = n.includeIntent;
+  f.enabled.checked = n.enabled;
+  $('#alerts-current').textContent = n.configured
+    ? `Configured: ${n.slack.channel ? `bot token → ${n.slack.channel}` : `webhook ${n.slack.webhookUrl}`}. Leave the fields empty to keep it.`
+    : 'Not configured yet.';
+  $('#alerts-recent').innerHTML = n.recent.length
+    ? `Recent: ${n.recent.slice(0, 5).map((r) => `${esc(r.kind)} · ${esc(r.agent)} · ${r.error ? `<span class="error">${esc(r.error)}</span>` : 'sent'} · ${ago(r.at)}`).join('<br>')}`
+    : '';
+  $('#alerts-error').hidden = true;
+}
+
+$('#alerts-btn').onclick = async () => {
+  $('#alerts-dialog').showModal();
+  await loadAlerts().catch((err) => toast(err.message));
+};
+$('#alerts-close').onclick = () => $('#alerts-dialog').close();
+$('#alerts-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {
+    events: { needsInput: f.ev_needsInput.checked, review: f.ev_review.checked, error: f.ev_error.checked, waiting: f.ev_waiting.checked },
+    needsInputDelaySec: Number(f.needsInputDelaySec.value),
+    waitingDelaySec: Number(f.waitingDelaySec.value),
+    skipWhenWatching: f.skipWhenWatching.checked,
+    includeIntent: f.includeIntent.checked,
+    enabled: f.enabled.checked,
+    channel: f.channel.value.trim() || undefined,
+  };
+  if (f.webhookUrl.value.trim()) body.webhookUrl = f.webhookUrl.value.trim();
+  if (f.botToken.value.trim()) body.botToken = f.botToken.value.trim();
+  try {
+    await api('POST', '/notify', body);
+    toast('Alert settings saved');
+    await loadAlerts();
+  } catch (err) {
+    $('#alerts-error').textContent = err.message;
+    $('#alerts-error').hidden = false;
+  }
+});
+$('#alerts-test').onclick = async () => {
+  try {
+    await api('POST', '/notify/test');
+    toast('Test message sent to Slack');
+  } catch (err) {
+    $('#alerts-error').textContent = err.message;
+    $('#alerts-error').hidden = false;
+  }
+};
 
 // ------------------------------------------------------------------ remote sign-in
 

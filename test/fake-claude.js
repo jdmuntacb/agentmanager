@@ -12,8 +12,14 @@ if (args.includes('-p')) {
   process.stdin.on('data', (d) => (input += d));
   process.stdin.on('end', () => {
     const ok = args[args.indexOf('--tools') + 1] === '' && args.includes('--strict-mcp-config');
-    const intent = input.match(/<intent>\n([\s\S]*?)\n<\/intent>/)?.[1];
-    process.stdout.write(`### In one line\n${ok ? 'Safe call.' : 'UNSAFE call.'} Intent: ${intent}\n### The intent\nx\n`, () => process.exit(0));
+    const section = (tag) => input.match(new RegExp(`<${tag}>\\n([\\s\\S]*?)\\n</${tag}>`))?.[1] ?? '';
+    const conv = section('conversation');
+    process.stdout.write(
+      `### The ask\n${ok ? 'Safe call.' : 'UNSAFE call.'} Intent: ${section('intent')}\n` +
+        `### Where it stands\n${section('agent_status').split('\n')[0]}\n` +
+        `### Conclusions so far\nsaw agent text: ${conv.includes('[agent] Looking at')}; repo: ${section('repository').split('\n')[0]}\n`,
+      () => process.exit(0),
+    );
   });
   await new Promise(() => {});
 }
@@ -41,6 +47,8 @@ if (briefDir) {
     path.join(briefDir, 'BRIEF.md'),
     [
       '# Brief',
+      // "#done" in the intent: act as if the task is finished.
+      (args.includes('--') && args[args.indexOf('--') + 1]?.includes('#done')) || process.env.FAKE_DONE ? 'Status: done' : 'Status: working',
       '## Problem',
       'Login fails for **SSO** users.',
       '## Solution',
@@ -62,6 +70,9 @@ if (briefDir) {
       '',
     ].join('\n'),
   );
+}
+if (args.includes('--') && args[args.indexOf('--') + 1]?.includes('#ask')) {
+  setTimeout(() => process.stdout.write('\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\n'), 200);
 }
 process.stdout.write(`fake-claude ready ${args.includes('--resume') ? 'resumed' : 'new'} ${sid}\r\n`);
 process.stdin.setRawMode?.(true);

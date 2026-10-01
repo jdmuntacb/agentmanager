@@ -197,3 +197,55 @@ x
     ],
   );
 });
+
+test('sessionDigest keeps the ask, the agent\'s words and one line per action', async () => {
+  const { sessionDigest } = await import('../src/tracker.js');
+  const file = path.join(tmp(), 'd.jsonl');
+  const rec = (type, content, extra = {}) => JSON.stringify({ type, message: { content }, ...extra }) + '\n';
+  fs.writeFileSync(
+    file,
+    rec('user', 'Fix the login bug <system-reminder>noise</system-reminder>') +
+      rec('assistant', [{ type: 'thinking', thinking: 'secret' }, { type: 'text', text: 'Plan: 1) reproduce 2) fix' }]) +
+      rec('assistant', [{ type: 'tool_use', name: 'Bash', input: { command: 'go test ./auth', description: 'Run auth tests' } }]) +
+      rec('user', [{ type: 'tool_result', content: 'huge output' }]) +
+      rec('assistant', [{ type: 'tool_use', name: 'Edit', input: { file_path: '/r/auth/session.go' } }]) +
+      rec('assistant', [{ type: 'tool_use', name: 'Read', input: { file_path: '/r/x.go' } }]) +
+      rec('assistant', [{ type: 'tool_use', name: 'AskUserQuestion', input: { questions: [{ question: 'Keep the old API?' }] } }]) +
+      rec('user', 'meta', { isMeta: true }),
+  );
+  const d = sessionDigest(file);
+  assert.deepEqual(d.digest.split('\n'), [
+    '[user] Fix the login bug',
+    '[agent] Plan: 1) reproduce 2) fix',
+    '[action] ran: Run auth tests',
+    '[action] edited /r/auth/session.go',
+    '[action] asked the user: Keep the old API?',
+  ]);
+  assert.deepEqual(d.edited, ['/r/auth/session.go']);
+  // Over budget: the first request stays, the oldest of the rest are dropped.
+  const small = sessionDigest(file, { maxChars: 90 }).digest.split('\n');
+  assert.equal(small[0], '[user] Fix the login bug');
+  assert.match(small[1], /earlier events omitted/);
+  assert.equal(small.at(-1), '[action] asked the user: Keep the old API?');
+});
+
+test('projectOf groups by repo across URL forms, then folder, general and other', async () => {
+  const { projectOf } = await import('../src/manager.js');
+  const https = projectOf({ repo: 'https://github.com/couchbasecloud/couchbase-cloud.git' });
+  const ssh = projectOf({ git: { remote: 'git@github.com:couchbasecloud/couchbase-cloud.git' } });
+  assert.equal(https.key, ssh.key, 'URL and a clone of the same repo group together');
+  assert.equal(https.name, 'couchbase-cloud');
+  assert.equal(https.full, 'couchbasecloud/couchbase-cloud');
+  assert.equal(projectOf({ kind: 'general' }).name, 'General');
+  assert.equal(projectOf({ sourceDir: '/Users/me/src/tools', workdir: '/x' }).name, 'tools');
+  assert.equal(projectOf({ workdir: '/Users/me/notes' }).name, 'notes');
+  assert.equal(projectOf({}).name, 'Other');
+  assert.deepEqual(projectOf({ project: 'Fusion', repo: 'https://github.com/a/b' }), { key: 'custom:fusion', name: 'Fusion', source: 'custom' });
+});
+
+test('parseBrief reads the status line', async () => {
+  const { parseBrief } = await import('../src/brief.js');
+  assert.equal(parseBrief('# Brief\nStatus: done\n## Problem\nx').status, 'done');
+  assert.equal(parseBrief('**Status:** Blocked\n## Problem\nx').status, 'blocked');
+  assert.equal(parseBrief('## Problem\nStatus: done is not the status line').status, null);
+});

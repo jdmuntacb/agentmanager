@@ -16,6 +16,7 @@ import {
   prsForBranch,
   recentSessionFiles,
   scanTranscript,
+  sessionDigest,
   subagentTranscripts,
   sumUsage,
   transcriptPath,
@@ -61,6 +62,33 @@ const handoffMessage = (agent) =>
   `The repository is ready. You are now in its working copy at ${agent.workdir}` +
   `${agent.branch ? ` (branch ${agent.branch})` : ''}. First review its CLAUDE.md, skills and hooks as instructed, ` +
   'then continue with the plan we agreed on.';
+
+/**
+ * The project an agent belongs to, for grouping: a user-set name, else its repo
+ * (URL or the clone's origin remote, so a URL and a local clone of the same repo
+ * group together), else the folder's name.
+ */
+export function projectOf(agent) {
+  if (agent.project) return { key: `custom:${agent.project.toLowerCase()}`, name: agent.project, source: 'custom' };
+  if (agent.kind === 'general') return { key: 'general', name: 'General', source: 'general' };
+  const url = agent.repo || agent.git?.remote;
+  if (url && /[:/]/.test(url)) {
+    const path = url
+      .trim()
+      .replace(/^[a-z+]+:\/\//i, '')
+      .replace(/^[^@/]+@/, '')
+      .replace(':', '/')
+      .replace(/\.git$/, '')
+      .replace(/\/+$/, '');
+    const parts = path.split('/').filter(Boolean);
+    const name = parts.at(-1) || path;
+    // github.com/org/repo -> key "github.com/org/repo"; file:// paths keep their full path.
+    return { key: `repo:${path.toLowerCase()}`, name, full: parts.slice(-2).join('/'), source: 'repo' };
+  }
+  const folder = agent.sourceDir || agent.requestedDir || (agent.workdir?.startsWith(paths.workspaces) ? null : agent.workdir);
+  if (folder) return { key: `dir:${folder}`, name: path.basename(folder), full: folder, source: 'folder' };
+  return { key: 'other', name: 'Other', source: 'other' };
+}
 
 export function slugify(text, max = 30) {
   return (
@@ -148,6 +176,7 @@ export class AgentManager extends EventEmitter {
     const costs = (agent.sessions ?? []).map((s) => s.cost?.usd).filter((c) => c != null);
     return {
       ...agent,
+      projectInfo: projectOf(agent),
       usage,
       // Claude Code's own cost figure from the transcripts (absent until it records one).
       costUsd: costs.length ? costs.reduce((a, b) => a + b, 0) : null,
@@ -205,6 +234,7 @@ export class AgentManager extends EventEmitter {
     model,
     start = true,
     plan = false,
+    project,
   }) {
     intent = (intent ?? '').trim();
     const general = kind === 'general';
@@ -217,6 +247,7 @@ export class AgentManager extends EventEmitter {
     const agent = {
       id,
       kind: general ? 'general' : 'task',
+      project: project?.trim() || null,
       name: name?.trim() || slug,
       slug,
       intent,
@@ -794,7 +825,8 @@ export class AgentManager extends EventEmitter {
   update(ref, fields) {
     const agent = this.mustGet(ref);
     const allowed = {};
-    for (const key of ['name', 'notes', 'permissionMode', 'model']) if (key in fields) allowed[key] = fields[key];
+    for (const key of ['name', 'notes', 'permissionMode', 'model', 'project']) if (key in fields) allowed[key] = fields[key];
+    if ('project' in allowed) allowed.project = String(allowed.project ?? '').trim() || null;
     return this.view(this.patch(agent.id, allowed));
   }
 
@@ -1004,13 +1036,63 @@ export class AgentManager extends EventEmitter {
     const agent = this.mustGet(ref);
     this.explaining ??= new Map();
     if (this.explaining.has(agent.id)) return this.explaining.get(agent.id);
+    this.patch(agent.id, { explanation: { ...agent.explanation, pending: true, error: null } });
+    const run = this.explainContext(agent)
+      .then((ctx) => this.runExplain(agent, ctx))
+      .catch((e) => {
+        if (this.store.get(agent.id)) {
+          this.patch(agent.id, { explanation: { ...this.store.get(agent.id).explanation, pending: false, error: e.message } });
+        }
+        throw e;
+      })
+      .finally(() => this.explaining.delete(agent.id));
+    this.explaining.set(agent.id, run);
+    return run;
+  }
+
+  /** What the agent is actually doing: its session, repo changes, live status and brief. */
+  async explainContext(agent) {
+    const v = this.view(agent);
     const file = briefPath(agent.id);
     const briefMarkdown = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    const planningOnly = agent.planning && !agent.planning.handedOffAt && !agent.workdir;
+    const sessionDir = planningOnly ? agent.planning.dir : agent.workdir;
+    const { digest } = sessionDir ? sessionDigest(transcriptPath(sessionDir, agent.sessionId)) : { digest: '' };
+    const phase = v.runtime.planning ? 'planning while the workspace is prepared' : agent.status;
+    const status = [
+      `status: ${phase}${v.runtime.running ? (v.runtime.busy ? ' (working right now)' : ' (idle, waiting for the next instruction)') : ''}`,
+      v.runtime.attention ? `blocked on: ${v.runtime.attention} (waiting for the user to answer in the terminal)` : null,
+      agent.error ? `error: ${agent.error}` : null,
+      `last activity: ${v.runtime.lastOutputAt ?? agent.sessions.find((s) => s.id === agent.sessionId)?.lastActivity ?? 'unknown'}`,
+      agent.repo ? `repo: ${agent.repo}` : null,
+      agent.git?.branch ? `branch: ${agent.git.branch}${agent.baseRef ? ` (branched from ${agent.baseRef})` : ''}` : null,
+      v.prs.length ? `PRs: ${v.prs.map((p) => `${p.url}${p.state ? ` [${p.state}]` : ''}${p.title ? ` ${p.title}` : ''}`).join('; ')}` : null,
+      v.bugs.length ? `issues: ${v.bugs.map((b) => b.key).join(', ')}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    let repo = '';
+    if (agent.workdir) {
+      const sha = agent.baseRef?.split(' @ ')[1];
+      const ch = await git.changeSummary(agent.workdir, sha).catch(() => null);
+      if (ch) {
+        repo = [
+          ch.commits.length ? `commits since branching:\n${ch.commits.join('\n')}` : 'no commits since branching',
+          ch.uncommitted.length ? `uncommitted changes:\n${ch.uncommitted.join('\n')}` : 'no uncommitted changes',
+          ch.diffstat ? `diffstat:\n${ch.diffstat}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+    return { intent: agent.intent, status, digest, repo, briefMarkdown };
+  }
+
+  runExplain(agent, ctx) {
     const args = [...(this.config.claudeArgs ?? []), '-p', '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
     args.push('--output-format', 'text');
     if (this.config.explainModel) args.push('--model', this.config.explainModel);
-    this.patch(agent.id, { explanation: { ...agent.explanation, pending: true, error: null } });
-    const run = new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const child = spawn(this.config.claudeBin, args, { cwd: paths.home, env: this.childEnv(agent), stdio: ['pipe', 'pipe', 'pipe'] });
       let out = '';
       let err = '';
@@ -1023,26 +1105,16 @@ export class AgentManager extends EventEmitter {
         if (code === 0 && out.trim()) resolve(out.trim());
         else reject(new Error(`claude -p failed (exit ${code}): ${(err || out).trim().slice(-300)}`));
       });
-      child.stdin.end(explainPrompt({ intent: agent.intent, briefMarkdown }));
-    })
-      .then((markdown) => {
-        const cur = this.store.get(agent.id);
-        if (!cur) return null;
-        return this.view(
-          this.patch(agent.id, {
-            explanation: { markdown, at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null },
-          }),
-        );
-      })
-      .catch((e) => {
-        if (this.store.get(agent.id)) {
-          this.patch(agent.id, { explanation: { ...this.store.get(agent.id).explanation, pending: false, error: e.message } });
-        }
-        throw e;
-      })
-      .finally(() => this.explaining.delete(agent.id));
-    this.explaining.set(agent.id, run);
-    return run;
+      child.stdin.end(explainPrompt(ctx));
+    }).then((markdown) => {
+      const cur = this.store.get(agent.id);
+      if (!cur) return null;
+      return this.view(
+        this.patch(agent.id, {
+          explanation: { markdown, at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null },
+        }),
+      );
+    });
   }
 
   briefFile(ref) {

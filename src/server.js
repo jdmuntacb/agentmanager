@@ -8,6 +8,8 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { ensureHome, HOST, loadConfig, paths, PORT } from './config.js';
 import { AgentManager } from './manager.js';
+import { Backlog } from './backlog.js';
+import { Notifier, loadNotify, publicNotify, saveNotify, sendSlack } from './notify.js';
 import * as remote from './remote.js';
 import { Store } from './store.js';
 
@@ -35,13 +37,23 @@ function isAllowedOrigin(origin, port) {
 }
 
 const PUBLIC_REMOTE_API = new Set(['POST /api/login', 'GET /api/session']);
-const LOCAL_ONLY_API = /^\/api\/(remote(\/|$)|shutdown$)/;
+const LOCAL_ONLY_API = /^\/api\/(remote(\/|$)|notify(\/|$)|shutdown$)/;
 
 export async function startServer({ port = PORT, host = HOST } = {}) {
   ensureHome();
   const config = loadConfig();
   const store = new Store(paths.state);
   const manager = new AgentManager({ store, config });
+  const backlog = new Backlog({ manager, store, config });
+  // Alerts link to the phone address when remote access is on, else the local UI.
+  const notifier = new Notifier({
+    manager,
+    backlog,
+    linkFor: (id) => {
+      const phone = remoteServer ? remote.remoteUrls(remotePort).find((u) => !u.vpn) : null;
+      return `${phone ? phone.url : `http://127.0.0.1:${port}/`}#${id}/term`;
+    },
+  });
   let remoteServer = null;
   let remotePort = null;
 
@@ -141,6 +153,56 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   api.post('/agents/:id/links', wrap((req) => manager.addLink(req.params.id, req.body ?? {})));
   api.delete('/agents/:id/links', wrap((req) => manager.removeLink(req.params.id, req.query)));
   api.post('/flush', wrap(() => manager.flush()));
+
+  // ---------------------------------------------------------- Slack alerts (local only)
+  const okUrl = (u) => /^https:\/\/[\w.-]+\//.test(u) || /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(u);
+  api.get('/notify', wrap(() => ({ ...publicNotify(), recent: notifier.log })));
+  api.post(
+    '/notify',
+    wrap((req) => {
+      const b = req.body ?? {};
+      const slack = {};
+      if (b.webhookUrl !== undefined) {
+        if (b.webhookUrl && !okUrl(b.webhookUrl)) throw fail(400, 'The webhook URL must be https://…');
+        slack.webhookUrl = b.webhookUrl || null;
+      }
+      if (b.botToken !== undefined) slack.botToken = b.botToken || null;
+      if (b.channel !== undefined) slack.channel = b.channel || null;
+      const patch = { slack };
+      for (const k of ['enabled', 'skipWhenWatching', 'includeIntent']) if (typeof b[k] === 'boolean') patch[k] = b[k];
+      for (const k of ['needsInputDelaySec', 'waitingDelaySec']) if (Number(b[k]) >= 0) patch[k] = Number(b[k]);
+      if (b.events && typeof b.events === 'object') patch.events = b.events;
+      const next = saveNotify(patch);
+      // Configuring Slack for the first time turns alerts on.
+      if (b.enabled === undefined && (slack.webhookUrl || (slack.botToken && (b.channel ?? next.slack.channel)))) saveNotify({ enabled: true });
+      return { ...publicNotify(), recent: notifier.log };
+    }),
+  );
+  api.post(
+    '/notify/test',
+    wrap(async () => {
+      await sendSlack(':wave: Test from Agent Manager: alerts will arrive here when an agent needs you.', loadNotify());
+      return { ok: true };
+    }),
+  );
+
+  // ---------------------------------------------------------- backlog
+  api.get('/backlog', wrap(() => backlog.view()));
+  api.post(
+    '/backlog',
+    wrap((req) => {
+      const { items, item, ...opts } = req.body ?? {};
+      return backlog.add(Array.isArray(items) ? items : [item], opts);
+    }),
+  );
+  api.post('/backlog/settings', wrap((req) => backlog.settings(req.body ?? {})));
+  api.patch('/backlog/:id', wrap((req) => backlog.update(req.params.id, req.body ?? {})));
+  api.delete('/backlog/:id', wrap((req) => backlog.remove(req.params.id)));
+  api.post('/backlog/:id/start', wrap((req) => backlog.start(req.params.id)));
+  api.post('/backlog/:id/accept', wrap((req) => backlog.accept(req.params.id)));
+  api.post('/backlog/:id/reopen', wrap((req) => backlog.reopen(req.params.id, req.body ?? {})));
+  api.post('/backlog/:id/cancel', wrap((req) => backlog.cancel(req.params.id)));
+  api.post('/backlog/:id/move', wrap((req) => backlog.move(req.params.id, req.body?.where)));
   api.post(
     '/shutdown',
     wrap(() => {
@@ -250,7 +312,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   const eventSinks = new Set();
   api.get('/events/stream', (req, res) => {
     const send = sse(req, res);
-    send({ t: 'snapshot', agents: manager.list() });
+    send({ t: 'snapshot', agents: manager.list(), backlog: backlog.view() });
     eventSinks.add(send);
     req.on('close', () => eventSinks.delete(send));
   });
@@ -337,12 +399,13 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   };
   manager.on('change', (agent) => broadcast({ t: 'agent', agent }));
   manager.on('removed', (id) => broadcast({ t: 'removed', id }));
+  backlog.on('change', (view) => broadcast({ t: 'backlog', backlog: view }));
 
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, 'http://x');
     if (url.pathname === '/ws/events') {
       eventClients.add(ws);
-      ws.send(JSON.stringify({ t: 'snapshot', agents: manager.list() }));
+      ws.send(JSON.stringify({ t: 'snapshot', agents: manager.list(), backlog: backlog.view() }));
       ws.on('close', () => eventClients.delete(ws));
       return;
     }
@@ -449,6 +512,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   return {
     server,
     manager,
+    backlog,
     url: `http://${host}:${port}`,
     startRemote,
     stopRemote,

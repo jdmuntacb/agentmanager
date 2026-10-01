@@ -47,6 +47,9 @@ const DEFAULTS = {
   flushSec: 30,
   // Ask task agents to keep a brief (Problem / Solution / Diagram / Checks) for the UI.
   brief: true,
+  // Backlog: items worked on at once per project (overridable per project), and overall.
+  backlogParallel: 2,
+  backlogMaxActive: 4,
   // Model for the Explain button's one-off summary (null = Claude's default).
   explainModel: null,
   // Tell agents to review and follow CLAUDE.md, skills, hooks and settings before working.

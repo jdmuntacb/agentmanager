@@ -203,3 +203,19 @@ export async function gitInfo(dir) {
     updatedAt: new Date().toISOString(),
   };
 }
+
+/** What changed in a worktree: uncommitted files, and commits/diffstat since `baseSha`. */
+export async function changeSummary(dir, baseSha) {
+  if (!(await isGitRepo(dir))) return null;
+  const safe = (p) => p.catch(() => '');
+  const [status, commits, stat] = await Promise.all([
+    safe(git(dir, 'status', '--porcelain')),
+    baseSha ? safe(git(dir, 'log', '--oneline', '--no-decorate', '-n', '30', `${baseSha}..HEAD`)) : '',
+    baseSha ? safe(git(dir, 'diff', '--stat', '--stat-width=120', baseSha)) : safe(git(dir, 'diff', '--stat', '--stat-width=120')),
+  ]);
+  return {
+    uncommitted: status ? status.split('\n').slice(0, 40) : [],
+    commits: commits ? commits.split('\n') : [],
+    diffstat: stat.split('\n').slice(-25).join('\n'),
+  };
+}
