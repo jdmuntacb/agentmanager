@@ -24,6 +24,7 @@ fs.writeFileSync(
     claudeBin: process.execPath,
     claudeArgs: [path.join(here, 'fake-claude.js')],
     gitRefreshSec: 1,
+    handoffIdleSec: 1,
     shell: '/bin/sh',
   }),
 );
@@ -98,6 +99,10 @@ test('agent lifecycle: spawn, track, terminal, close, resume, fresh session', as
   assert.deepEqual(tracked.prs.map((p) => [p.number, p.source]), [[7, 'session']]);
   assert.deepEqual(tracked.bugs.map((b) => [b.key, b.source]).sort(), [['MB-1', 'intent'], ['MB-4242', 'mentioned']]);
   assert.equal(tracked.sessions[0].title, 'Fake session title');
+  assert.deepEqual(
+    [tracked.usage.input, tracked.usage.output, tracked.usage.cacheCreation, tracked.usage.cacheRead, tracked.usage.total],
+    [12, 34, 56, 78, 180],
+  );
 
   // Terminal: backlog replay, input round trip.
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/term/${a1.id}`);
@@ -369,4 +374,78 @@ test('setup interrupted by a daemon restart is retried on the next start', async
   await waitFor(() => m3.get(a.id).runtime.running, 20000, 'retried setup to launch');
   assert.ok(m3.get(a.id).workdir);
   assert.equal(m3.get(a.id).setupInterrupted, undefined);
+});
+
+const claudeJson = () => JSON.parse(fs.readFileSync(path.join(home, 'claude', '.claude.json'), 'utf8'));
+const isTrusted = (dir) => Boolean(claudeJson().projects?.[fs.realpathSync(dir)]?.hasTrustDialogAccepted);
+
+test('planning while cloning moves into the repo with the same session', async () => {
+  const origin = path.join(home, 'plan-auto.git');
+  const url = `file://${origin}`; // does not exist yet, so setup fails and we control when it succeeds
+  const [a] = (await call('POST', '/agents', { intent: 'Plan then build', repo: url, plan: true })).body;
+  assert.equal(a.runtime.planning, true);
+  const planLaunch = await waitFor(() => launches().find((l) => l.args.includes(a.sessionId)), 8000, 'planning launch');
+  assert.equal(planLaunch.cwd, fs.realpathSync(path.join(home, 'planning')));
+  assert.ok(planLaunch.args.includes('--append-system-prompt'));
+  assert.deepEqual(planLaunch.args.slice(-2), ['--', 'Plan then build']);
+  assert.ok(isTrusted(path.join(home, 'planning')), 'planning folder pre-trusted');
+
+  // Setup fails; planning keeps running and survives a retry.
+  await waitFor(async () => (await agentNow(a.id)).status === 'error', 15000, 'setup error');
+  assert.equal((await agentNow(a.id)).runtime.planning, true);
+  fs.renameSync(makeOrigin('plan-auto-src'), origin);
+  assert.equal((await call('POST', `/agents/${a.id}/start`, {})).body.status, 'preparing');
+
+  // Nobody is attached and the session is idle: it moves into the workspace by itself.
+  const moved = await waitFor(
+    () => launches().find((l) => l.args.includes('--resume') && l.args.includes(a.sessionId) && !l.cwd.includes('planning')),
+    20000,
+    'handoff launch',
+  );
+  const now = await agentNow(a.id);
+  assert.equal(moved.cwd, fs.realpathSync(now.workdir));
+  assert.match(moved.args.at(-1), /^The repository is ready\. You are now in its working copy/);
+  assert.equal(now.sessionId, a.sessionId);
+  assert.equal(now.sessions.length, 1);
+  assert.ok(now.planning.handedOffAt);
+  assert.ok(isTrusted(now.workdir), 'workspace pre-trusted');
+  const { transcriptPath } = await import('../src/tracker.js');
+  assert.ok(fs.existsSync(transcriptPath(now.workdir, a.sessionId)), 'transcript moved into the workspace');
+  await waitFor(async () => (await agentNow(a.id)).status === 'running' && !(await agentNow(a.id)).runtime.planning);
+  await call('POST', `/agents/${a.id}/stop`);
+});
+
+test('planning waits for "Continue in repo" while a terminal is attached', async () => {
+  const origin = path.join(home, 'plan-manual.git');
+  const [a] = (await call('POST', '/agents', { intent: 'Plan with me', repo: `file://${origin}`, plan: true })).body;
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/term/${a.id}`);
+  await new Promise((r) => ws.on('open', r));
+  await waitFor(async () => (await agentNow(a.id)).status === 'error', 15000, 'setup error');
+  fs.renameSync(makeOrigin('plan-manual-src'), origin);
+  await call('POST', `/agents/${a.id}/start`, {});
+  const ready = await waitFor(async () => ((await agentNow(a.id)).planning?.ready ? agentNow(a.id) : null), 20000, 'ready flag');
+  await new Promise((r) => setTimeout(r, 2500));
+  assert.equal((await agentNow(a.id)).runtime.planning, true, 'still planning while attached');
+  assert.ok(ready.workdir);
+
+  const handed = (await call('POST', `/agents/${a.id}/handoff`)).body;
+  assert.equal(handed.runtime.planning, false);
+  assert.equal(handed.status, 'running');
+  await waitFor(
+    () => launches().some((l) => l.cwd === fs.realpathSync(ready.workdir) && l.args.includes('--resume')),
+    8000,
+    'resume in workspace',
+  );
+  ws.close();
+  await call('POST', `/agents/${a.id}/stop`);
+});
+
+test('worktree option falls back to the folder itself when it is not a git repo', async () => {
+  const plain = path.join(home, 'plain-folder');
+  fs.mkdirSync(plain);
+  const [a] = (await call('POST', '/agents', { intent: 'Plain folder', dir: plain, worktree: true, start: false })).body;
+  const ready = await waitFor(async () => (['stopped', 'error'].includes((await agentNow(a.id)).status) ? agentNow(a.id) : null));
+  assert.equal(ready.status, 'stopped', ready.error);
+  assert.equal(ready.workdir, plain);
+  assert.equal(ready.worktree, false);
 });

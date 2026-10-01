@@ -101,7 +101,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 .pill::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .pill.working { color: var(--green); }
 .pill.working::before { animation: pulse 1s infinite; }
-.pill.waiting { color: var(--accent); }
+.pill.waiting, .pill.planning { color: var(--accent); }
 .pill.preparing, .pill.exited { color: var(--yellow); }
 .pill.error, .pill.attention { color: var(--red); }
 .pill.attention::before { animation: pulse 1s infinite; }
@@ -126,6 +126,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 .progress-box { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; display: grid; gap: 6px; background: var(--panel); }
 .progress-box .bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
 .progress-box .bar span { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+.ready-box { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--green); border-radius: 6px; font-size: 13px; display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
 .error-box { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--red); color: var(--red); border-radius: 6px; font-size: 13px; }
 
 .grid {

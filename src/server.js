@@ -69,6 +69,8 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     }),
   );
   api.post('/general', wrap((req) => manager.createGeneral(req.body ?? {})));
+  api.post('/agents/:id/plan', wrap((req) => manager.startPlanning(req.params.id)));
+  api.post('/agents/:id/handoff', wrap((req) => manager.maybeHandoff(manager.mustGet(req.params.id).id, { force: true })));
   api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id)));
   api.get(
     '/agents/:id',

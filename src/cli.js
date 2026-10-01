@@ -18,6 +18,10 @@ const STATUS_COLOR = { running: green, preparing: yellow, stopped: dim, exited: 
 
 function statusLabel(a) {
   const color = STATUS_COLOR[a.status] ?? ((s) => s);
+  if (a.runtime?.planning) {
+    if (a.runtime.attention) return red('needs input');
+    return cyan(a.workdir && a.status !== 'preparing' ? 'planning (repo ready)' : 'planning');
+  }
   if (a.status === 'preparing' && a.progress) {
     const p = a.progress;
     return color(p.step ? `${p.phase.toLowerCase()} ${p.percent}%` : p.phase.toLowerCase());
@@ -27,6 +31,13 @@ function statusLabel(a) {
     return color(a.runtime?.busy ? 'working' : 'waiting');
   }
   return color(a.status);
+}
+
+function fmtTokens(n) {
+  if (!n) return '';
+  if (n < 1000) return String(n);
+  if (n < 1e6) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
+  return `${(n / 1e6).toFixed(n < 1e7 ? 2 : 1)}M`;
 }
 
 function truncate(s, n) {
@@ -68,8 +79,12 @@ function printAgent(a) {
   }
   if (a.status === 'error' && !a.workdir) kv('retry', `agentmgr start ${a.id}`);
   kv('attention', a.runtime.attention && red(`${a.runtime.attention}: run "agentmgr attach ${a.id}" to answer`));
-  const cost = a.sessions.reduce((sum, s) => sum + (s.cost?.usd ?? 0), 0);
-  kv('cost', cost ? `$${cost.toFixed(2)}` : null);
+  const u = a.usage;
+  if (u?.total) {
+    kv('tokens', `${u.total.toLocaleString()} total: ${u.input.toLocaleString()} in, ${u.output.toLocaleString()} out, ` +
+      `${u.cacheRead.toLocaleString()} cache read, ${u.cacheCreation.toLocaleString()} cache write (${u.requests} requests)`);
+  }
+  kv('cost', a.costUsd ? `$${a.costUsd.toFixed(2)} ${dim('(reported by Claude Code)')}` : null);
   if (a.prs.length) {
     console.log(`  ${dim('PRs')}`);
     for (const p of a.prs) {
@@ -212,6 +227,7 @@ export async function main(argv) {
       ]),
     )
     .option('-m, --model <model>', 'claude model')
+    .option('--plan', 'while a repo URL clones, plan the task with Claude (moves into the repo when ready)')
     .option('--no-start', 'create without launching')
     .option('-a, --attach', 'attach to the agent after launch (single intent only)')
     .action(async (intents, opts, cmd) => {
@@ -229,12 +245,13 @@ export async function main(argv) {
         permissionMode: opts.permissionMode,
         model: opts.model,
         start: opts.start,
+        plan: opts.plan,
       });
       for (const a of created) console.log(`${green('+')} ${bold(a.name)} ${dim(a.id)}  session ${cyan(a.sessionId)}`);
       console.log(dim(`Workspace setup and launch continue in the background. "agentmgr ls" shows status.`));
       if (opts.attach && created.length === 1) {
         let a = created[0];
-        for (let i = 0; i < 600 && a.status === 'preparing'; i++) {
+        for (let i = 0; i < 600 && a.status === 'preparing' && !a.runtime.running; i++) {
           await new Promise((r) => setTimeout(r, 500));
           a = await resolveAgent(a.id);
         }
@@ -259,6 +276,28 @@ export async function main(argv) {
         a = await resolveAgent(a.id);
       }
       if (opts.attach) await attach(a.id);
+    });
+
+  program
+    .command('plan')
+    .description('While the workspace is still being prepared, plan the task with Claude and attach')
+    .argument('<agent>')
+    .action(async (ref) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      await api('POST', `/agents/${a.id}/plan`);
+      await attach(a.id, { resume: false });
+    });
+
+  program
+    .command('handoff')
+    .description('Move a planning session into its ready workspace now')
+    .argument('<agent>')
+    .action(async (ref) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      const res = await api('POST', `/agents/${a.id}/handoff`);
+      console.log(`${green('▶')} ${res.name} continues in ${res.workdir} (session ${cyan(res.sessionId)})`);
     });
 
   program
@@ -321,10 +360,11 @@ export async function main(argv) {
           a.git?.branch ?? '',
           String(a.prs.length || ''),
           String(a.bugs.length || ''),
+          fmtTokens(a.usage?.total),
           a.sessionId.slice(0, 8),
           truncate(a.workdir ?? '', 50),
         ]),
-        ['ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'SESSION', 'FOLDER'],
+        ['ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'TOKENS', 'SESSION', 'FOLDER'],
       );
     });
 
@@ -406,10 +446,11 @@ export async function main(argv) {
         a.sessions.map((s) => [
           s.id === a.sessionId ? green(`${s.id} *`) : s.id,
           truncate(s.title ?? '', 40),
+          fmtTokens(s.usage?.total),
           s.cost?.usd != null ? `$${s.cost.usd.toFixed(2)}` : '',
           s.lastActivity ?? '',
         ]),
-        ['SESSION', 'TITLE', 'COST', 'LAST ACTIVITY'],
+        ['SESSION', 'TITLE', 'TOKENS', 'COST', 'LAST ACTIVITY'],
       );
       console.log(dim(`\nOutside agentmgr: cd ${a.workdir} && claude --resume <session>`));
     });

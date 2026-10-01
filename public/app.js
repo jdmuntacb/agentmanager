@@ -44,11 +44,24 @@ async function act(fn, okMsg) {
 }
 
 function statusOf(a) {
+  if (a.runtime.planning) return a.runtime.attention ? 'attention' : 'planning';
   if (a.status === 'running') {
     if (a.runtime.attention) return 'attention';
     return a.runtime.busy ? 'working' : 'waiting';
   }
   return a.status;
+}
+
+/** 1234 -> "1.2k", 3456789 -> "3.5M" */
+function fmtTokens(n) {
+  if (!n) return '0';
+  if (n < 1000) return String(n);
+  if (n < 1e6) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
+  return `${(n / 1e6).toFixed(n < 1e7 ? 2 : 1)}M`;
+}
+
+function usageTitle(u) {
+  return `input ${u.input.toLocaleString()} · output ${u.output.toLocaleString()} · cache write ${u.cacheCreation.toLocaleString()} · cache read ${u.cacheRead.toLocaleString()} · ${u.requests} API requests`;
 }
 
 const pillText = (st) => (st === 'attention' ? 'needs input' : st);
@@ -104,6 +117,7 @@ function renderList() {
           ${a.git?.branch ? `<span>⎇ ${esc(a.git.branch)}</span>` : ''}
           ${a.prs.length ? `<span>${a.prs.length} PR</span>` : ''}
           ${a.bugs.length ? `<span>${a.bugs.length} bug</span>` : ''}
+          ${a.usage?.total ? `<span title="${esc(usageTitle(a.usage))}">${fmtTokens(a.usage.total)} tok</span>` : ''}
           ${a.runtime.clients ? `<span title="terminals attached">◉ ${a.runtime.clients}</span>` : ''}
         </div>
       </li>`;
@@ -147,7 +161,8 @@ function renderDetail() {
 
   const st = statusOf(a);
   const running = a.runtime.running;
-  const totalCost = a.sessions.reduce((s, x) => s + (x.cost?.usd ?? 0), 0);
+  const totalCost = a.costUsd ?? 0;
+  const u = a.usage ?? { total: 0 };
   const current = a.sessions.find((s) => s.id === a.sessionId);
 
   body.innerHTML = `
@@ -158,8 +173,11 @@ function renderDetail() {
       </div>
       <div class="d-actions">
         ${a.status === 'error' && !a.workdir
-          ? `<button class="primary" data-act="start" title="Run the clone / worktree setup again">Retry setup</button>`
-          : `<button class="primary" data-act="terminal" ${a.status === 'preparing' ? 'disabled' : ''}>${running ? 'Open terminal' : 'Resume & open terminal'}</button>`}
+          ? `<button class="primary" data-act="start" title="Run the clone / worktree setup again">Retry setup</button>
+             ${running ? '<button data-act="terminal">Open terminal</button>' : ''}`
+          : a.status === 'preparing' && !running
+            ? `<button class="primary" data-act="plan" title="Talk the task through with Claude while the workspace is prepared">Plan while it clones</button>`
+            : `<button class="primary" data-act="terminal">${running ? 'Open terminal' : 'Resume & open terminal'}</button>`}
         ${running
           ? `<button data-act="stop" title="Close the claude process; the session ID is kept">Close session</button>`
           : a.status === 'error' && !a.workdir
@@ -176,7 +194,15 @@ function renderDetail() {
       ? `<div class="progress-box">
           <div>${esc(progressText(a.progress) || 'Preparing workspace…')}</div>
           ${a.progress?.step ? `<div class="bar"><span style="width:${a.progress.percent}%"></span></div>` : ''}
-          <div class="hint">Claude starts as soon as the workspace is ready. Deleting the agent cancels setup.</div>
+          <div class="hint">${a.runtime.planning
+            ? 'A planning session is running in the terminal. It moves into the repo, with the whole conversation, once the workspace is ready.'
+            : 'Claude starts as soon as the workspace is ready. Use <b>Plan while it clones</b> to clarify the task with Claude meanwhile. Deleting the agent cancels setup.'}</div>
+        </div>`
+      : ''}
+    ${a.runtime.planning && a.workdir && a.status !== 'preparing'
+      ? `<div class="ready-box">
+          <span>The workspace is ready. The planning session moves into the repo when you leave the terminal, or now:</span>
+          <button class="primary small" data-act="handoff">Continue in repo</button>
         </div>`
       : ''}
     ${a.runtime.attention ? `<div class="error-box">${esc(a.runtime.attention)}: the agent is waiting for an answer. Open its terminal to respond.</div>` : ''}
@@ -189,7 +215,10 @@ function renderDetail() {
           <dt>Title</dt><dd>${esc(current?.title ?? '—')}</dd>
           <dt>Agent ID</dt><dd><code>${a.id}</code></dd>
           <dt>Last output</dt><dd>${a.runtime.lastOutputAt ? ago(a.runtime.lastOutputAt) : current?.lastActivity ? ago(current.lastActivity) : '—'}</dd>
-          <dt>Cost</dt><dd>${totalCost ? `$${totalCost.toFixed(2)}` : '—'}</dd>
+          <dt>Tokens</dt><dd title="${u.total ? esc(usageTitle(u)) : ''}">${u.total
+            ? `${fmtTokens(u.input)} in · ${fmtTokens(u.output)} out · ${fmtTokens(u.cacheRead)} cache read · ${fmtTokens(u.cacheCreation)} cache write`
+            : '—'}</dd>
+          <dt>Cost</dt><dd>${totalCost ? `$${totalCost.toFixed(2)} <span class="hint">(reported by Claude Code)</span>` : '—'}</dd>
           <dt>Mode</dt><dd>${esc(a.permissionMode)}${a.model ? ` · ${esc(a.model)}` : ''}</dd>
         </dl>
       </div>
@@ -226,13 +255,14 @@ function renderDetail() {
       <div class="card">
         <h3>Session history <span>${a.sessions.length}</span></h3>
         <table class="sessions">
-          <tr><th>ID</th><th>Title</th><th>Active</th><th></th></tr>
+          <tr><th>ID</th><th>Title</th><th>Tokens</th><th>Active</th><th></th></tr>
           ${[...a.sessions]
             .reverse()
             .map(
               (s) => `<tr class="${s.id === a.sessionId ? 'current' : ''}">
               <td><code title="${esc(s.id)}">${s.id.slice(0, 8)}</code>${copyBtn(s.id)}</td>
               <td>${esc(s.title ?? '')}</td>
+              <td title="${s.usage ? esc(usageTitle(s.usage)) : ''}">${s.usage ? fmtTokens(s.usage.total) : ''}</td>
               <td>${ago(s.lastActivity ?? s.lastStartedAt)}</td>
               <td>${s.id === a.sessionId ? 'current' : running ? '' : `<button class="small" data-resume-session="${s.id}">Resume</button>`}</td>
             </tr>`,
@@ -446,6 +476,18 @@ $('#detail-body').addEventListener('click', async (e) => {
       if (!a.runtime.running) await act(async () => upsert(await api('POST', `/agents/${a.id}/start`, {})));
       term.open(a.id);
       break;
+    case 'plan':
+      act(async () => {
+        upsert(await api('POST', `/agents/${a.id}/plan`));
+        term.open(a.id);
+      });
+      break;
+    case 'handoff':
+      act(async () => {
+        upsert(await api('POST', `/agents/${a.id}/handoff`));
+        term.open(a.id);
+      }, 'Moved into the repository');
+      break;
     case 'shell':
       term.open(a.id, 'shell');
       break;
@@ -533,6 +575,7 @@ $('#new-form').addEventListener('submit', async (e) => {
       permissionMode: f.get('permissionMode') || undefined,
       model: f.get('model') || undefined,
       worktree: f.get('worktree') ? true : undefined,
+      plan: Boolean(f.get('plan')),
       start: Boolean(f.get('start')),
     });
     created.forEach((a) => agents.set(a.id, a));
@@ -540,6 +583,7 @@ $('#new-form').addEventListener('submit', async (e) => {
     e.target.reset();
     select(created[0].id);
     toast(`Created ${created.length} agent${created.length > 1 ? 's' : ''}`);
+    if (created.length === 1 && created[0].runtime.planning) term.open(created[0].id);
   } catch (err) {
     $('#new-error').textContent = err.message;
     $('#new-error').hidden = false;

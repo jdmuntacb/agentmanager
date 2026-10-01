@@ -93,3 +93,51 @@ test('Store persists and resolves by id, prefix and name', () => {
   assert.equal(s2.resolve('ab'), undefined); // ambiguous prefix
   assert.equal(s2.resolve('beta').id, 'abd456');
 });
+
+test('trustFolder pre-accepts the trust prompt without touching other settings', async () => {
+  const cfg = tmp();
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = cfg;
+  try {
+    const { trustFolder } = await import('../src/trust.js');
+    const file = path.join(cfg, '.claude.json');
+    fs.writeFileSync(file, JSON.stringify({ theme: 'dark', projects: { '/x': { allowedTools: ['Read'] } } }));
+    const dir = tmp();
+    assert.equal(trustFolder(dir), true);
+    assert.equal(trustFolder(dir), false, 'second call is a no-op');
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(data.theme, 'dark');
+    assert.deepEqual(data.projects['/x'], { allowedTools: ['Read'] });
+    assert.equal(data.projects[fs.realpathSync(dir)].hasTrustDialogAccepted, true);
+    assert.ok(fs.existsSync(`${file}.agentmgr-backup`));
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test('token usage counts each API response once and includes subagents', async () => {
+  const { sumUsage } = await import('../src/tracker.js');
+  const file = path.join(tmp(), 'u.jsonl');
+  const line = (id, out) =>
+    JSON.stringify({
+      type: 'assistant',
+      message: { id, usage: { input_tokens: 10, output_tokens: out, cache_creation_input_tokens: 100, cache_read_input_tokens: 1000 } },
+    }) + '\n';
+  // msg_1 is split over two lines (two content blocks); the last line has the final output count.
+  fs.writeFileSync(file, line('msg_1', 5) + line('msg_1', 7) + line('msg_2', 3));
+  const cursor = { offset: 0 };
+  scanTranscript(file, cursor);
+  const sub = path.join(tmp(), 'sub.jsonl');
+  fs.writeFileSync(sub, line('msg_s', 1));
+  const subCursor = { offset: 0 };
+  scanTranscript(sub, subCursor);
+  assert.deepEqual(sumUsage(cursor.usage, subCursor.usage), {
+    input: 30,
+    output: 11,
+    cacheCreation: 300,
+    cacheRead: 3000,
+    requests: 3,
+    total: 3341,
+  });
+});

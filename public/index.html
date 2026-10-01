@@ -89,8 +89,12 @@
           </label>
         </div>
         <label class="check">
-          <input type="checkbox" name="worktree" />
-          Give each agent its own git worktree and branch <span class="hint">(always on when cloning a repo URL, and when several intents share a folder)</span>
+          <input type="checkbox" name="worktree" checked />
+          Give each agent its own git worktree and branch <span class="hint">(for a git folder; always on when cloning a repo URL)</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="plan" checked />
+          Plan with Claude while the repo clones <span class="hint">(repo URLs only; the session moves into the repo when it's ready)</span>
         </label>
         <label class="check">
           <input type="checkbox" name="start" checked />

@@ -16,7 +16,11 @@ const write = (rec) => fs.appendFileSync(file, JSON.stringify({ sessionId: sid, 
 write({ type: 'ai-title', aiTitle: 'Fake session title' });
 write({
   type: 'assistant',
-  message: { content: [{ type: 'text', text: 'Looking at https://jira.example.com/browse/MB-4242 now' }] },
+  message: {
+    id: `msg_${Date.now()}`,
+    usage: { input_tokens: 12, output_tokens: 34, cache_creation_input_tokens: 56, cache_read_input_tokens: 78 },
+    content: [{ type: 'text', text: 'Looking at https://jira.example.com/browse/MB-4242 now' }],
+  },
 });
 write({ type: 'pr-link', prNumber: 7, prUrl: 'https://github.com/example/repo/pull/7' });
 

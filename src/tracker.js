@@ -17,6 +17,37 @@ export function transcriptPath(cwd, sessionId) {
   return path.join(claudeProjectDir(cwd), `${sessionId}.jsonl`);
 }
 
+/** Transcripts of subagents a session spawned (their tokens count toward the session). */
+export function subagentTranscripts(cwd, sessionId) {
+  const dir = path.join(claudeProjectDir(cwd), sessionId, 'subagents');
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((n) => n.endsWith('.jsonl'))
+      .map((n) => path.join(dir, n));
+  } catch {
+    return [];
+  }
+}
+
+const emptyUsage = () => ({ input: 0, output: 0, cacheCreation: 0, cacheRead: 0, requests: 0 });
+
+/** Sum per-request usage (keyed by API message id, so repeated lines count once). */
+export function sumUsage(...maps) {
+  const total = emptyUsage();
+  for (const map of maps) {
+    for (const u of map.values()) {
+      total.input += u.input;
+      total.output += u.output;
+      total.cacheCreation += u.cacheCreation;
+      total.cacheRead += u.cacheRead;
+      total.requests += 1;
+    }
+  }
+  total.total = total.input + total.output + total.cacheCreation + total.cacheRead;
+  return total;
+}
+
 /** Session files in the agent's project dir modified at/after `sinceMs`, newest first. */
 export function recentSessionFiles(cwd, sinceMs) {
   const dir = claudeProjectDir(cwd);
@@ -101,6 +132,8 @@ function textOf(content) {
  */
 export function scanTranscript(file, cursor, bugPatterns = []) {
   const result = { prs: [], bugs: [], title: null, lastPrompt: null, cost: null, lastActivity: null };
+  // Token usage per API response, kept on the cursor so incremental scans accumulate.
+  cursor.usage ??= new Map();
   let fd;
   try {
     fd = fs.openSync(file, 'r');
@@ -143,8 +176,24 @@ export function scanTranscript(file, cursor, bugPatterns = []) {
             linesRemoved: rec.totalLinesRemoved ?? null,
           };
           break;
-        case 'user':
         case 'assistant': {
+          const u = rec.message?.usage;
+          if (u) {
+            // One response is written as several lines (one per content block); the last has final counts.
+            const key = rec.message.id ?? rec.requestId ?? rec.uuid;
+            cursor.usage.set(key, {
+              input: u.input_tokens ?? 0,
+              output: u.output_tokens ?? 0,
+              cacheCreation: u.cache_creation_input_tokens ?? 0,
+              cacheRead: u.cache_read_input_tokens ?? 0,
+            });
+          }
+          const refs = extractRefs(textOf(rec.message?.content), bugPatterns);
+          result.prs.push(...refs.prs);
+          result.bugs.push(...refs.bugs);
+          break;
+        }
+        case 'user': {
           const refs = extractRefs(textOf(rec.message?.content), bugPatterns);
           result.prs.push(...refs.prs);
           result.bugs.push(...refs.bugs);

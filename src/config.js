@@ -16,6 +16,8 @@ export const paths = {
   repos: path.join(HOME, 'repos'),
   // Shared working folder for general (no repo / folder) sessions.
   general: path.join(HOME, 'general'),
+  // Holding folder for planning sessions that run while a repo is still cloning.
+  planning: path.join(HOME, 'planning'),
 };
 
 const DEFAULTS = {
@@ -37,12 +39,17 @@ const DEFAULTS = {
   // Partial clone for repo URLs: history now, file contents only when checked out.
   // Much faster for big repos. Set to null for full clones.
   cloneFilter: 'blob:none',
+  // Pre-accept Claude's "trust this folder" prompt for the folders agents run in.
+  trustAgentFolders: true,
+  // A planning session moves into the repo by itself once Claude has been idle this
+  // long and no terminal is attached; otherwise it waits for "Continue in repo".
+  handoffIdleSec: 5,
   // Shell used for the ancillary terminal in an agent's folder.
   shell: process.env.SHELL || '/bin/zsh',
 };
 
 export function ensureHome() {
-  for (const dir of [paths.home, paths.workspaces, paths.repos, paths.general]) {
+  for (const dir of [paths.home, paths.workspaces, paths.repos, paths.general, paths.planning]) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }

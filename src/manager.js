@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import pty from 'node-pty';
 import { expandHome, paths } from './config.js';
+import { trustFolder } from './trust.js';
 import * as git from './git.js';
 import {
   bugFromRef,
@@ -13,6 +14,8 @@ import {
   prsForBranch,
   recentSessionFiles,
   scanTranscript,
+  subagentTranscripts,
+  sumUsage,
   transcriptPath,
 } from './tracker.js';
 
@@ -44,6 +47,17 @@ const ANSI = /\x1b(\[[0-9;?<>=]*[ -\/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|[()][0-
 // When a link is found from several sources, the higher-ranked source is kept.
 const SOURCE_RANK = { manual: 5, intent: 4, session: 3, branch: 2, mentioned: 1 };
 const BUSY_IDLE_MS = 3000;
+
+const planningPrompt = (agent) =>
+  `You are in a planning phase. The working copy of ${agent.repo || 'the repository'} is still being ` +
+  'prepared (cloned) and is not available yet, so do not look for project files in the current folder ' +
+  'and do not create or edit files here. Use this time with the user: restate the task, ask focused ' +
+  'questions, gather requirements and constraints, and agree on an approach and a step-by-step plan. ' +
+  'When the repository is ready, this session will move into it and you will be told.';
+
+const handoffMessage = (agent) =>
+  `The repository is ready. You are now in its working copy at ${agent.workdir}` +
+  `${agent.branch ? ` (branch ${agent.branch})` : ''}. Continue with the plan we agreed on.`;
 
 export function slugify(text, max = 30) {
   return (
@@ -113,13 +127,20 @@ export class AgentManager extends EventEmitter {
 
   view(agent) {
     const rt = this.runtimes.get(agent.id);
+    const usage = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0, requests: 0, total: 0 };
+    for (const s of agent.sessions ?? []) for (const k of Object.keys(usage)) usage[k] += s.usage?.[k] ?? 0;
+    const costs = (agent.sessions ?? []).map((s) => s.cost?.usd).filter((c) => c != null);
     return {
       ...agent,
+      usage,
+      // Claude Code's own cost figure from the transcripts (absent until it records one).
+      costUsd: costs.length ? costs.reduce((a, b) => a + b, 0) : null,
       prs: Object.values(agent.prs ?? {}),
       bugs: Object.values(agent.bugs ?? {}),
       runtime: {
         running: Boolean(rt?.pty),
         busy: Boolean(rt?.pty && rt.busy),
+        planning: Boolean(rt?.pty && rt.planning),
         attention: (rt?.pty && !rt.busy && rt.attention) || null,
         clients: rt?.clients.size ?? 0,
         shell: Boolean(this.shells.get(agent.id)?.pty),
@@ -156,7 +177,7 @@ export class AgentManager extends EventEmitter {
     return this.create({ kind: 'general', intent: question, name, permissionMode, model });
   }
 
-  create({ kind = 'task', intent, name, repo, dir, worktree = false, permissionMode, model, start = true }) {
+  create({ kind = 'task', intent, name, repo, dir, worktree = false, permissionMode, model, start = true, plan = false }) {
     intent = (intent ?? '').trim();
     const general = kind === 'general';
     if (!intent && !general) throw Object.assign(new Error('Intent is required'), { status: 400 });
@@ -202,6 +223,12 @@ export class AgentManager extends EventEmitter {
     this.changed(agent);
 
     this.prepare(agent, { start }).catch(() => {});
+    // Planning only makes sense while there is a clone to wait for.
+    if (plan && agent.repo && git.isRemoteUrl(agent.repo)) {
+      try {
+        this.startPlanning(agent.id);
+      } catch {}
+    }
     return this.view(agent);
   }
 
@@ -233,7 +260,9 @@ export class AgentManager extends EventEmitter {
           progress: null,
           setupInterrupted: undefined,
         });
-        if (start) this.start(agent.id);
+        const rt = this.runtimes.get(agent.id);
+        if (rt?.pty && rt.planning) this.maybeHandoff(agent.id).catch(() => {});
+        else if (this.store.get(agent.id)?.desired === 'running') this.start(agent.id);
       } catch (err) {
         if (this.store.get(agent.id)) {
           this.patch(agent.id, { status: 'error', error: err.message, progress: null, setupInterrupted: undefined });
@@ -255,6 +284,12 @@ export class AgentManager extends EventEmitter {
     }
     this.patch(agent.id, { status: 'preparing', error: null, desired: 'running' });
     this.prepare(agent, { start: true }).catch(() => {});
+    // Bring back a planning session that a daemon restart interrupted.
+    if (agent.planning && !agent.planning.handedOffAt && !this.runtimes.get(agent.id)?.pty) {
+      try {
+        this.startPlanning(agent.id);
+      } catch {}
+    }
     return this.view(agent);
   }
 
@@ -328,15 +363,15 @@ export class AgentManager extends EventEmitter {
     }
 
     fs.mkdirSync(dir, { recursive: true });
-    if (agent.worktree) {
-      if (!(await git.isGitRepo(dir))) throw new Error(`Worktree requested but ${dir} is not a git repository`);
+    // A worktree needs a git repo; for any other folder (the UI asks for worktrees by default) use it as is.
+    if (agent.worktree && (await git.isGitRepo(dir))) {
       const top = await git.run('git', ['rev-parse', '--show-toplevel'], { cwd: dir });
       const workdir = path.join(paths.workspaces, `${path.basename(top)}-${slug}-${id}`);
       progress({ phase: 'Checking out' });
       await this.withLock(top, () => git.addWorktree(top, workdir, branch, 'HEAD', cloneOpts('Checking out')));
       return { workdir, sourceDir: top, branch, worktree: true, repo };
     }
-    return { workdir: dir, repo };
+    return { workdir: dir, repo, worktree: false };
   }
 
   // -------------------------------------------------------------- lifecycle
@@ -348,8 +383,20 @@ export class AgentManager extends EventEmitter {
    */
   start(ref, { fresh = false, sessionId } = {}) {
     const agent = this.mustGet(ref);
-    if (this.runtimes.get(agent.id)?.pty) return this.view(agent);
-    if (agent.status === 'preparing') throw Object.assign(new Error('Workspace is still being prepared'), { status: 409 });
+    const live = this.runtimes.get(agent.id);
+    if (live?.pty) {
+      // "Start" on a planning session whose workspace is ready means: move it into the repo.
+      if (live.planning && agent.workdir && agent.status !== 'preparing') return this.maybeHandoff(agent.id, { force: true });
+      // Retry setup while the planning session keeps running.
+      if (agent.status === 'error' && !agent.workdir) return this.retrySetup(agent.id);
+      return this.view(agent);
+    }
+    if (agent.status === 'preparing') {
+      throw Object.assign(
+        new Error(`Workspace is still being prepared; plan with Claude meanwhile: agentmgr plan ${agent.id}`),
+        { status: 409 },
+      );
+    }
     if (agent.status === 'error' && !agent.workdir) return this.retrySetup(agent.id);
     if (!agent.workdir || !fs.existsSync(agent.workdir)) {
       throw Object.assign(new Error(`Working folder ${agent.workdir} no longer exists`), { status: 409 });
@@ -366,21 +413,53 @@ export class AgentManager extends EventEmitter {
     }
 
     const sid = agent.sessionId;
+    // A planning session ran in the holding folder: move its transcript into the
+    // workspace so the same session (same ID, full history) continues there.
+    const handoff = Boolean(agent.planning && !agent.planning.handedOffAt);
+    if (handoff) this.moveTranscript(agent, sid);
     const resuming = fs.existsSync(transcriptPath(agent.workdir, sid));
-    const args = [...(this.config.claudeArgs ?? [])];
-    if (agent.permissionMode && agent.permissionMode !== 'default') args.push('--permission-mode', agent.permissionMode);
-    if (agent.model) args.push('--model', agent.model);
+    const args = this.baseArgs(agent);
     if (resuming) {
       args.push('--resume', sid);
+      if (handoff) args.push('--', handoffMessage(agent));
     } else {
       args.push('--session-id', sid, '--name', agent.name);
       if (agent.intent) args.push('--', agent.intent);
     }
+    const proc = this.spawnClaude(agent, agent.workdir, args);
 
-    const env = this.childEnv(agent);
+    const session = agent.sessions.find((s) => s.id === sid);
+    if (session) {
+      session.starts = (session.starts ?? 0) + 1;
+      session.lastStartedAt = now();
+    }
+    this.patch(agent.id, {
+      status: 'running',
+      desired: 'running',
+      error: null,
+      exitCode: null,
+      pid: proc.pid,
+      lastStartedAt: now(),
+      sessions: agent.sessions,
+      sessionId: sid,
+      ...(handoff ? { planning: { ...agent.planning, ready: false, handedOffAt: now() } } : {}),
+    });
+    return this.view(this.store.get(agent.id));
+  }
+
+  baseArgs(agent) {
+    const args = [...(this.config.claudeArgs ?? [])];
+    if (agent.permissionMode && agent.permissionMode !== 'default') args.push('--permission-mode', agent.permissionMode);
+    if (agent.model) args.push('--model', agent.model);
+    return args;
+  }
+
+  /** Spawn claude in a PTY for this agent, reusing its terminal clients and scrollback. */
+  spawnClaude(agent, cwd, args, { planning = false } = {}) {
     const prev = this.runtimes.get(agent.id);
     const rt = {
       pty: null,
+      planning,
       chunks: prev?.chunks ?? [],
       size: prev?.size ?? 0,
       clients: prev?.clients ?? new Set(),
@@ -393,7 +472,18 @@ export class AgentManager extends EventEmitter {
       tail: '',
       attention: null,
     };
-    if (prev?.pty === null && rt.size) this.appendOutput(rt, '\r\n\x1b[2m── agent restarted ──\x1b[0m\r\n');
+    if (prev?.pty === null && rt.size) {
+      const note = prev.planning && !planning ? 'moved into the repository' : 'agent restarted';
+      this.appendOutput(rt, `\r\n\x1b[2m── ${note} ──\x1b[0m\r\n`);
+    }
+
+    if (this.config.trustAgentFolders) {
+      try {
+        trustFolder(cwd);
+      } catch (err) {
+        console.error(`[agentmgr] could not pre-trust ${cwd}: ${err.message}`);
+      }
+    }
 
     let proc;
     try {
@@ -401,8 +491,8 @@ export class AgentManager extends EventEmitter {
         name: 'xterm-256color',
         cols: rt.cols,
         rows: rt.rows,
-        cwd: agent.workdir,
-        env,
+        cwd,
+        env: this.childEnv(agent),
       });
     } catch (err) {
       this.patch(agent.id, { status: 'error', error: `Failed to launch ${this.config.claudeBin}: ${err.message}` });
@@ -430,6 +520,11 @@ export class AgentManager extends EventEmitter {
       this.broadcast(rt, { t: 'exit', code: exitCode, signal });
       const a = this.store.get(agent.id);
       if (!a) return;
+      if (rt.planning) {
+        // The agent's own status (preparing / ready / error) is about the workspace; leave it.
+        this.patch(agent.id, { pid: null });
+        return;
+      }
       this.patch(agent.id, {
         status: rt.stopping ? 'stopped' : 'exited',
         // Claude exiting by itself (e.g. /exit) is a deliberate close; don't auto-resume it.
@@ -440,23 +535,73 @@ export class AgentManager extends EventEmitter {
       });
       this.refresh(agent.id, { withPrs: true }).catch(() => {});
     });
+    return proc;
+  }
 
-    const session = agent.sessions.find((s) => s.id === sid);
-    if (session) {
-      session.starts = (session.starts ?? 0) + 1;
-      session.lastStartedAt = now();
+  // -------------------------------------------------------------- planning
+
+  /**
+   * Run a planning session while the workspace is still being prepared: same
+   * session ID, in a holding folder, told that the repo is not there yet.
+   */
+  startPlanning(ref) {
+    const agent = this.mustGet(ref);
+    if (this.runtimes.get(agent.id)?.pty) return this.view(agent);
+    const waiting = agent.status === 'preparing' || (agent.status === 'error' && !agent.workdir);
+    if (!waiting) return this.start(agent.id); // workspace is ready: just run the agent there
+    if (agent.planning?.handedOffAt) {
+      throw Object.assign(new Error('This agent already moved into its workspace'), { status: 409 });
     }
+    fs.mkdirSync(paths.planning, { recursive: true });
+    const sid = agent.sessionId;
+    const args = this.baseArgs(agent);
+    if (fs.existsSync(transcriptPath(paths.planning, sid))) {
+      args.push('--resume', sid);
+    } else {
+      args.push('--session-id', sid, '--name', agent.name, '--append-system-prompt', planningPrompt(agent));
+      if (agent.intent) args.push('--', agent.intent);
+    }
+    const proc = this.spawnClaude(agent, paths.planning, args, { planning: true });
     this.patch(agent.id, {
-      status: 'running',
       desired: 'running',
-      error: null,
-      exitCode: null,
       pid: proc.pid,
-      lastStartedAt: now(),
-      sessions: agent.sessions,
-      sessionId: sid,
+      planning: { dir: paths.planning, startedAt: agent.planning?.startedAt ?? now(), ready: false },
     });
     return this.view(this.store.get(agent.id));
+  }
+
+  moveTranscript(agent, sid) {
+    const src = transcriptPath(agent.planning.dir, sid);
+    const dst = transcriptPath(agent.workdir, sid);
+    if (!fs.existsSync(src) || fs.existsSync(dst)) return;
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.copyFileSync(src, dst);
+  }
+
+  /**
+   * Move a planning session into its now-ready workspace. Without `force` it
+   * only does so when nobody is looking at the terminal and Claude is idle, so
+   * it never yanks the session away mid-conversation; otherwise it flags the
+   * agent "ready" and waits for Continue in repo.
+   */
+  async maybeHandoff(id, { force = false } = {}) {
+    const agent = this.store.get(id);
+    const rt = this.runtimes.get(id);
+    if (!agent?.workdir || agent.status === 'preparing' || !(rt?.pty && rt.planning)) return agent && this.view(agent);
+    const idleMs = (this.config.handoffIdleSec ?? 5) * 1000;
+    const quiet = !rt.clients.size && !rt.busy && Date.now() - (rt.lastOutputAt ?? 0) >= idleMs;
+    if (!force && !quiet) {
+      if (!agent.planning?.ready) this.patch(id, { planning: { ...agent.planning, ready: true } });
+      return this.view(agent);
+    }
+    if (this.handingOff?.has(id)) return this.view(agent);
+    (this.handingOff ??= new Set()).add(id);
+    try {
+      await this.stop(id, { keepDesired: true });
+      return this.start(id);
+    } finally {
+      this.handingOff.delete(id);
+    }
   }
 
   /**
@@ -536,7 +681,11 @@ export class AgentManager extends EventEmitter {
     this.closeShell(agent.id);
     for (const client of this.shells.get(agent.id)?.clients ?? []) client.close?.();
     this.shells.delete(agent.id);
-    for (const s of agent.sessions) this.cursors.delete(s.id);
+    for (const key of this.cursors.keys()) {
+      if (agent.sessions.some((s) => key.startsWith(`${s.id}:`) || key.includes(`/${s.id}/subagents/`))) {
+        this.cursors.delete(key);
+      }
+    }
     for (const client of this.runtimes.get(agent.id)?.clients ?? []) client.close?.();
     this.runtimes.delete(agent.id);
     this.store.remove(agent.id);
@@ -745,20 +894,36 @@ export class AgentManager extends EventEmitter {
     this.refreshing.add(id);
     try {
       const agent = this.store.get(id);
-      if (!agent?.workdir) return agent && this.view(agent);
-      let changed = this.adoptSessions(agent);
+      // Before handoff, a planning session's transcript lives in the planning folder.
+      const planningOnly = agent?.planning && !agent.planning.handedOffAt && !agent.workdir;
+      const sessionDir = planningOnly ? agent.planning.dir : agent?.workdir;
+      if (!sessionDir) return agent && this.view(agent);
+      let changed = agent.workdir ? this.adoptSessions(agent) : false;
 
-      const info = await git.gitInfo(agent.workdir);
+      const info = agent.workdir ? await git.gitInfo(agent.workdir) : agent.git;
       if (!this.store.get(id)) return null;
-      if (JSON.stringify({ ...info, updatedAt: 0 }) !== JSON.stringify({ ...agent.git, updatedAt: 0 })) {
+      if (info !== undefined && JSON.stringify({ ...info, updatedAt: 0 }) !== JSON.stringify({ ...agent.git, updatedAt: 0 })) {
         agent.git = info;
         changed = true;
       }
 
       for (const session of agent.sessions) {
-        const cursor = this.cursors.get(session.id) ?? { offset: 0 };
-        this.cursors.set(session.id, cursor);
-        const res = scanTranscript(transcriptPath(agent.workdir, session.id), cursor, this.config.bugPatterns);
+        const file = transcriptPath(sessionDir, session.id);
+        const key = `${session.id}:${file}`; // the transcript moves at handoff; rescan the new copy
+        const cursor = this.cursors.get(key) ?? { offset: 0 };
+        this.cursors.set(key, cursor);
+        const res = scanTranscript(file, cursor, this.config.bugPatterns);
+        const subMaps = subagentTranscripts(sessionDir, session.id).map((sub) => {
+          const c = this.cursors.get(sub) ?? { offset: 0 };
+          this.cursors.set(sub, c);
+          scanTranscript(sub, c);
+          return c.usage;
+        });
+        const usage = sumUsage(cursor.usage, ...subMaps);
+        if (usage.requests && JSON.stringify(session.usage) !== JSON.stringify(usage)) {
+          session.usage = usage;
+          changed = true;
+        }
         for (const key of ['title', 'lastPrompt', 'cost', 'lastActivity']) {
           if (res[key] != null && JSON.stringify(session[key]) !== JSON.stringify(res[key])) {
             session[key] = res[key];
@@ -806,6 +971,11 @@ export class AgentManager extends EventEmitter {
         const a = this.store.get(id);
         if (a) this.changed(a);
       }
+    }
+    for (const [id, rt] of this.runtimes) {
+      if (!rt.pty || !rt.planning) continue;
+      const a = this.store.get(id);
+      if (a?.workdir && a.status !== 'preparing') this.maybeHandoff(id).catch(() => {});
     }
     if (this.tickCount % this.config.gitRefreshSec !== 0) return;
     for (const [id, rt] of this.runtimes) {
