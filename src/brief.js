@@ -181,3 +181,41 @@ export function explainPrompt({ intent, status, digest, repo, briefMarkdown }) {
     '</brief>',
   ].join('\n');
 }
+
+/** Prompt for "Insights": Why / What / How / Now, three tidy points each. */
+export function insightsPrompt({ intent, status, digest, repo, briefMarkdown }) {
+  return [
+    "Give a human the four insights that matter about an AI coding agent's work, from its ask and live",
+    'context below. Write Markdown with exactly these four sections, in this order:',
+    '### Why',
+    'Why this work matters: the motivation, the user or business need, or the root cause of the problem.',
+    '### What',
+    'What is being done or delivered: the scope and the outcome.',
+    '### How',
+    'How it is being done: the approach, the key mechanism or the main changes.',
+    '### Now',
+    'Where it stands now and the next step, including anything waiting on the user.',
+    '',
+    'Style rules, strictly:',
+    '- Each section has 1 to 3 bullets, never more. Fewer is better when it is enough.',
+    '- Each bullet is one short, concrete line of at most 12 words: easy to remember and repeat.',
+    '- Lead with the key word; no filler, no hedging, no nested bullets, no preamble or closing text.',
+    '- Use only the context. If something is not known yet, write "Unclear yet" as the bullet.',
+    '',
+    '<agent_status>',
+    status,
+    '</agent_status>',
+    '<intent>',
+    intent || '(none)',
+    '</intent>',
+    '<conversation>',
+    digest || '(no conversation recorded yet)',
+    '</conversation>',
+    '<repository>',
+    repo || '(no repository changes recorded)',
+    '</repository>',
+    '<brief>',
+    briefMarkdown || '(the agent has not written a brief yet)',
+    '</brief>',
+  ].join('\n');
+}

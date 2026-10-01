@@ -131,6 +131,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   api.post('/general', wrap((req) => manager.createGeneral(req.body ?? {})));
   api.get('/agents/:id/brief', wrap((req) => manager.briefFile(req.params.id)));
   api.post('/agents/:id/explain', wrap((req) => manager.explain(req.params.id)));
+  api.post('/agents/:id/insights', wrap((req) => manager.insights(req.params.id)));
   api.post('/agents/:id/plan', wrap((req) => manager.startPlanning(req.params.id)));
   api.post('/agents/:id/handoff', wrap((req) => manager.maybeHandoff(manager.mustGet(req.params.id).id, { force: true })));
   api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id)));

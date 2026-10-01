@@ -154,13 +154,44 @@ function explainBox(a) {
   return { button, box };
 }
 
+const INSIGHT_ICONS = { why: '🎯', what: '📦', how: '🛠', now: '📍' };
+
+/** Why / What / How / Now as four cards. */
+function insightsBox(a) {
+  const ins = a.insights;
+  const button = `<button class="small ${ins?.markdown ? '' : 'primary'}" data-act="insights" ${ins?.pending ? 'disabled' : ''}
+    title="Why, What, How and Now in three memorable points each, from the agent's ask and live session (a separate one-off Claude call)">${ins?.pending ? 'Thinking…' : ins?.markdown ? 'Refresh insights' : 'Insights'}</button>`;
+  if (!ins?.markdown && !ins?.error) return { button, box: '' };
+  const sections = {};
+  for (const part of (ins.markdown ?? '').split(/^###\s+/m).slice(1)) {
+    const [head, ...rest] = part.split('\n');
+    const key = head.trim().toLowerCase().replace(/[^a-z]/g, '');
+    if (INSIGHT_ICONS[key]) sections[key] = rest.join('\n').trim();
+  }
+  const stale = ins.markdown && a.brief?.updatedAt && ins.briefUpdatedAt !== a.brief.updatedAt;
+  const box = `<div class="insights">
+      ${ins.error ? `<p class="error">Couldn't get insights: ${esc(ins.error)}</p>` : ''}
+      ${ins.markdown
+        ? Object.keys(sections).length
+          ? `<div class="insight-grid">${Object.keys(INSIGHT_ICONS)
+              .map((k) => `<section class="insight ${k}"><h4>${INSIGHT_ICONS[k]} ${k[0].toUpperCase()}${k.slice(1)}</h4><div class="md">${md(sections[k] || 'Unclear yet')}</div></section>`)
+              .join('')}</div>`
+          : `<div class="md">${md(ins.markdown)}</div>`
+        : ''}
+      ${ins.markdown ? `<p class="hint">${stale ? 'The brief has changed since; refresh for the latest. · ' : ''}From ${ago(ins.at)}.</p>` : ''}
+    </div>`;
+  return { button, box };
+}
+
 function briefPanel(a) {
   if (a.kind === 'general') return '';
   const b = a.brief;
   const ex = explainBox(a);
+  const ins = insightsBox(a);
   if (!b) {
     return `<div class="card brief">
-      <h3>Brief ${ex.button}</h3>
+      <h3>Brief <span class="brief-actions">${ins.button} ${ex.button}</span></h3>
+      ${ins.box}
       ${ex.box}
       <p class="hint">Problem, solution, diagram and checks appear here once the agent writes its brief.
       ${a.lastStartedAt && !a.runtime.running ? ' Agents started before this feature write one after their next resume.' : ''}</p>
@@ -172,7 +203,8 @@ function briefPanel(a) {
         .join('')}</ul>`
     : '<p class="hint">No checks yet.</p>';
   return `<div class="card brief">
-    <h3>Brief <span class="brief-actions"><span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span> ${ex.button}</span></h3>
+    <h3>Brief <span class="brief-actions"><span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span> ${ins.button} ${ex.button}</span></h3>
+    ${ins.box}
     ${ex.box}
     <div class="brief-grid">
       <section><h4>Problem</h4>${b.problem ? clamp(a, 'problem', md(b.problem)) : '<p class="hint">—</p>'}</section>
@@ -887,6 +919,11 @@ $('#detail-body').addEventListener('click', async (e) => {
       act(async () => upsert(await api('PATCH', `/agents/${a.id}`, { project: name })));
       break;
     }
+    case 'insights':
+      btn.disabled = true;
+      btn.textContent = 'Thinking…';
+      act(async () => upsert(await api('POST', `/agents/${a.id}/insights`)));
+      break;
     case 'explain':
       btn.disabled = true;
       btn.textContent = 'Explaining…';

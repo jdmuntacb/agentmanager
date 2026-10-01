@@ -189,6 +189,18 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 .card.brief { margin-top: 16px; }
 .card.brief h3 { align-items: center; }
 .brief-actions { display: flex; gap: 10px; align-items: center; text-transform: none; letter-spacing: 0; }
+.insights { margin: 0 0 12px; }
+.insight-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.insight { padding: 10px 12px; border-radius: 8px; background: var(--panel-2); border-top: 3px solid var(--accent); min-width: 0; }
+.insight.why { border-top-color: #e8590c; }
+.insight.what { border-top-color: #3b5bdb; }
+.insight.how { border-top-color: #2f9e44; }
+.insight.now { border-top-color: #ae3ec9; }
+.insight h4 { margin: 0 0 6px; font-size: 13px; color: var(--text); }
+.insight .md ul { margin: 0; padding-left: 16px; }
+.insight .md li { margin: 0 0 4px; }
+@media (max-width: 1000px) { .insight-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .insight-grid { grid-template-columns: minmax(0, 1fr); } }
 .explain { margin: 0 0 12px; padding: 10px 12px; border-radius: 8px; background: var(--panel-2); border-left: 3px solid var(--accent); }
 .explain .md h3 { font-size: 13px; text-transform: none; letter-spacing: 0; color: var(--text); margin: 8px 0 2px; display: block; }
 .explain .md h3:first-child { margin-top: 0; }

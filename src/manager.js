@@ -5,7 +5,13 @@ import path from 'node:path';
 import pty from 'node-pty';
 import { expandHome, paths } from './config.js';
 import { trustFolder } from './trust.js';
-import { briefDir, briefPath, briefPrompt, conventionsPrompt, explainPrompt, loadBrief } from './brief.js';
+import { briefDir, briefPath, briefPrompt, conventionsPrompt, explainPrompt, insightsPrompt, loadBrief } from './brief.js';
+
+// One-off summaries of an agent's live context, each stored on the agent under `field`.
+const SUMMARIES = {
+  explain: { field: 'explanation', prompt: explainPrompt },
+  insights: { field: 'insights', prompt: insightsPrompt },
+};
 import { spawn } from 'node:child_process';
 import * as git from './git.js';
 import {
@@ -143,7 +149,9 @@ export class AgentManager extends EventEmitter {
         });
       }
       if (agent.progress) store.patch(agent.id, { progress: null });
-      if (agent.explanation?.pending) store.patch(agent.id, { explanation: { ...agent.explanation, pending: false } });
+      for (const { field } of Object.values(SUMMARIES)) {
+        if (agent[field]?.pending) store.patch(agent.id, { [field]: { ...agent[field], pending: false } });
+      }
     }
     this.preparing = new Map(); // agent id -> { controller, done } for workspace setup in flight
 
@@ -1034,20 +1042,31 @@ export class AgentManager extends EventEmitter {
    * session is never touched, so this never interrupts or adds context to its work.
    */
   explain(ref) {
+    return this.summarize(ref, 'explain');
+  }
+
+  /** Why / What / How / Now in three tidy points each. */
+  insights(ref) {
+    return this.summarize(ref, 'insights');
+  }
+
+  summarize(ref, kind) {
+    const { field } = SUMMARIES[kind];
     const agent = this.mustGet(ref);
     this.explaining ??= new Map();
-    if (this.explaining.has(agent.id)) return this.explaining.get(agent.id);
-    this.patch(agent.id, { explanation: { ...agent.explanation, pending: true, error: null } });
+    const key = `${kind}:${agent.id}`;
+    if (this.explaining.has(key)) return this.explaining.get(key);
+    this.patch(agent.id, { [field]: { ...agent[field], pending: true, error: null } });
     const run = this.explainContext(agent)
-      .then((ctx) => this.runExplain(agent, ctx))
+      .then((ctx) => this.runExplain(agent, ctx, kind))
       .catch((e) => {
         if (this.store.get(agent.id)) {
-          this.patch(agent.id, { explanation: { ...this.store.get(agent.id).explanation, pending: false, error: e.message } });
+          this.patch(agent.id, { [field]: { ...this.store.get(agent.id)[field], pending: false, error: e.message } });
         }
         throw e;
       })
-      .finally(() => this.explaining.delete(agent.id));
-    this.explaining.set(agent.id, run);
+      .finally(() => this.explaining.delete(key));
+    this.explaining.set(key, run);
     return run;
   }
 
@@ -1089,7 +1108,8 @@ export class AgentManager extends EventEmitter {
     return { intent: agent.intent, status, digest, repo, briefMarkdown };
   }
 
-  runExplain(agent, ctx) {
+  runExplain(agent, ctx, kind = 'explain') {
+    const { field, prompt } = SUMMARIES[kind];
     const args = [...(this.config.claudeArgs ?? []), '-p', '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
     args.push('--output-format', 'text');
     if (this.config.explainModel) args.push('--model', this.config.explainModel);
@@ -1106,13 +1126,13 @@ export class AgentManager extends EventEmitter {
         if (code === 0 && out.trim()) resolve(out.trim());
         else reject(new Error(`claude -p failed (exit ${code}): ${(err || out).trim().slice(-300)}`));
       });
-      child.stdin.end(explainPrompt(ctx));
+      child.stdin.end(prompt(ctx));
     }).then((markdown) => {
       const cur = this.store.get(agent.id);
       if (!cur) return null;
       return this.view(
         this.patch(agent.id, {
-          explanation: { markdown, at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null },
+          [field]: { markdown, at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null },
         }),
       );
     });

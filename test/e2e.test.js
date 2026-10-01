@@ -740,6 +740,11 @@ test("Explain summarizes the agent's live session in a separate tool-less Claude
   assert.equal(res.body.explanation.pending, false);
   assert.equal(res.body.status, 'stopped', 'explaining did not restart the agent');
   assert.ok(!launches().some((l) => l.args.includes(a.sessionId) && l.args.includes('-p')), 'not run inside the agent session');
+
+  // Insights: same context, Why / What / How / Now, stored separately.
+  const ins = (await call('POST', `/agents/${a.id}/insights`)).body;
+  assert.match(ins.insights.markdown, /^### Why\n- Safe call: Explain me please[\s\S]*### Now\n- saw agent text: true/);
+  assert.match(ins.explanation.markdown, /^### The ask/, 'explanation kept');
 });
 
 test('backlog: per-project limit, done → review frees a slot, accept, reopen, pause, priority', async () => {

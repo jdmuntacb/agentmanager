@@ -18,6 +18,7 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Projects.** The sidebar is a tree, project → agents, so you see how many projects are in flight and how many parallel sessions each has.
 - **Backlog.** Queue asks as work orders. Agents pick them up one by one, up to N in parallel per project, until each is done. You accept or reopen each one.
 - **Slack alerts.** A message in your channel when an agent needs input, finishes a backlog item, or fails.
+- **Insights.** Why, What, How and Now for any agent, three memorable points each.
 - **Explain.** One click gives a plain-language explanation of the intent and the insight behind the problem and solution. It comes from a separate tool-less Claude call, so the agent isn't interrupted.
 - **From your phone.** On by default: HTTPS access on your local network at a plain `https://<ip>:<port>`. Sign in with a QR code, and answer Claude's prompts with a key bar and reply box. Nothing to install.
 - **Never loses state.** `agentmgr flush` (also every 30 s and on shutdown) saves session IDs, terminal scrollback and usage. `agentmgr restart` brings everything back.
@@ -55,7 +56,8 @@ agentmgr show <agent>                         # everything tracked for one agent
 agentmgr attach <agent>                       # live terminal here; Ctrl-] detaches (resumes a closed agent)
 agentmgr shell <agent>                        # a shell in the agent's folder; Ctrl-] detaches
 agentmgr brief <agent>                        # print the agent's brief (Markdown)
-agentmgr explain <agent>                      # plain-language explanation of intent, problem and solution
+agentmgr insights <agent>                     # Why / What / How / Now, three points each
+agentmgr explain <agent>                      # full briefing: ask, status, plan, solution, conclusions, needs
 agentmgr remote on | off | status | rotate    # phone / remote access (see below)
 agentmgr backlog add "ask" -r <repo> [-p 1]   # queue work; also: ls, start, accept, reopen, move, limit, pause
 agentmgr notify slack --webhook <url>         # Slack alerts; also: test, status, on, off, event <name> on|off
@@ -174,6 +176,19 @@ How it behaves:
 - **Conventions.** With `reviewConventions` on (the default), agents are also told to read `CLAUDE.md` / `AGENTS.md`, the relevant skills (`.claude/skills`, `~/.claude/skills`), hooks and permissions (`.claude/settings*.json`, `~/.claude/settings.json`), and project commands and agents before working. They record what applies as the first check.
 - **Off switch.** Set `"brief": false` or `"reviewConventions": false` to turn these off. Neither applies to general sessions.
 - **Existing agents.** Agents started before this version pick it up on their next resume.
+
+## Insights
+
+**Insights** in the Brief panel, or `agentmgr insights <agent>`, shows the agent's work as four cards built from its ask and live context:
+
+| Card | Answers |
+| --- | --- |
+| 🎯 **Why** | Why it matters: the motivation, the need, or the root cause |
+| 📦 **What** | What is being done or delivered: scope and outcome |
+| 🛠 **How** | The approach, the key mechanism, the main changes |
+| 📍 **Now** | Where it stands and the next step, including anything waiting on you |
+
+Each card has at most **three points of about 12 words each**, so they're easy to remember and repeat. Insights uses the same context and the same separate, tool-less Claude call as Explain, so the agent isn't interrupted. Use Insights for a quick glance and Explain for the full briefing.
 
 ## Explain
 

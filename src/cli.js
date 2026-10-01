@@ -324,6 +324,18 @@ export async function main(argv) {
     });
 
   program
+    .command('insights')
+    .description('Why / What / How / Now for an agent, three tidy points each (one-off Claude call)')
+    .argument('<agent>')
+    .action(async (ref) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      process.stderr.write(dim('Thinking… (a separate Claude call; the agent is not interrupted)\n'));
+      const res = await api('POST', `/agents/${a.id}/insights`);
+      process.stdout.write(`${res.insights.markdown}\n`);
+    });
+
+  program
     .command('plan')
     .description('While the workspace is still being prepared, plan the task with Claude and attach')
     .argument('<agent>')
