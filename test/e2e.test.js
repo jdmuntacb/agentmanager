@@ -535,6 +535,14 @@ test('task agents keep a brief and are told to follow skills and hooks; general 
     ],
   );
   assert.match(sys, /## References[\s\S]*PRD and Tech Spec/);
+  // Results: the agent's own outcome + blockers, plus tracked facts (its failing check).
+  assert.equal(withBrief.results.outcome, 'blocked');
+  assert.deepEqual(withBrief.results.delivered.map((d) => d.text), ['Root cause found in `auth/session.go`']);
+  assert.deepEqual(withBrief.results.blockers.map((b) => [b.text, b.source]), [
+    ['staging credentials (needs: platform team)', 'agent'],
+    ['Failing check: e2e login suite', 'checks'],
+  ]);
+  assert.match(sys, /## Results[\s\S]*Outcome:[\s\S]*Blocked by/);
   const raw = (await call('GET', `/agents/${a.id}/brief`)).body;
   assert.equal(raw.path, path.join(home, 'briefs', a.id, 'BRIEF.md'));
   assert.match(raw.markdown, /## Checks/);
@@ -862,8 +870,8 @@ test('Slack Workflow Builder webhooks get only the "text" variable, as plain tex
     await call('POST', '/notify', { webhookUrl: `http://127.0.0.1:${hook.address().port}/triggers/T1/123/abc`, needsInputDelaySec: 0, enabled: true });
     assert.equal((await call('GET', '/notify')).body.workflow, true);
     const [a] = (await call('POST', '/agents', { intent: 'Workflow #ask', project: 'WF' })).body;
-    await waitFor(() => got.some((m) => m.body.text?.includes(a.name)), 15000, 'workflow alert');
-    const m = got.find((x) => x.body.text.includes(a.name));
+    await waitFor(() => got.some((m) => m.body.text?.includes(a.name) && /needs input/.test(m.body.text)), 15000, 'workflow alert');
+    const m = got.find((x) => x.body.text.includes(a.name) && /needs input/.test(x.body.text));
     assert.deepEqual(Object.keys(m.body), ['text'], 'only the variables a workflow defines');
     assert.match(m.body.text, /needs input: Permission prompt/);
     assert.match(m.body.text, new RegExp(`Open: http://127\\.0\\.0\\.1:\\d+/#${a.id}/term`));

@@ -12,6 +12,7 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Background terminals.** Agents run inside the daemon's PTYs. Open any agent's live terminal in the browser (**Open terminal**) or in your shell (`agentmgr attach`). Closing the view leaves the agent running.
 - **Session IDs are kept.** Each agent is started with a known `--session-id`. **Close session** stops the process but keeps the ID, and bringing it back runs `claude --resume <id>`. **New session** adds another ID to the agent's history; earlier ones stay resumable.
 - **Tracking.** For each agent you see its session ID, working folder, repo, branch, head commit, uncommitted changes, PRs and bugs.
+- **Results.** The end result at a glance: ✅ done, 🟡 partial, ⛔ blocked or 🔄 in progress, with what was delivered and what's blocking it.
 - **Brief per agent.** Each agent keeps a living brief that the UI shows next to its terminal:
   - **Problem**, **Solution**, a **design / flow diagram** (Mermaid) and **Checks** (passed / failed / running / pending);
   - when the intent links a Jira issue, **References** with its **PRD** and **Tech Spec** links and the points that matter.
@@ -172,6 +173,7 @@ Every task agent is told, on each launch, to keep a short brief in `~/.agentmana
 | `## Solution` | The approach and key changes, kept current |
 | `## Diagram` | One ` ```mermaid ` block: flow, sequence or architecture |
 | `## Checks` | `- [ ]` pending, `- [~]` running, `- [x]` passed, `- [!]` failed, with the command or evidence |
+| `## Results` | `Outcome: in progress \| partial \| done \| blocked`, then `- Delivered: …` (PRs, commits, files, docs, answers) and `- Blocked by: … (needs: who/what)` |
 | `## References` | Only when the intent links Jira issues. The agent looks them up with its own Jira / Atlassian tools (no credentials in agentmgr) and lists the **PRD** and **Tech Spec** fields as links with highlights, plus other design docs. Empty fields are listed as "none". |
 
 How it behaves:
@@ -234,6 +236,24 @@ The Brief panel's **Share for review** buttons, or `agentmgr doc <agent> <kind>`
 | 📍 **Now** | Where it stands and the next step, including anything waiting on you |
 
 Each card has at most **three points of about 12 words each**, so they're easy to remember and repeat. Insights uses the same context and the same separate, tool-less Claude call as Explain, so the agent isn't interrupted. Use Insights for a quick glance and Explain for the full briefing.
+
+## Results
+
+The **Results** card is the first thing in the Brief panel, and `agentmgr show` lists it too. It shows:
+
+- **The outcome:** ✅ Done, 🟡 Partial, ⛔ Blocked or 🔄 In progress.
+- **Blockers first, in red.**
+- **What was delivered.**
+
+It combines what the agent wrote under `## Results` with what Agent Manager tracks itself:
+
+- PRs (with their state).
+- Failing checks.
+- An unanswered prompt.
+- A setup error.
+- The brief's `Status:` line.
+
+So agents that haven't written Results yet still get one. Blocked and done agents show ⛔ / ✅ in the agent list, and the **blocked** Slack alert (on by default) fires when an agent reports it's blocked.
 
 ## Explain
 
@@ -335,6 +355,7 @@ Or use **Alerts** in the header (on this computer only). Settings, including the
 | review | on | A backlog item finished and is ready for your review |
 | error | on | Workspace setup or launch failed |
 | waiting | off | The agent finished its turn and has been idle 2 min |
+| blocked | on | The agent reports it is blocked (brief status or Results outcome) |
 
 **Message behaviour:**
 

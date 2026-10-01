@@ -264,3 +264,22 @@ test('suggestShortcut makes short, unique project shortcuts', async () => {
   assert.equal(take('agentmanager'), 'age');
   assert.equal(take('code-coverage'), 'cc2', 'collisions get a number');
 });
+
+test('parseBrief reads Results: outcome, delivered, blocked by', async () => {
+  const { parseBrief } = await import('../src/brief.js');
+  const r = parseBrief(`## Problem
+x
+## Results
+**Outcome:** Partial
+- Delivered: PR https://github.com/a/b/pull/9
+- Delivered: design doc
+- **Blocked by:** QA environment (needs: QE)
+Some notes.
+`).results;
+  assert.deepEqual(r, {
+    outcome: 'partial',
+    delivered: ['PR https://github.com/a/b/pull/9', 'design doc'],
+    blockers: ['QA environment (needs: QE)'],
+    notes: 'Some notes.',
+  });
+});

@@ -10,6 +10,7 @@ export const EVENT_DEFAULTS = {
   needsInput: true, // trust / permission prompt or a question menu, unanswered
   review: true, // backlog item moved to review
   error: true, // workspace setup or launch failed
+  blocked: true, // the agent reports it is blocked (brief status / results outcome)
   waiting: false, // finished its turn and idle (can be noisy)
 };
 
@@ -130,6 +131,14 @@ export class Notifier {
     } else {
       s.idleSince = null;
     }
+    const blocked = a.brief?.status === 'blocked' || a.brief?.results?.outcome === 'blocked';
+    if (blocked) {
+      if (!s.sent.has('blocked')) {
+        s.sent.add('blocked');
+        const why = a.brief?.results?.blockers?.[0];
+        this.send('blocked', a, `is blocked${why ? `: ${why}` : ''}`);
+      }
+    } else s.sent.delete('blocked');
     if (a.status === 'error') {
       if (!s.sent.has('error')) {
         s.sent.add('error');
@@ -171,7 +180,7 @@ export class Notifier {
   send(kind, agent, what) {
     const n = loadNotify();
     if (!n.enabled || !n.events[kind]) return;
-    const icon = { needsInput: ':raised_hand:', review: ':white_check_mark:', error: ':x:', waiting: ':hourglass_flowing_sand:' }[kind];
+    const icon = { needsInput: ':raised_hand:', review: ':white_check_mark:', error: ':x:', waiting: ':hourglass_flowing_sand:', blocked: ':no_entry:' }[kind];
     const project = agent.projectInfo?.name ? ` (${agent.projectInfo.name})` : '';
     const link = this.linkFor(agent.id);
     const intent = n.includeIntent && agent.intent ? `\n> ${agent.intent.replace(/\s+/g, ' ').slice(0, 200)}` : '';

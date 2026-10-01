@@ -199,6 +199,16 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 .card.brief { margin-top: 16px; }
 .card.brief h3 { align-items: center; }
 .brief-actions { display: flex; gap: 10px; align-items: center; text-transform: none; letter-spacing: 0; }
+.results { margin: 0 0 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); border-left: 4px solid var(--accent); }
+.results.done { border-left-color: var(--green); }
+.results.partial { border-left-color: var(--yellow); }
+.results.blocked { border-left-color: var(--red); background: color-mix(in srgb, var(--red) 6%, transparent); }
+.results h4 { margin: 0 0 6px; font-size: 13px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.results .outcome { font-weight: 700; }
+.results ul { margin: 4px 0; padding-left: 18px; font-size: 13.5px; }
+.results li.blocker { color: var(--red); }
+.results li.blocker a { color: inherit; text-decoration: underline; }
+.outcome-mark { flex: none; font-size: 12px; }
 .share-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: -2px 0 12px; }
 .doc-buttons { display: inline-flex; gap: 6px; flex-wrap: wrap; }
 .doc-btn.has { border-color: var(--accent); color: var(--accent); }

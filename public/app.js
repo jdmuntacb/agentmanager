@@ -302,6 +302,27 @@ function insightsBox(a) {
   return { button, box };
 }
 
+const OUTCOME = {
+  done: ['✅', 'Done'],
+  partial: ['🟡', 'Partial'],
+  blocked: ['⛔', 'Blocked'],
+  'in progress': ['🔄', 'In progress'],
+};
+
+/** End result, status and blockers: first thing a reviewer reads. */
+function resultsCard(a) {
+  const r = a.results;
+  if (!r) return '';
+  const [icon, label] = OUTCOME[r.outcome] ?? ['🔄', r.outcome];
+  const item = (x, cls) => `<li class="${cls}">${x.url ? `<a href="${esc(x.url)}" target="_blank" rel="noopener">${md(x.text).replace(/^<p>|<\/p>\s*$/g, '')}</a>` : md(x.text).replace(/^<p>|<\/p>\s*$/g, '')}</li>`;
+  return `<div class="results ${r.outcome.replace(' ', '-')}">
+    <h4>Results <span class="outcome">${icon} ${label}</span>${r.fromAgent ? '' : ' <span class="hint">(from what Agent Manager can see; the agent adds its own when it next updates its brief)</span>'}</h4>
+    ${r.blockers.length ? `<ul class="blockers">${r.blockers.map((x) => item(x, 'blocker')).join('')}</ul>` : ''}
+    ${r.delivered.length ? `<ul class="delivered">${r.delivered.map((x) => item(x, 'delivered')).join('')}</ul>` : '<p class="hint">Nothing delivered yet.</p>'}
+    ${r.notes ? `<div class="md">${md(r.notes)}</div>` : ''}
+  </div>`;
+}
+
 function briefPanel(a) {
   if (a.kind === 'general') return '';
   const b = a.brief;
@@ -311,6 +332,7 @@ function briefPanel(a) {
     return `<div class="card brief">
       <h3>Brief <span class="brief-actions">${ins.button} ${ex.button}</span></h3>
       <div class="share-row"><span class="hint">Share for review:</span> ${docButtons(a)}</div>
+      ${resultsCard(a)}
       ${ins.box}
       ${ex.box}
       <p class="hint">Problem, solution, diagram and checks appear here once the agent writes its brief.
@@ -325,6 +347,7 @@ function briefPanel(a) {
   return `<div class="card brief">
     <h3>Brief <span class="brief-actions"><span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span> ${ins.button} ${ex.button}</span></h3>
     <div class="share-row"><span class="hint">Share for review:</span> ${docButtons(a)}</div>
+    ${resultsCard(a)}
     ${ins.box}
     ${ex.box}
     <div class="brief-grid">
@@ -403,7 +426,7 @@ const prioChip = (p, { always = false } = {}) =>
 function agentItem(a) {
   const st = statusOf(a);
   return `<li data-id="${a.id}" class="agent pr${a.priority ?? 2} ${a.id === selectedId ? 'selected' : ''}">
-    <div class="line1">${prioChip(a.priority ?? 2)}<span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
+    <div class="line1">${prioChip(a.priority ?? 2)}${a.results?.outcome === 'blocked' ? '<span class="outcome-mark" title="Blocked">⛔</span>' : a.results?.outcome === 'done' ? '<span class="outcome-mark" title="Done">✅</span>' : ''}<span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
     <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${esc(a.intent || 'General session')}</div>
     ${a.status === 'preparing' && a.progress ? `<div class="progress-line">${esc(progressText(a.progress))}</div>` : ''}
     <div class="meta">
@@ -1479,7 +1502,7 @@ $('#alerts-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
   const body = {
-    events: { needsInput: f.ev_needsInput.checked, review: f.ev_review.checked, error: f.ev_error.checked, waiting: f.ev_waiting.checked },
+    events: { needsInput: f.ev_needsInput.checked, review: f.ev_review.checked, error: f.ev_error.checked, waiting: f.ev_waiting.checked, blocked: f.ev_blocked.checked },
     needsInputDelaySec: Number(f.needsInputDelaySec.value),
     waitingDelaySec: Number(f.waitingDelaySec.value),
     skipWhenWatching: f.skipWhenWatching.checked,

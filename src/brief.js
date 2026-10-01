@@ -25,6 +25,9 @@ export const briefPrompt = (file) =>
   'Keep it small and valid Mermaid syntax.\n' +
   '## Checks\nA task list of how the work is verified, one line per check with the command or evidence: ' +
   '"- [ ]" pending, "- [~]" running, "- [x]" passed, "- [!]" failed.\n' +
+  '## Results\nThe end result so far. First line "Outcome: in progress | partial | done | blocked". Then bullets:\n' +
+  '"- Delivered: ..." for each concrete result (PR or commit links, files, documents, answers), and\n' +
+  '"- Blocked by: ... (needs: who or what)" for anything blocking progress. Keep it current; it is what reviewers read first.\n' +
   'Add a fifth section only when the task links Jira issues (or other tickets):\n' +
   '## References\nLook each linked issue up (use your Jira / Atlassian tools if you have them) and list the ' +
   'documents its fields point to, above all its PRD and Tech Spec fields, plus design docs or Confluence pages. ' +
@@ -40,6 +43,7 @@ const SECTION_ALIASES = {
   diagram: ['diagram', 'design', 'flow', 'architecture', 'design/flow/architecture', 'design / flow / architecture'],
   checks: ['checks', 'verification', 'tests', 'testing', 'validation'],
   references: ['references', 'links', 'documents', 'docs', 'specs', 'prd / tech spec', 'prd/tech spec'],
+  results: ['results', 'result', 'outcome', 'status and results', 'results and status'],
 };
 
 // "- **PRD**: [Title](https://...) — highlight", tolerating ":" / "-" / "–" separators and bare URLs.
@@ -69,7 +73,7 @@ const CHECK_STATES = { ' ': 'pending', '~': 'running', x: 'passed', X: 'passed',
 
 /** Parse the brief Markdown into its four sections. Unknown sections are ignored. */
 export function parseBrief(markdown) {
-  const out = { status: null, problem: '', solution: '', diagram: null, diagramNotes: '', checks: [], references: [] };
+  const out = { status: null, problem: '', solution: '', diagram: null, diagramNotes: '', checks: [], references: [], results: null };
   const st = markdown.split(/^##\s/m)[0].match(/^\s*\**status\**\s*:\s*\**\s*(planning|working|blocked|done)\b/im);
   if (st) out.status = st[1].toLowerCase();
   const parts = markdown.split(/^##\s+(.+?)\s*#*\s*$/m);
@@ -81,6 +85,20 @@ export function parseBrief(markdown) {
       const m = body.match(/```mermaid\s*\n([\s\S]*?)```/);
       out.diagram = m ? m[1].trim() : null;
       out.diagramNotes = (m ? body.replace(m[0], '') : body).trim();
+    } else if (key === 'results') {
+      const outcome = body.match(/^\s*\**outcome\**\s*:\s*\**\s*(in progress|in-progress|partial|done|blocked)\b/im)?.[1];
+      const lines = body.split('\n');
+      const pick = (re) => lines.map((l) => l.match(re)?.[1]?.trim()).filter(Boolean);
+      out.results = {
+        outcome: outcome ? outcome.toLowerCase().replace('-', ' ') : null,
+        // Tolerates "Delivered:", "**Delivered:**" and "**Delivered**:".
+        delivered: pick(/^\s*[-*]\s+\**\s*delivered\s*\**\s*:\s*\**\s*(.+)$/i),
+        blockers: pick(/^\s*[-*]\s+\**\s*blocked by\s*\**\s*:\s*\**\s*(.+)$/i),
+        notes: lines
+          .filter((l) => !/^\s*\**\s*outcome\s*\**\s*:/i.test(l) && !/^\s*[-*]\s+\**\s*(delivered|blocked by)\s*\**\s*:/i.test(l))
+          .join('\n')
+          .trim(),
+      };
     } else if (key === 'references') {
       for (const line of body.split('\n')) {
         const ref = parseReference(line);

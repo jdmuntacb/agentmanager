@@ -223,8 +223,10 @@ export class AgentManager extends EventEmitter {
     for (const s of agent.sessions ?? []) for (const k of Object.keys(usage)) usage[k] += s.usage?.[k] ?? 0;
     usage.io = usage.input + usage.output;
     const costs = (agent.sessions ?? []).map((s) => s.cost?.usd).filter((c) => c != null);
+    const prs = Object.values(agent.prs ?? {});
     return {
       ...agent,
+      results: this.results(agent, rt, prs),
       priority: agent.priority ?? 2,
       projectInfo: this.projectInfo(agent),
       usage,
@@ -242,6 +244,37 @@ export class AgentManager extends EventEmitter {
         lastOutputAt: rt?.lastOutputAt ? new Date(rt.lastOutputAt).toISOString() : null,
       },
     };
+  }
+
+  /**
+   * The end result / status / blockers for an agent: what the agent wrote under
+   * "## Results", plus what Agent Manager knows (PRs, checks, prompts, errors).
+   */
+  results(agent, rt, prs) {
+    const r = agent.brief?.results;
+    const delivered = (r?.delivered ?? []).map((text) => ({ text, source: 'agent' }));
+    const blockers = (r?.blockers ?? []).map((text) => ({ text, source: 'agent' }));
+    for (const p of prs) {
+      if (p.source === 'mentioned') continue;
+      const label = `PR ${p.number ? `#${p.number} ` : ''}${p.title ?? p.url}${p.state ? ` (${p.isDraft ? 'draft' : p.state.toLowerCase()})` : ''}`;
+      if (!delivered.some((d) => d.text.includes(p.url) || (p.number && d.text.includes(`#${p.number}`)))) {
+        delivered.push({ text: label, url: p.url, source: 'tracked' });
+      }
+    }
+    const failed = (agent.brief?.checks ?? []).filter((c) => c.state === 'failed');
+    for (const c of failed) blockers.push({ text: `Failing check: ${c.text}`, source: 'checks' });
+    const attention = rt?.pty && !rt.busy && rt.attention;
+    if (attention) blockers.push({ text: `${attention}: waiting for an answer in the terminal`, source: 'live' });
+    if (agent.status === 'error') blockers.push({ text: agent.error ?? 'Setup or launch failed', source: 'live' });
+
+    let outcome = r?.outcome ?? null;
+    if (!outcome) {
+      if (agent.status === 'error' || agent.brief?.status === 'blocked') outcome = 'blocked';
+      else if (agent.brief?.status === 'done') outcome = 'done';
+      else if (agent.brief?.status || rt?.pty || agent.status === 'preparing') outcome = 'in progress';
+    }
+    if (!outcome && !delivered.length && !blockers.length) return null;
+    return { outcome: outcome ?? 'in progress', delivered, blockers, notes: r?.notes ?? '', fromAgent: Boolean(r) };
   }
 
   changed(agent) {

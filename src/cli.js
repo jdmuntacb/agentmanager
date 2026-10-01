@@ -87,6 +87,13 @@ function printAgent(a) {
     kv('', dim(`cache: ${u.cacheRead.toLocaleString()} read, ${u.cacheCreation.toLocaleString()} write; ${u.total.toLocaleString()} total incl. cache, ${u.requests} requests`));
   }
   kv('cost', a.costUsd ? `$${a.costUsd.toFixed(2)} ${dim('(reported by Claude Code)')}` : null);
+  if (a.results) {
+    const r = a.results;
+    const icon = { done: green('✔ done'), partial: yellow('◐ partial'), blocked: red('⛔ blocked'), 'in progress': cyan('↻ in progress') };
+    console.log(`  ${dim('Results')}    ${icon[r.outcome] ?? r.outcome}`);
+    for (const d of r.delivered) console.log(`    ${green('•')} ${d.text}`);
+    for (const b of r.blockers) console.log(`    ${red('⛔')} ${b.text}`);
+  }
   if (a.brief) {
     const b = a.brief;
     const icon = { passed: green('✓'), failed: red('✗'), running: yellow('◔'), pending: dim('○') };
@@ -621,11 +628,11 @@ export async function main(argv) {
   }
   notifyCmd
     .command('event')
-    .description('Turn one alert on or off: needsInput, review, error, waiting')
+    .description('Turn one alert on or off: needsInput, review, error, waiting, blocked')
     .argument('<event>')
     .argument('<onoff>')
     .action(async (event, onoff) => {
-      if (!['needsInput', 'review', 'error', 'waiting'].includes(event)) throw new Error('event must be needsInput, review, error or waiting');
+      if (!['needsInput', 'review', 'error', 'waiting', 'blocked'].includes(event)) throw new Error('event must be needsInput, review, error, waiting or blocked');
       await daemon();
       printNotify(await api('POST', '/notify', { events: { [event]: onoff === 'on' } }));
     });
