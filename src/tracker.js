@@ -44,7 +44,8 @@ export function sumUsage(...maps) {
       total.requests += 1;
     }
   }
-  total.total = total.input + total.output + total.cacheCreation + total.cacheRead;
+  total.io = total.input + total.output; // what the model read fresh and wrote
+  total.total = total.io + total.cacheCreation + total.cacheRead;
   return total;
 }
 

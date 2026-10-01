@@ -82,8 +82,9 @@ function printAgent(a) {
   kv('attention', a.runtime.attention && red(`${a.runtime.attention}: run "agentmgr attach ${a.id}" to answer`));
   const u = a.usage;
   if (u?.total) {
-    kv('tokens', `${u.total.toLocaleString()} total: ${u.input.toLocaleString()} in, ${u.output.toLocaleString()} out, ` +
-      `${u.cacheRead.toLocaleString()} cache read, ${u.cacheCreation.toLocaleString()} cache write (${u.requests} requests)`);
+    const io = u.io ?? u.input + u.output;
+    kv('tokens', `${io.toLocaleString()} I/O (${u.input.toLocaleString()} in, ${u.output.toLocaleString()} out)`);
+    kv('', dim(`cache: ${u.cacheRead.toLocaleString()} read, ${u.cacheCreation.toLocaleString()} write; ${u.total.toLocaleString()} total incl. cache, ${u.requests} requests`));
   }
   kv('cost', a.costUsd ? `$${a.costUsd.toFixed(2)} ${dim('(reported by Claude Code)')}` : null);
   if (a.brief) {
@@ -478,7 +479,7 @@ export async function main(argv) {
   notifyCmd
     .command('slack')
     .description('Send alerts to Slack: an incoming webhook URL, or a bot token and channel')
-    .option('--webhook <url>', 'incoming webhook URL (https://hooks.slack.com/services/...)')
+    .option('--webhook <url>', 'incoming webhook (hooks.slack.com/services/...) or Workflow Builder webhook (hooks.slack.com/triggers/...)')
     .option('--token <token>', 'bot token (xoxb-...) for chat.postMessage')
     .option('--channel <channel>', 'channel for the bot token, e.g. #agents')
     .action(async (opts) => {
@@ -634,11 +635,11 @@ export async function main(argv) {
           a.git?.branch ?? '',
           String(a.prs.length || ''),
           String(a.bugs.length || ''),
-          fmtTokens(a.usage?.total),
+          fmtTokens(a.usage?.io ?? (a.usage ? a.usage.input + a.usage.output : 0)),
           a.sessionId.slice(0, 8),
           truncate(a.workdir ?? '', 50),
         ]),
-        ['PROJECT', 'ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'TOKENS', 'SESSION', 'FOLDER'],
+        ['PROJECT', 'ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'I/O TOK', 'SESSION', 'FOLDER'],
       );
     });
 
@@ -720,11 +721,11 @@ export async function main(argv) {
         a.sessions.map((s) => [
           s.id === a.sessionId ? green(`${s.id} *`) : s.id,
           truncate(s.title ?? '', 40),
-          fmtTokens(s.usage?.total),
+          fmtTokens(s.usage ? (s.usage.io ?? s.usage.input + s.usage.output) : 0),
           s.cost?.usd != null ? `$${s.cost.usd.toFixed(2)}` : '',
           s.lastActivity ?? '',
         ]),
-        ['SESSION', 'TITLE', 'TOKENS', 'COST', 'LAST ACTIVITY'],
+        ['SESSION', 'TITLE', 'I/O TOK', 'COST', 'LAST ACTIVITY'],
       );
       console.log(dim(`\nOutside agentmgr: cd ${a.workdir} && claude --resume <session>`));
     });

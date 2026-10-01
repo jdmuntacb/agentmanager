@@ -9,7 +9,7 @@ import { WebSocketServer } from 'ws';
 import { ensureHome, HOST, loadConfig, paths, PORT } from './config.js';
 import { AgentManager } from './manager.js';
 import { Backlog } from './backlog.js';
-import { Notifier, loadNotify, publicNotify, saveNotify, sendSlack } from './notify.js';
+import { Notifier, isWorkflowUrl, loadNotify, publicNotify, saveNotify, sendSlack } from './notify.js';
 import * as remote from './remote.js';
 import { Store } from './store.js';
 
@@ -156,7 +156,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
 
   // ---------------------------------------------------------- Slack alerts (local only)
   const okUrl = (u) => /^https:\/\/[\w.-]+\//.test(u) || /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(u);
-  api.get('/notify', wrap(() => ({ ...publicNotify(), recent: notifier.log })));
+  api.get('/notify', wrap(() => ({ ...publicNotify(), workflow: isWorkflowUrl(loadNotify().slack.webhookUrl), recent: notifier.log })));
   api.post(
     '/notify',
     wrap((req) => {

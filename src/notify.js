@@ -55,8 +55,16 @@ export function publicNotify() {
   };
 }
 
-/** Post one message, via the incoming webhook or chat.postMessage. */
-export async function sendSlack(text, n = loadNotify()) {
+/** Workflow Builder webhook ("From a webhook" trigger) rather than an app's incoming webhook. */
+export const isWorkflowUrl = (url) => /^https:\/\/hooks\.slack\.com\/triggers\//.test(url ?? '') || /\/triggers\//.test(url ?? '');
+
+/**
+ * Post one message: via a bot token (chat.postMessage), an incoming webhook, or a
+ * Workflow Builder webhook. `text` may use Slack link markup (<url|label>);
+ * `plain` is the same message without it, for workflows, which insert the
+ * "text" variable verbatim and only accept the variables they define.
+ */
+export async function sendSlack(text, n = loadNotify(), plain = text) {
   const { webhookUrl, botToken, channel } = n.slack;
   if (botToken && channel) {
     const res = await fetch('https://slack.com/api/chat.postMessage', {
@@ -69,12 +77,17 @@ export async function sendSlack(text, n = loadNotify()) {
     return;
   }
   if (!webhookUrl) throw new Error('Slack is not configured (set a webhook URL, or a bot token and channel)');
+  const workflow = isWorkflowUrl(webhookUrl);
   const res = await fetch(webhookUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text, unfurl_links: false }),
+    body: JSON.stringify(workflow ? { text: plain } : { text, unfurl_links: false }),
   });
-  if (!res.ok) throw new Error(`Slack webhook: HTTP ${res.status} ${(await res.text().catch(() => '')).slice(0, 100)}`);
+  if (!res.ok) {
+    const detail = (await res.text().catch(() => '')).slice(0, 160);
+    const hint = workflow && res.status === 400 ? ' (does the workflow define exactly one variable named "text"?)' : '';
+    throw new Error(`Slack ${workflow ? 'workflow' : 'webhook'}: HTTP ${res.status} ${detail}${hint}`);
+  }
 }
 
 /**
@@ -163,7 +176,8 @@ export class Notifier {
     const link = this.linkFor(agent.id);
     const intent = n.includeIntent && agent.intent ? `\n> ${agent.intent.replace(/\s+/g, ' ').slice(0, 200)}` : '';
     const text = `${icon} *${agent.name}*${project} ${what}${intent}${link ? `\n<${link}|Open in Agent Manager>` : ''}`;
-    sendSlack(text, n)
+    const plain = `${icon} ${agent.name}${project} ${what.replace(/\*/g, '')}${intent}${link ? `\nOpen: ${link}` : ''}`;
+    sendSlack(text, n, plain)
       .then(() => this.record(kind, agent, null))
       .catch((err) => this.record(kind, agent, err.message));
   }

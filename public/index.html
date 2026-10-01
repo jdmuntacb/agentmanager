@@ -188,8 +188,8 @@
     <dialog id="alerts-dialog">
       <form id="alerts-form" method="dialog" class="alerts-body">
         <h2>Slack alerts</h2>
-        <p class="hint">Get a Slack message when an agent needs you. Use a channel's <b>incoming webhook</b> URL, or a <b>bot token</b> and channel. Stored only on this computer.</p>
-        <label>Incoming webhook URL <input name="webhookUrl" type="password" autocomplete="off" placeholder="https://hooks.slack.com/services/…" /></label>
+        <p class="hint">Get a Slack message when an agent needs you. Use a <b>Workflow Builder</b> webhook (<code>…/triggers/…</code>, with one Text variable named <code>text</code>), an app's <b>incoming webhook</b> (<code>…/services/…</code>), or a <b>bot token</b> and channel. Stored only on this computer.</p>
+        <label>Webhook URL <input name="webhookUrl" type="password" autocomplete="off" placeholder="https://hooks.slack.com/services/…" /></label>
         <div class="row">
           <label>or bot token <input name="botToken" type="password" autocomplete="off" placeholder="xoxb-…" /></label>
           <label>channel <input name="channel" placeholder="#agents" /></label>

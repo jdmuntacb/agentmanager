@@ -104,6 +104,7 @@ test('agent lifecycle: spawn, track, terminal, close, resume, fresh session', as
     [tracked.usage.input, tracked.usage.output, tracked.usage.cacheCreation, tracked.usage.cacheRead, tracked.usage.total],
     [12, 34, 56, 78, 180],
   );
+  assert.equal(tracked.usage.io, 46, 'I/O = input + output only');
 
   // Terminal: backlog replay, input round trip.
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/term/${a1.id}`);
@@ -833,6 +834,35 @@ test('Slack alerts: needs input after the delay, once per episode; review; setti
     const [it] = (await call('POST', '/backlog', { items: ['alert me #done'], project: 'Alerts' })).body;
     await waitFor(() => got.some((m) => /ready for your review/.test(m.text) && m.text.includes('alert me')), 15000, 'review alert');
     await call('POST', `/backlog/${it.id}/accept`);
+  } finally {
+    await call('POST', '/notify', { enabled: false });
+    hook.close();
+  }
+});
+
+test('Slack Workflow Builder webhooks get only the "text" variable, as plain text', async () => {
+  const http = await import('node:http');
+  const got = [];
+  const hook = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      got.push({ path: req.url, body: JSON.parse(b) });
+      res.end('{"ok":true}');
+    });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  try {
+    await call('POST', '/notify', { webhookUrl: `http://127.0.0.1:${hook.address().port}/triggers/T1/123/abc`, needsInputDelaySec: 0, enabled: true });
+    assert.equal((await call('GET', '/notify')).body.workflow, true);
+    const [a] = (await call('POST', '/agents', { intent: 'Workflow #ask', project: 'WF' })).body;
+    await waitFor(() => got.some((m) => m.body.text?.includes(a.name)), 15000, 'workflow alert');
+    const m = got.find((x) => x.body.text.includes(a.name));
+    assert.deepEqual(Object.keys(m.body), ['text'], 'only the variables a workflow defines');
+    assert.match(m.body.text, /needs input: Permission prompt/);
+    assert.match(m.body.text, new RegExp(`Open: http://127\\.0\\.0\\.1:\\d+/#${a.id}/term`));
+    assert.ok(!/<http[^>]*\|/.test(m.body.text), 'no Slack link markup in workflow text');
+    await call('POST', `/agents/${a.id}/stop`);
   } finally {
     await call('POST', '/notify', { enabled: false });
     hook.close();

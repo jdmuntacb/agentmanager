@@ -138,6 +138,7 @@ test('token usage counts each API response once and includes subagents', async (
     cacheCreation: 300,
     cacheRead: 3000,
     requests: 3,
+    io: 41,
     total: 3341,
   });
 });

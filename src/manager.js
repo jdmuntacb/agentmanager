@@ -173,6 +173,7 @@ export class AgentManager extends EventEmitter {
     const rt = this.runtimes.get(agent.id);
     const usage = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0, requests: 0, total: 0 };
     for (const s of agent.sessions ?? []) for (const k of Object.keys(usage)) usage[k] += s.usage?.[k] ?? 0;
+    usage.io = usage.input + usage.output;
     const costs = (agent.sessions ?? []).map((s) => s.cost?.usd).filter((c) => c != null);
     return {
       ...agent,

@@ -239,8 +239,21 @@ The backlog is saved with the rest of the state.
 
 ## Slack alerts
 
+**Three ways to connect Slack:**
+
+- **Workflow Builder.** Needs no app install, and can message you directly.
+  1. In Slack, open *Workflows* (or *Automations*) and create a new workflow that starts **From a webhook**.
+  2. Add **one variable**: name `text`, type *Text*.
+  3. Add a step, **Send a message to a person** (yourself) or **…to a channel**, and insert the `text` variable as the message.
+  4. Publish it and copy the web request URL (`https://hooks.slack.com/triggers/…`).
+- **Incoming webhook.** Create an app at api.slack.com/apps → *Incoming Webhooks* → *Add New Webhook*, then pick a channel. Your workspace may require admin approval.
+- **Bot token and channel.** If you already have a Slack app.
+
+Then:
+
 ```sh
-agentmgr notify slack --webhook https://hooks.slack.com/services/…   # a channel's incoming webhook
+agentmgr notify slack --webhook https://hooks.slack.com/triggers/…   # Workflow Builder webhook
+agentmgr notify slack --webhook https://hooks.slack.com/services/…   # or an app's incoming webhook
 agentmgr notify slack --token xoxb-… --channel '#agents'            # or a bot token + channel
 agentmgr notify test
 ```

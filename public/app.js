@@ -67,9 +67,13 @@ function fmtTokens(n) {
   return `${(n / 1e6).toFixed(n < 1e7 ? 2 : 1)}M`;
 }
 
+const ioOf = (u) => (u ? (u.io ?? u.input + u.output) : 0);
+
 function usageTitle(u) {
-  return `input ${u.input.toLocaleString()} · output ${u.output.toLocaleString()} · cache write ${u.cacheCreation.toLocaleString()} · cache read ${u.cacheRead.toLocaleString()} · ${u.requests} API requests`;
+  return `I/O ${ioOf(u).toLocaleString()} (input ${u.input.toLocaleString()} + output ${u.output.toLocaleString()}) · cache write ${u.cacheCreation.toLocaleString()} · cache read ${u.cacheRead.toLocaleString()} · total incl. cache ${u.total.toLocaleString()} · ${u.requests} API requests`;
 }
+
+const tokensOpen = new Set(); // agents whose token breakdown is expanded
 
 // ------------------------------------------------------------------ brief
 
@@ -250,7 +254,7 @@ function agentItem(a) {
       ${a.git?.branch ? `<span class="branch" title="${esc(a.git.branch)}">⎇ ${esc(a.git.branch)}</span>` : ''}
       ${a.prs.length ? `<span>${a.prs.length} PR</span>` : ''}
       ${a.bugs.length ? `<span>${a.bugs.length} bug</span>` : ''}
-      ${a.usage?.total ? `<span title="${esc(usageTitle(a.usage))}">${fmtTokens(a.usage.total)} tok</span>` : ''}
+      ${a.usage?.total ? `<span title="${esc(usageTitle(a.usage))}">${fmtTokens(ioOf(a.usage))} tok</span>` : ''}
       ${(a.brief?.references ?? []).filter((r) => r.key && r.url).map((r) => `<span class="tag key-ref" title="${esc(r.title || r.url)}">${esc(r.label)}</span>`).join('')}
       ${a.brief?.summary?.total
         ? `<span class="${a.brief.summary.failed ? 'fail' : ''}" title="${esc(checksSummary(a.brief))}">✓${a.brief.summary.passed}/${a.brief.summary.total}${a.brief.summary.failed ? ` ✗${a.brief.summary.failed}` : ''}</span>`
@@ -551,8 +555,12 @@ function renderDetail() {
           <dt>Title</dt><dd>${esc(current?.title ?? '—')}</dd>
           <dt>Agent ID</dt><dd><code>${a.id}</code></dd>
           <dt>Last output</dt><dd>${a.runtime.lastOutputAt ? ago(a.runtime.lastOutputAt) : current?.lastActivity ? ago(current.lastActivity) : '—'}</dd>
-          <dt>Tokens</dt><dd title="${u.total ? esc(usageTitle(u)) : ''}">${u.total
-            ? `${fmtTokens(u.input)} in · ${fmtTokens(u.output)} out · ${fmtTokens(u.cacheRead)} cache read · ${fmtTokens(u.cacheCreation)} cache write`
+          <dt>Tokens</dt><dd class="tokens">${u.total
+            ? `<button class="link tok-toggle" data-tokens="${a.id}" title="Input + output tokens. Click for the full breakdown.">${fmtTokens(ioOf(u))} I/O ${tokensOpen.has(a.id) ? '▾' : '▸'}</button>
+               ${tokensOpen.has(a.id)
+                 ? `<div class="tok-detail">${fmtTokens(u.input)} in · ${fmtTokens(u.output)} out · ${fmtTokens(u.cacheRead)} cache read · ${fmtTokens(u.cacheCreation)} cache write
+                    <br>${fmtTokens(u.total)} total incl. cache · ${u.requests} requests</div>`
+                 : ''}`
             : '—'}</dd>
           <dt>Cost</dt><dd>${totalCost ? `$${totalCost.toFixed(2)} <span class="hint">(reported by Claude Code)</span>` : '—'}</dd>
           <dt>Mode</dt><dd>${esc(a.permissionMode)}${a.model ? ` · ${esc(a.model)}` : ''}</dd>
@@ -593,14 +601,14 @@ function renderDetail() {
       <div class="card">
         <h3>Session history <span>${a.sessions.length}</span></h3>
         <table class="sessions">
-          <tr><th>ID</th><th>Title</th><th>Tokens</th><th>Active</th><th></th></tr>
+          <tr><th>ID</th><th>Title</th><th title="Input + output tokens">I/O tokens</th><th>Active</th><th></th></tr>
           ${[...a.sessions]
             .reverse()
             .map(
               (s) => `<tr class="${s.id === a.sessionId ? 'current' : ''}">
               <td><code title="${esc(s.id)}">${s.id.slice(0, 8)}</code>${copyBtn(s.id)}</td>
               <td>${esc(s.title ?? '')}</td>
-              <td title="${s.usage ? esc(usageTitle(s.usage)) : ''}">${s.usage ? fmtTokens(s.usage.total) : ''}</td>
+              <td title="${s.usage ? esc(usageTitle(s.usage)) : ''}">${s.usage ? fmtTokens(ioOf(s.usage)) : ''}</td>
               <td>${ago(s.lastActivity ?? s.lastStartedAt)}</td>
               <td>${s.id === a.sessionId ? 'current' : running ? '' : `<button class="small" data-resume-session="${s.id}">Resume</button>`}</td>
             </tr>`,
@@ -827,6 +835,12 @@ $('#detail-body').addEventListener('click', async (e) => {
     const note = prompt('What still needs doing? (sent to this agent)', '');
     if (note === null) return;
     return act(() => api('POST', `/backlog/${btn.dataset.backlogReopen}/reopen`, { note }), 'Reopened');
+  }
+  if (btn.dataset.tokens) {
+    const id = btn.dataset.tokens;
+    if (tokensOpen.has(id)) tokensOpen.delete(id);
+    else tokensOpen.add(id);
+    return renderDetail();
   }
   if (btn.dataset.more) {
     const key = btn.dataset.more;
