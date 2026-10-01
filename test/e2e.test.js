@@ -906,3 +906,23 @@ test('stakeholder documents: analysis, design, flow, proposal; stored per kind; 
   assert.equal((await call('POST', `/agents/${a.id}/docs/novel`)).status, 400);
   assert.equal((await fetch(`${base}/share.html`)).status, 200);
 });
+
+test('documents in the background: returns at once, all four, at most two Claude calls at a time', async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Background docs', start: false })).body;
+  await waitFor(async () => (await agentNow(a.id)).status === 'stopped', 8000, 'ready');
+  const t0 = Date.now();
+  const res = await call('POST', `/agents/${a.id}/docs/all?background=1`);
+  assert.equal(res.status, 200);
+  assert.ok(Date.now() - t0 < 1500, 'returned without waiting');
+  assert.ok(Object.values(res.body.docs).some((d) => d.pending), 'shows as pending');
+  assert.ok(manager.summaryRunning <= 2, 'concurrency capped');
+  const done = await waitFor(async () => {
+    const ag = await agentNow(a.id);
+    return ['analysis', 'design', 'flow', 'proposal'].every((k) => ag.docs?.[k]?.markdown && !ag.docs[k].pending) ? ag : null;
+  }, 20000, 'all four written');
+  assert.match(done.docs.flow.markdown, /^# Flow: Background docs/);
+  assert.equal(manager.summaryRunning, 0);
+  // A single kind in the background too.
+  assert.ok((await call('POST', `/agents/${a.id}/docs/design?background=1`)).body.docs.design.pending);
+  await waitFor(async () => !(await agentNow(a.id)).docs.design.pending, 10000, 'design rewritten');
+});

@@ -329,6 +329,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .45); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .error { color: var(--red); margin: 0; font-size: 13px; }
 
+.toast button { margin-left: 8px; }
 .toast {
   position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
   padding: 8px 14px; border-radius: 6px; font-size: 13px; z-index: 10; max-width: calc(100vw - 32px);

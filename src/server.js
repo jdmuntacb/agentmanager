@@ -130,9 +130,19 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   );
   api.post('/general', wrap((req) => manager.createGeneral(req.body ?? {})));
   api.get('/agents/:id/brief', wrap((req) => manager.briefFile(req.params.id)));
-  api.post('/agents/:id/explain', wrap((req) => manager.explain(req.params.id)));
-  api.post('/agents/:id/insights', wrap((req) => manager.insights(req.params.id)));
-  api.post('/agents/:id/docs/:kind', wrap((req) => manager.document(req.params.id, req.params.kind)));
+  // ?background=1 starts the work and returns at once (watch the agent's events for the result).
+  const bg = (req) => req.query.background === '1' || req.body?.background === true;
+  api.post('/agents/:id/explain', wrap((req) => (bg(req) ? manager.summarizeInBackground(req.params.id, ['explain']) : manager.explain(req.params.id))));
+  api.post('/agents/:id/insights', wrap((req) => (bg(req) ? manager.summarizeInBackground(req.params.id, ['insights']) : manager.insights(req.params.id))));
+  const DOC_LIST = ['analysis', 'design', 'flow', 'proposal'];
+  api.post(
+    '/agents/:id/docs/:kind',
+    wrap((req) => {
+      const kinds = req.params.kind === 'all' ? DOC_LIST : [req.params.kind];
+      if (bg(req) || kinds.length > 1) return manager.summarizeInBackground(req.params.id, kinds);
+      return manager.document(req.params.id, req.params.kind);
+    }),
+  );
   api.post('/agents/:id/plan', wrap((req) => manager.startPlanning(req.params.id)));
   api.post('/agents/:id/handoff', wrap((req) => manager.maybeHandoff(manager.mustGet(req.params.id).id, { force: true })));
   api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id)));

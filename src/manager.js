@@ -1080,6 +1080,40 @@ export class AgentManager extends EventEmitter {
     return this.summarize(ref, 'insights');
   }
 
+  /**
+   * At most `summaryConcurrency` one-off Claude calls (documents, explain,
+   * insights) at once; the rest wait. Resolves to a release function.
+   */
+  summarySlot() {
+    this.summaryRunning ??= 0;
+    this.summaryQueue ??= [];
+    const max = this.config.summaryConcurrency ?? 2;
+    const release = () => {
+      this.summaryRunning--;
+      this.summaryQueue.shift()?.();
+    };
+    if (this.summaryRunning < max) {
+      this.summaryRunning++;
+      return Promise.resolve(release);
+    }
+    return new Promise((resolve) =>
+      this.summaryQueue.push(() => {
+        this.summaryRunning++;
+        resolve(release);
+      }),
+    );
+  }
+
+  /** Start one or more summaries without waiting; returns the agent view right away. */
+  summarizeInBackground(ref, kinds) {
+    const agent = this.mustGet(ref);
+    for (const kind of kinds) {
+      if (!SUMMARIES[kind]) throw Object.assign(new Error(`Unknown document "${kind}"`), { status: 400 });
+    }
+    for (const kind of kinds) this.summarize(agent.id, kind).catch(() => {}); // errors are stored on the agent
+    return this.view(this.store.get(agent.id));
+  }
+
   /** A stakeholder document: analysis, design, flow or proposal. */
   document(ref, kind) {
     if (!DOC_KINDS[kind]) throw Object.assign(new Error(`Unknown document "${kind}"`), { status: 400 });
@@ -1092,8 +1126,12 @@ export class AgentManager extends EventEmitter {
     const key = `${kind}:${agent.id}`;
     if (this.explaining.has(key)) return this.explaining.get(key);
     this.patch(agent.id, summaryPatch(agent, kind, { ...getSummary(agent, kind), pending: true, error: null }));
-    const run = this.explainContext(agent)
-      .then((ctx) => this.runExplain(agent, { ...ctx, agentName: agent.name }, kind))
+    const run = this.summarySlot()
+      .then((release) =>
+        this.explainContext(agent)
+          .then((ctx) => this.runExplain(agent, { ...ctx, agentName: agent.name }, kind))
+          .finally(release),
+      )
       .catch((e) => {
         const cur = this.store.get(agent.id);
         if (cur) this.patch(agent.id, summaryPatch(cur, kind, { ...getSummary(cur, kind), pending: false, error: e.message }));

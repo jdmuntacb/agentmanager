@@ -50,6 +50,8 @@ const DEFAULTS = {
   // Backlog: items worked on at once per project (overridable per project), and overall.
   backlogParallel: 2,
   backlogMaxActive: 4,
+  // How many one-off Claude calls (documents, Explain, Insights) run at once; the rest queue.
+  summaryConcurrency: 2,
   // Model for the Explain button's one-off summary (null = Claude's default).
   explainModel: null,
   // Tell agents to review and follow CLAUDE.md, skills, hooks and settings before working.

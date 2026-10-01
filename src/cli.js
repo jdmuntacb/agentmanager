@@ -329,13 +329,22 @@ export async function main(argv) {
     .command('doc')
     .description('Write a stakeholder document from the agent work: analysis, design, flow or proposal')
     .argument('<agent>')
-    .argument('<kind>', 'analysis, design, flow or proposal')
+    .argument('<kind>', 'analysis, design, flow, proposal, or all (background)')
     .option('-o, --output <file>', 'also save the Markdown to this file')
     .option('--cached', 'print the last version instead of writing a new one')
+    .option('-b, --background', 'start writing and return at once (kind "all" writes all four)')
     .action(async (ref, kind, opts) => {
       await daemon();
       const a = await resolveAgent(ref);
+      if (opts.background || kind === 'all') {
+        const res = await api('POST', `/agents/${a.id}/docs/${encodeURIComponent(kind)}?background=1`);
+        const kinds = kind === 'all' ? ['analysis', 'design', 'flow', 'proposal'] : [kind];
+        console.log(`${green('…')} writing ${kinds.join(', ')} for ${res.name} in the background`);
+        console.log(dim(`  read it when ready: agentmgr doc ${a.id} ${kinds[0]} --cached  (or open the agent in the UI)`));
+        return;
+      }
       let d = a.docs?.[kind];
+      if (opts.cached && d?.pending && !d?.markdown) throw new Error(`The ${kind} document is still being written; try again shortly`);
       if (!opts.cached || !d?.markdown) {
         process.stderr.write(dim(`Writing the ${kind} document… (a separate Claude call; the agent is not interrupted)\n`));
         d = (await api('POST', `/agents/${a.id}/docs/${encodeURIComponent(kind)}`)).docs[kind];

@@ -60,6 +60,7 @@ agentmgr shell <agent>                        # a shell in the agent's folder; C
 agentmgr brief <agent>                        # print the agent's brief (Markdown)
 agentmgr priority <agent> P0                  # P0 urgent, P1 high, P2 normal (default), P3 low
 agentmgr doc <agent> proposal -o p.md         # analysis | design | flow | proposal, for stakeholders
+agentmgr doc <agent> all --background         # write all four in the background
 agentmgr insights <agent>                     # Why / What / How / Now, three points each
 agentmgr explain <agent>                      # full briefing: ask, status, plan, solution, conclusions, needs
 agentmgr remote on | off | status | rotate    # phone / remote access (see below)
@@ -209,6 +210,12 @@ The Brief panel's **Share for review** buttons, or `agentmgr doc <agent> <kind>`
 - **Copy Markdown** pastes cleanly into Confluence, Google Docs, Slack or a PR.
 - **Download .md** saves the file.
 - **Print / PDF** opens a print-ready page with the Mermaid diagrams rendered. Use your browser's *Save as PDF*.
+
+**In the background.**
+
+- **Starting.** While a document is being written, **Continue in background** closes the viewer, and the writing carries on in the daemon. **Write all in background** starts every document that doesn't exist yet. You get a notification with an **Open** button as each one is ready.
+- **CLI.** `agentmgr doc <agent> <kind|all> --background` returns at once. `agentmgr doc <agent> <kind> --cached` prints the result later.
+- **Queueing.** At most `summaryConcurrency` (2) of these one-off Claude calls run at once, Explain and Insights included. The rest queue.
 
 **Behaviour.** Documents are kept per agent and marked out of date when the brief changes. They come from the same separate, tool-less Claude call as Explain, so the agent isn't interrupted. On the phone link, the print page needs sign-in like everything else.
 
@@ -396,6 +403,7 @@ State lives in `~/.agentmanager/` (`state.json`, `daemon.log`, `repos/` for shar
   "trustAgentFolders": true,
   "brief": true,
   "explainModel": null,
+  "summaryConcurrency": 2,
   "flushSec": 30,
   "backlogParallel": 2,
   "backlogMaxActive": 4,

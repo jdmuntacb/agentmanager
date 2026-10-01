@@ -32,10 +32,18 @@ async function api(method, route, body) {
   return data;
 }
 
-function toast(msg, ms = 2600) {
+function toast(msg, ms = 2600, action) {
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = msg;
+  if (action) {
+    const b = Object.assign(document.createElement('button'), { className: 'small primary', textContent: action.label });
+    b.onclick = () => {
+      el.remove();
+      action.run();
+    };
+    el.append(' ', b);
+  }
   document.body.append(el);
   setTimeout(() => el.remove(), ms);
 }
@@ -171,7 +179,11 @@ function docHtml(markdown) {
 }
 
 function docButtons(a) {
-  return `<span class="doc-buttons" title="Documents to share with stakeholders">${Object.entries(DOCS)
+  const missing = Object.keys(DOCS).filter((k) => !a.docs?.[k]?.markdown && !a.docs?.[k]?.pending);
+  const all = missing.length
+    ? `<button class="small ghost" data-doc-all title="Write ${missing.map((k) => DOCS[k]).join(', ')} in the background; you'll be told when each is ready">Write all in background</button>`
+    : '';
+  return `<span class="doc-buttons" title="Documents to share with stakeholders">${all}${Object.entries(DOCS)
     .map(([k, label]) => {
       const d = a.docs?.[k];
       const stale = d?.markdown && a.brief?.updatedAt && d.briefUpdatedAt !== a.brief.updatedAt;
@@ -203,6 +215,7 @@ function renderDocDialog() {
   $('#doc-meta').textContent = d?.markdown ? `Written ${ago(d.at)}${stale ? ' · the brief has changed since; Regenerate for the latest' : ''}` : '';
   for (const id of ['doc-copy', 'doc-download', 'doc-print']) $(`#${id}`).disabled = !d?.markdown;
   $('#doc-regen').disabled = Boolean(d?.pending);
+  $('#doc-bg').hidden = !d?.pending;
 }
 
 function openDoc(agentId, kind) {
@@ -223,6 +236,27 @@ $('#doc-close').onclick = () => {
   docView = null;
   $('#doc-dialog').close();
 };
+$('#doc-bg').onclick = () => {
+  toast(`Writing ${DOCS[docView.kind].toLowerCase()} in the background; you'll be told when it's ready`, 3500);
+  docView = null;
+  $('#doc-dialog').close();
+};
+
+// Tell the user when a document finishes while they're not looking at it.
+const docsSeen = new Map(); // "<agent>:<kind>" -> pending?
+function watchDocs(a) {
+  for (const k of Object.keys(DOCS)) {
+    const key = `${a.id}:${k}`;
+    const d = a.docs?.[k];
+    const was = docsSeen.get(key);
+    docsSeen.set(key, Boolean(d?.pending));
+    if (!was || d?.pending) continue;
+    const viewing = docView && docView.agentId === a.id && docView.kind === k;
+    if (viewing) continue;
+    if (d?.markdown && !d.error) toast(`${DOCS[k]} for ${a.name} is ready`, 10000, { label: 'Open', run: () => openDoc(a.id, k) });
+    else if (d?.error) toast(`${DOCS[k]} for ${a.name} failed: ${d.error}`, 8000);
+  }
+}
 $('#doc-regen').onclick = () => generateDoc();
 $('#doc-copy').onclick = async () => {
   const d = agents.get(docView.agentId)?.docs?.[docView.kind];
@@ -969,6 +1003,12 @@ $('#detail-body').addEventListener('click', async (e) => {
     return act(() => api('POST', `/backlog/${btn.dataset.backlogReopen}/reopen`, { note }), 'Reopened');
   }
   if (btn.dataset.doc) return openDoc(a.id, btn.dataset.doc);
+  if ('docAll' in btn.dataset) {
+    return act(async () => {
+      upsert(await api('POST', `/agents/${a.id}/docs/all?background=1`));
+      toast(`Writing the documents for ${a.name} in the background (2 at a time); you'll be told as each is ready`, 4500);
+    });
+  }
   if (btn.dataset.tokens) {
     const id = btn.dataset.tokens;
     if (tokensOpen.has(id)) tokensOpen.delete(id);
@@ -1220,6 +1260,7 @@ function handleEvent(msg) {
     agents.clear();
     msg.agents.forEach((a) => agents.set(a.id, a));
     if (msg.backlog) backlogState = msg.backlog;
+    msg.agents.forEach(watchDocs);
     if (selectedId && !agents.has(selectedId)) selectedId = null;
     if (openTermOnLoad && selectedId) {
       if (hashView === 'shell') term.open(selectedId, 'shell');
@@ -1228,6 +1269,7 @@ function handleEvent(msg) {
     openTermOnLoad = false;
   } else if (msg.t === 'agent') {
     agents.set(msg.agent.id, msg.agent);
+    watchDocs(msg.agent);
   } else if (msg.t === 'removed') {
     agents.delete(msg.id);
     if (selectedId === msg.id) select(null);
