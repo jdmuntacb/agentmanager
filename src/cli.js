@@ -70,6 +70,7 @@ function printAgent(a) {
   kv('repo', a.repo);
   if (a.git) kv('branch', `${a.git.branch}${a.git.dirtyFiles ? yellow(` (+${a.git.dirtyFiles} changed)`) : ''}`);
   if (a.git?.head) kv('head', `${a.git.head.sha} ${a.git.head.subject}`);
+  kv('branched from', a.baseRef);
   kv('worktree of', a.worktree ? a.sourceDir : null);
   kv('permissions', a.permissionMode !== 'default' ? a.permissionMode : null);
   kv('error', a.error && red(a.error));
@@ -216,6 +217,7 @@ export async function main(argv) {
     .option('-f, --file <path>', 'read intents from a file, one per line ("-" for stdin)')
     .option('-n, --name <name>', 'display name')
     .option('-w, --worktree', 'give each agent its own git worktree of --dir')
+    .option('-b, --base <ref>', "branch each agent from this branch, tag or SHA (default: the repo's default branch, fetched)")
     .option('--no-worktree', 'run all agents directly in --dir')
     .addOption(
       new Option('-p, --permission-mode <mode>', 'claude permission mode').choices([
@@ -242,6 +244,7 @@ export async function main(argv) {
         dir: opts.dir,
         name: opts.name,
         worktree: worktreeSource === 'cli' ? opts.worktree : undefined,
+        base: opts.base,
         permissionMode: opts.permissionMode,
         model: opts.model,
         start: opts.start,

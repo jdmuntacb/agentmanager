@@ -100,6 +100,10 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   app.use('/api', api);
 
   const server = http.createServer(app);
+  // Outlive clients' idle keep-alive sockets (Node fetch keeps them ~4s+): with the 5s
+  // default, a request sent on a socket just as the server closes it fails with ECONNRESET.
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (req, socket, head) => {

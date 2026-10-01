@@ -230,6 +230,7 @@ function renderDetail() {
           <dt>Repo</dt><dd>${a.repo ? `<code>${esc(a.repo)}</code>` : '—'}</dd>
           <dt>Branch</dt><dd>${a.git?.branch ? `<code>${esc(a.git.branch)}</code>` : '—'}${a.git?.dirtyFiles ? ` <span class="tag">${a.git.dirtyFiles} changed</span>` : ''}</dd>
           <dt>Head</dt><dd>${a.git?.head ? `<code>${esc(a.git.head.sha)}</code> ${esc(a.git.head.subject)}` : '—'}</dd>
+          ${a.baseRef ? `<dt>Branched from</dt><dd><code>${esc(a.baseRef)}</code></dd>` : ''}
           ${a.worktree ? `<dt>Worktree of</dt><dd><code>${esc(a.sourceDir)}</code></dd>` : ''}
         </dl>
       </div>
@@ -575,6 +576,7 @@ $('#new-form').addEventListener('submit', async (e) => {
       permissionMode: f.get('permissionMode') || undefined,
       model: f.get('model') || undefined,
       worktree: f.get('worktree') ? true : undefined,
+      base: f.get('base') || undefined,
       plan: Boolean(f.get('plan')),
       start: Boolean(f.get('start')),
     });

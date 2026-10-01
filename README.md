@@ -38,6 +38,7 @@ agentmgr add -r https://github.com/org/repo.git \
   "Add pagination to /users" "Investigate MB-12345 and open a fix PR"
 agentmgr add -f intents.txt -r git@github.com:org/repo.git -p acceptEdits
 agentmgr add --plan -a -r https://github.com/org/big-repo.git "Fix MB-123"   # plan with Claude while it clones
+agentmgr add -d ~/src/big-repo -w -b release-1 "Backport the fix"          # worktree of your clone, branched from release-1
 
 agentmgr ls                                   # status, branch, PR/bug counts, session
 agentmgr show <agent>                         # everything tracked for one agent
@@ -71,6 +72,25 @@ agentmgr service status | uninstall
 | `error` | Workspace setup or launch failed. See the error message. If setup failed, **Retry setup** (or `agentmgr start <agent>`) runs it again. Setup interrupted by a daemon restart is retried automatically. |
 
 Agent folders are pre-trusted (see below), so new agents don't stop at Claude's "trust this folder" prompt.
+
+## Sharing one big repo between agents
+
+Every agent gets **its own worktree and its own branch** (`agent/<name>-<id>`) of one shared clone. Git history is stored once, and each agent only adds its checked-out files, so a new agent on a repo that's already there starts in seconds.
+
+- **Repo URL** (`-r <url>`): the first agent clones it into `~/.agentmanager/repos/`. Later agents with the same URL reuse that clone after a quick fetch.
+- **A clone you already have** (`-d <folder> -w`, or the folder field with the worktree box ticked, which is the UI default): agents get worktrees of your clone. Your own checkout and branch are never touched.
+
+**Where branches start.** By default each agent branches from the repo's **default branch, freshly fetched** (`origin/HEAD`, usually `origin/main`). That holds even if your clone is checked out on another branch or is behind. To start somewhere else, use `--base <ref>` (or the **Base branch** field):
+
+- a branch name such as `release-1`, which uses `origin/release-1` when the remote has it;
+- a tag or a SHA;
+- `HEAD` for the folder's current checkout.
+
+**Other details:**
+
+- **Offline.** If the fetch fails (offline, no access), the refs already present are used.
+- **No upstream.** Agent branches are created without an upstream, so Claude's first `git push -u origin <branch>` sets the right one. They never accidentally track `origin/main`.
+- **Where it shows.** The agent shows **Branched from** with the ref and commit it started at.
 
 ## Restarts and reboots
 

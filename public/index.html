@@ -88,6 +88,10 @@
             <input name="model" placeholder="e.g. opus" />
           </label>
         </div>
+        <label>
+          Base branch <span class="hint">optional; each agent branches from this. Default: the repo's default branch, freshly fetched</span>
+          <input name="base" placeholder="main" />
+        </label>
         <label class="check">
           <input type="checkbox" name="worktree" checked />
           Give each agent its own git worktree and branch <span class="hint">(for a git folder; always on when cloning a repo URL)</span>

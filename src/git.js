@@ -124,7 +124,9 @@ export async function addWorktree(repoDir, dest, branch, ref = 'HEAD', { signal,
   if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true }); // left by an interrupted attempt
   await git(repoDir, 'worktree', 'prune');
   try {
-    await run('git', ['worktree', 'add', '--no-checkout', '-B', branch, dest, ref], { cwd: repoDir, signal });
+    // --no-track: the agent's branch must not adopt origin/main as its upstream, or a
+    // plain "git push" from it would be refused; its first push sets its own upstream.
+    await run('git', ['worktree', 'add', '--no-checkout', '--no-track', '-B', branch, dest, ref], { cwd: repoDir, signal });
     await gitProgress(['checkout', '--progress', '-f'], { cwd: dest, signal, onProgress });
   } catch (err) {
     fs.rmSync(dest, { recursive: true, force: true });
@@ -143,6 +145,44 @@ export async function remoteRef(dir) {
   } catch {
     return 'HEAD';
   }
+}
+
+const commitOf = (dir, ref) =>
+  run('git', ['rev-parse', '--verify', '-q', `${ref}^{commit}`], { cwd: dir }).catch(() => null);
+
+export async function hasRemote(dir, name = 'origin') {
+  return run('git', ['remote', 'get-url', name], { cwd: dir }).then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
+ * Pick the commit a new agent branch starts from.
+ * - `base` given: origin/<base> (fresh remote branch), else <base> as a local branch, tag or SHA.
+ * - no base: the remote's default branch (origin/HEAD, origin/main, origin/master), falling
+ *   back to local main/master and finally the folder's current HEAD (repos with no remote).
+ * Returns { ref, sha }.
+ */
+export async function resolveBase(dir, base) {
+  // "HEAD" means the folder's current checkout, never the remote's origin/HEAD.
+  const candidates = base
+    ? base === 'HEAD'
+      ? ['HEAD']
+      : [`origin/${base}`, base]
+    : [
+        await run('git', ['rev-parse', '--abbrev-ref', 'origin/HEAD'], { cwd: dir }).catch(() => null),
+        'origin/main',
+        'origin/master',
+        'main',
+        'master',
+        'HEAD',
+      ].filter(Boolean);
+  for (const ref of candidates) {
+    const sha = await commitOf(dir, ref);
+    if (sha) return { ref, sha };
+  }
+  throw new Error(`Base "${base}" not found (tried ${candidates.join(', ')})`);
 }
 
 export async function gitInfo(dir) {

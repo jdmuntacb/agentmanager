@@ -71,6 +71,7 @@ export function slugify(text, max = 30) {
 }
 
 const now = () => new Date().toISOString();
+const baseLabel = ({ ref, sha }) => `${ref} @ ${sha.slice(0, 9)}`;
 
 export class AgentManager extends EventEmitter {
   constructor({ store, config }) {
@@ -177,7 +178,19 @@ export class AgentManager extends EventEmitter {
     return this.create({ kind: 'general', intent: question, name, permissionMode, model });
   }
 
-  create({ kind = 'task', intent, name, repo, dir, worktree = false, permissionMode, model, start = true, plan = false }) {
+  create({
+    kind = 'task',
+    intent,
+    name,
+    repo,
+    dir,
+    worktree = false,
+    base,
+    permissionMode,
+    model,
+    start = true,
+    plan = false,
+  }) {
     intent = (intent ?? '').trim();
     const general = kind === 'general';
     if (!intent && !general) throw Object.assign(new Error('Intent is required'), { status: 400 });
@@ -198,6 +211,9 @@ export class AgentManager extends EventEmitter {
       sourceDir: null,
       branch: null,
       worktree: !general && Boolean(worktree),
+      // Requested start point for the agent's branch (null = the repo's default branch).
+      base: general ? null : base?.trim() || null,
+      baseRef: null,
       permissionMode: permissionMode || this.config.permissionMode,
       model: model || null,
       status: 'preparing',
@@ -342,12 +358,14 @@ export class AgentManager extends EventEmitter {
         }
       });
       const workdir = path.join(paths.workspaces, `${name}-${slug}-${id}`);
+      let start;
       await this.withLock(base, async () => {
         signal?.throwIfAborted();
         progress({ phase: 'Checking out' });
-        await git.addWorktree(base, workdir, branch, await git.remoteRef(base), cloneOpts('Checking out'));
+        start = await git.resolveBase(base, agent.base);
+        await git.addWorktree(base, workdir, branch, start.sha, cloneOpts('Checking out'));
       });
-      return { workdir, sourceDir: base, branch, worktree: true, repo };
+      return { workdir, sourceDir: base, branch, worktree: true, repo, baseRef: baseLabel(start) };
     }
 
     if (repo && dir && !fs.existsSync(dir)) {
@@ -367,9 +385,20 @@ export class AgentManager extends EventEmitter {
     if (agent.worktree && (await git.isGitRepo(dir))) {
       const top = await git.run('git', ['rev-parse', '--show-toplevel'], { cwd: dir });
       const workdir = path.join(paths.workspaces, `${path.basename(top)}-${slug}-${id}`);
-      progress({ phase: 'Checking out' });
-      await this.withLock(top, () => git.addWorktree(top, workdir, branch, 'HEAD', cloneOpts('Checking out')));
-      return { workdir, sourceDir: top, branch, worktree: true, repo };
+      let start;
+      await this.withLock(top, async () => {
+        // Branch off the latest default branch (or the requested base), not whatever is checked out.
+        if (await git.hasRemote(top)) {
+          progress({ phase: 'Fetching' });
+          await git.fetch(top, { signal }).catch((err) => {
+            if (err.cancelled) throw err; // offline / no access: use the refs we already have
+          });
+        }
+        start = await git.resolveBase(top, agent.base);
+        progress({ phase: 'Checking out' });
+        await git.addWorktree(top, workdir, branch, start.sha, cloneOpts('Checking out'));
+      });
+      return { workdir, sourceDir: top, branch, worktree: true, repo, baseRef: baseLabel(start) };
     }
     return { workdir: dir, repo, worktree: false };
   }

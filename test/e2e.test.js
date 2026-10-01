@@ -449,3 +449,62 @@ test('worktree option falls back to the folder itself when it is not a git repo'
   assert.equal(ready.workdir, plain);
   assert.equal(ready.worktree, false);
 });
+
+test('agents branch from the fresh default branch, or from a requested base', async () => {
+  const g = (cwd, ...args) => execFileSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd }).toString().trim();
+  const origin = makeOrigin('based');
+  const seed = path.join(home, 'based-seed');
+  g(seed, 'checkout', '-q', '-b', 'release-1');
+  fs.writeFileSync(path.join(seed, 'release.txt'), 'r1\n');
+  g(seed, 'add', '.');
+  g(seed, 'commit', '-q', '-m', 'release work');
+  g(seed, 'tag', 'v1');
+  g(seed, 'push', '-q', 'origin', 'release-1', 'v1');
+
+  // The user's clone is behind origin/main and checked out on a local feature branch.
+  const mine = path.join(home, 'based-mine');
+  g(home, 'clone', '-q', origin, mine);
+  g(seed, 'checkout', '-q', 'main');
+  fs.writeFileSync(path.join(seed, 'new-on-main.txt'), 'x\n');
+  g(seed, 'add', '.');
+  g(seed, 'commit', '-q', '-m', 'newer main');
+  g(seed, 'push', '-q', 'origin', 'main');
+  g(mine, 'checkout', '-q', '-b', 'my-feature');
+  fs.writeFileSync(path.join(mine, 'wip.txt'), 'wip\n');
+  g(mine, 'add', '.');
+  g(mine, 'commit', '-q', '-m', 'local wip');
+  const originMain = g(origin, 'rev-parse', 'main');
+
+  const make = async (body) => {
+    const [a] = (await call('POST', '/agents', { dir: mine, worktree: true, start: false, ...body })).body;
+    return waitFor(async () => (['stopped', 'error'].includes((await agentNow(a.id)).status) ? agentNow(a.id) : null), 15000);
+  };
+
+  const def = await make({ intent: 'Default base' });
+  assert.equal(def.status, 'stopped', def.error);
+  assert.equal(g(def.workdir, 'rev-parse', 'HEAD'), originMain, 'branched from the freshly fetched origin/main');
+  assert.match(def.baseRef, /^origin\/main @ /);
+  assert.ok(fs.existsSync(path.join(def.workdir, 'new-on-main.txt')));
+  assert.ok(!fs.existsSync(path.join(def.workdir, 'wip.txt')), 'not from the checked-out feature branch');
+  assert.throws(() => g(def.workdir, 'rev-parse', '--abbrev-ref', '@{u}'), 'agent branch has no upstream');
+  assert.equal(g(mine, 'rev-parse', '--abbrev-ref', 'HEAD'), 'my-feature', "user's checkout untouched");
+
+  const rel = await make({ intent: 'Release base', base: 'release-1' });
+  assert.match(rel.baseRef, /^origin\/release-1 @ /);
+  assert.ok(fs.existsSync(path.join(rel.workdir, 'release.txt')));
+
+  const tag = await make({ intent: 'Tag base', base: 'v1' });
+  assert.match(tag.baseRef, /^v1 @ /);
+
+  const head = await make({ intent: 'Head base', base: 'HEAD' });
+  assert.ok(fs.existsSync(path.join(head.workdir, 'wip.txt')), 'HEAD keeps the old behaviour');
+
+  const bad = await make({ intent: 'Bad base', base: 'no-such-branch' });
+  assert.equal(bad.status, 'error');
+  assert.match(bad.error, /Base "no-such-branch" not found/);
+
+  // Repo URLs honour --base too.
+  const [u] = (await call('POST', '/agents', { intent: 'URL base', repo: `file://${origin}`, base: 'release-1', start: false })).body;
+  const viaUrl = await waitFor(async () => (['stopped', 'error'].includes((await agentNow(u.id)).status) ? agentNow(u.id) : null), 15000);
+  assert.match(viaUrl.baseRef ?? viaUrl.error, /^origin\/release-1 @ /);
+});
