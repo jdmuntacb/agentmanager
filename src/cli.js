@@ -86,6 +86,18 @@ function printAgent(a) {
       `${u.cacheRead.toLocaleString()} cache read, ${u.cacheCreation.toLocaleString()} cache write (${u.requests} requests)`);
   }
   kv('cost', a.costUsd ? `$${a.costUsd.toFixed(2)} ${dim('(reported by Claude Code)')}` : null);
+  if (a.brief) {
+    const b = a.brief;
+    const icon = { passed: green('✓'), failed: red('✗'), running: yellow('◔'), pending: dim('○') };
+    console.log(`  ${dim('Brief')} ${dim(`(updated ${b.updatedAt}; full text: agentmgr brief ${a.id})`)}`);
+    if (b.problem) console.log(`    ${bold('Problem')}   ${truncate(b.problem, 200)}`);
+    if (b.solution) console.log(`    ${bold('Solution')}  ${truncate(b.solution, 200)}`);
+    if (b.diagram) console.log(`    ${bold('Diagram')}   ${dim(`mermaid, ${b.diagram.split('\n').length} lines (rendered in the UI)`)}`);
+    for (const r of b.references ?? []) {
+      console.log(`    ${r.key ? cyan(r.label) : r.label}: ${r.url ?? ''}${r.highlight ? ` ${dim(`— ${r.highlight}`)}` : ''}`);
+    }
+    for (const c of b.checks) console.log(`    ${icon[c.state]} ${c.text}`);
+  }
   if (a.prs.length) {
     console.log(`  ${dim('PRs')}`);
     for (const p of a.prs) {
@@ -279,6 +291,18 @@ export async function main(argv) {
         a = await resolveAgent(a.id);
       }
       if (opts.attach) await attach(a.id);
+    });
+
+  program
+    .command('brief')
+    .description("Print the agent's brief (Problem, Solution, Diagram, Checks) as Markdown")
+    .argument('<agent>')
+    .action(async (ref) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      const res = await api('GET', `/agents/${a.id}/brief`);
+      if (!res.markdown) return console.log(dim(`No brief yet (${res.path})`));
+      process.stdout.write(res.markdown.endsWith('\n') ? res.markdown : `${res.markdown}\n`);
     });
 
   program

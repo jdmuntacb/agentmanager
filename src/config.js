@@ -18,6 +18,8 @@ export const paths = {
   general: path.join(HOME, 'general'),
   // Holding folder for planning sessions that run while a repo is still cloning.
   planning: path.join(HOME, 'planning'),
+  // Per-agent briefs (Problem / Solution / Diagram / Checks), kept outside any repo.
+  briefs: path.join(HOME, 'briefs'),
 };
 
 const DEFAULTS = {
@@ -39,6 +41,10 @@ const DEFAULTS = {
   // Partial clone for repo URLs: history now, file contents only when checked out.
   // Much faster for big repos. Set to null for full clones.
   cloneFilter: 'blob:none',
+  // Ask task agents to keep a brief (Problem / Solution / Diagram / Checks) for the UI.
+  brief: true,
+  // Tell agents to review and follow CLAUDE.md, skills, hooks and settings before working.
+  reviewConventions: true,
   // Pre-accept Claude's "trust this folder" prompt for the folders agents run in.
   trustAgentFolders: true,
   // A planning session moves into the repo by itself once Claude has been idle this
@@ -49,7 +55,7 @@ const DEFAULTS = {
 };
 
 export function ensureHome() {
-  for (const dir of [paths.home, paths.workspaces, paths.repos, paths.general, paths.planning]) {
+  for (const dir of [paths.home, paths.workspaces, paths.repos, paths.general, paths.planning, paths.briefs]) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }

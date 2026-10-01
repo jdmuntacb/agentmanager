@@ -12,6 +12,10 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Background terminals.** Agents run inside the daemon's PTYs. Open any agent's live terminal in the browser (**Open terminal**) or in your shell (`agentmgr attach`). Closing the view leaves the agent running.
 - **Session IDs are kept.** Each agent is started with a known `--session-id`. **Close session** stops the process but keeps the ID, and bringing it back runs `claude --resume <id>`. **New session** adds another ID to the agent's history; earlier ones stay resumable.
 - **Tracking.** For each agent you see its session ID, working folder, repo, branch, head commit, uncommitted changes, PRs and bugs.
+- **Brief per agent.** Each agent keeps a living brief that the UI shows next to its terminal:
+  - **Problem**, **Solution**, a **design / flow diagram** (Mermaid) and **Checks** (passed / failed / running / pending);
+  - when the intent links a Jira issue, **References** with its **PRD** and **Tech Spec** links and the points that matter.
+- **Follows your conventions.** Before changing anything, agents review `CLAUDE.md` / `AGENTS.md`, skills, hooks and settings (repo and `~/.claude`), and follow them.
 - **Tokens and cost.** Input, output and cache tokens are tracked per session, subagents included, alongside the cost Claude Code reports.
 - **No trust prompt.** Folders agents run in are pre-trusted, so Claude's "trust this folder" prompt doesn't block them.
 - **Survives restarts and reboots.** Agents that were running when the daemon stopped (restart, crash or reboot) are resumed with the same session IDs when it starts again. `agentmgr service install` starts the daemon at login.
@@ -44,6 +48,7 @@ agentmgr ls                                   # status, branch, PR/bug counts, s
 agentmgr show <agent>                         # everything tracked for one agent
 agentmgr attach <agent>                       # live terminal here; Ctrl-] detaches (resumes a closed agent)
 agentmgr shell <agent>                        # a shell in the agent's folder; Ctrl-] detaches
+agentmgr brief <agent>                        # print the agent's brief (Markdown)
 agentmgr plan <agent>                         # plan with Claude while the workspace is still being prepared
 agentmgr handoff <agent>                      # move a planning session into its ready workspace now
 agentmgr ask ["question"]                     # general session with no repo or folder
@@ -135,6 +140,29 @@ Cloning a big repo can take a while. Tick **Plan with Claude while the repo clon
 
 If setup fails while you're planning, the planning session keeps running and **Retry setup** tries again.
 
+## The brief
+
+Every task agent is told, on each launch, to keep a short brief in `~/.agentmanager/briefs/<id>/BRIEF.md`. The file is outside the repository, so it never gets committed. The sections are:
+
+| Section | Contents |
+| --- | --- |
+| `## Problem` | What's wrong or needed, and why |
+| `## Solution` | The approach and key changes, kept current |
+| `## Diagram` | One ` ```mermaid ` block: flow, sequence or architecture |
+| `## Checks` | `- [ ]` pending, `- [~]` running, `- [x]` passed, `- [!]` failed, with the command or evidence |
+| `## References` | Only when the intent links Jira issues. The agent looks them up with its own Jira / Atlassian tools (no credentials in agentmgr) and lists the **PRD** and **Tech Spec** fields as links with highlights, plus other design docs. Empty fields are listed as "none". |
+
+How it behaves:
+
+- **Display.** The UI shows the brief as a panel with a rendered diagram, check icons and highlighted PRD / Tech Spec links. The agent list shows check counts and PRD / Tech Spec chips. `agentmgr show` summarizes it, and `agentmgr brief <agent>` prints it.
+- **Updates.** Changes show up within a second while the agent runs.
+- **Planning.** Planning sessions start the brief too, so Problem, the proposed Solution and the References can be filled in before the clone finishes.
+- **Permissions.** Claude gets `--add-dir` access plus `Write` / `Edit` permission rules for its brief folder only, so writing the brief never stops at a permission prompt. Everything else keeps your normal permission mode.
+- **Safety.** Markdown is sanitized (DOMPurify) and diagrams render with Mermaid's `strict` security level.
+- **Conventions.** With `reviewConventions` on (the default), agents are also told to read `CLAUDE.md` / `AGENTS.md`, the relevant skills (`.claude/skills`, `~/.claude/skills`), hooks and permissions (`.claude/settings*.json`, `~/.claude/settings.json`), and project commands and agents before working. They record what applies as the first check.
+- **Off switch.** Set `"brief": false` or `"reviewConventions": false` to turn these off. Neither applies to general sessions.
+- **Existing agents.** Agents started before this version pick it up on their next resume.
+
 ## Folder trust
 
 Before launching Claude in a folder, agentmgr marks that folder as trusted in Claude Code's config (`~/.claude.json`, `projects[<path>].hasTrustDialogAccepted`). That is the same record Claude writes when you choose "Yes, I trust this folder". It only does this for the folders agents run in: workspaces, the planning folder, general sessions and folders you pass with `-d`.
@@ -167,6 +195,8 @@ State lives in `~/.agentmanager/` (`state.json`, `daemon.log`, `repos/` for shar
   "prRefreshSec": 120,
   "autoResume": true,
   "trustAgentFolders": true,
+  "brief": true,
+  "reviewConventions": true,
   "handoffIdleSec": 5,
   "cloneFilter": "blob:none",
   "shell": "/bin/zsh"

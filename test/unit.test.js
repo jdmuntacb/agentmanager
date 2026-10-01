@@ -141,3 +141,59 @@ test('token usage counts each API response once and includes subagents', async (
     total: 3341,
   });
 });
+
+test('parseBrief reads the four sections, check states and the mermaid block', async () => {
+  const { parseBrief } = await import('../src/brief.js');
+  const b = parseBrief(`# Brief
+## Problem Statement
+Users can't log in.
+
+## Approach
+Refresh tokens **before** expiry.
+
+## Design / Flow / Architecture
+\`\`\`mermaid
+sequenceDiagram
+  A->>B: refresh
+\`\`\`
+Notes under the diagram.
+
+## Verification
+- [x] unit tests
+- [!] e2e
+- [~] lint
+- [ ] manual check
+- not a check line
+
+## Something else
+ignored
+`);
+  assert.equal(b.problem, "Users can't log in.");
+  assert.equal(b.solution, 'Refresh tokens **before** expiry.');
+  assert.equal(b.diagram, 'sequenceDiagram\n  A->>B: refresh');
+  assert.equal(b.diagramNotes, 'Notes under the diagram.');
+  assert.deepEqual(b.checks.map((c) => c.state), ['passed', 'failed', 'running', 'pending']);
+  assert.deepEqual(b.summary, { passed: 1, failed: 1, running: 1, pending: 1, total: 4 });
+  assert.equal(parseBrief('## Diagram\nno code block here').diagram, null);
+});
+
+test('parseBrief reads PRD / Tech Spec references from the linked Jira issue', async () => {
+  const { parseBrief } = await import('../src/brief.js');
+  const b = parseBrief(`## Problem
+x
+## References
+- **PRD**: [Fusion rebalance PRD](https://confluence.example.com/prd/123) — must finish within 30 minutes
+- **Tech Spec**: none on IDEA-872
+- **Design doc**: https://docs.example.com/d/9 - sequence of the accelerator handoff
+- Related: [MB-1](https://jira.example.com/browse/MB-1)
+`);
+  assert.deepEqual(
+    b.references.map((r) => [r.label, r.title, r.url, r.highlight, r.key, r.missing]),
+    [
+      ['PRD', 'Fusion rebalance PRD', 'https://confluence.example.com/prd/123', 'must finish within 30 minutes', true, false],
+      ['Tech Spec', null, null, 'none on IDEA-872', true, true],
+      ['Design doc', null, 'https://docs.example.com/d/9', 'sequence of the accelerator handoff', true, false],
+      ['Related', 'MB-1', 'https://jira.example.com/browse/MB-1', '', false, false],
+    ],
+  );
+});

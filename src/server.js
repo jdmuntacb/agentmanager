@@ -45,9 +45,21 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   });
   app.use(express.json({ limit: '1mb' }));
 
-  const pkgDir = (name) => path.dirname(require.resolve(`${name}/package.json`));
+  // Package root, found from its entry point (not every package exports package.json).
+  const pkgDir = (name) => {
+    let dir = path.dirname(require.resolve(name));
+    while (!fs.existsSync(path.join(dir, 'package.json')) || JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).name !== name) {
+      const up = path.dirname(dir);
+      if (up === dir) throw new Error(`Cannot find package root for ${name}`);
+      dir = up;
+    }
+    return dir;
+  };
   app.use('/vendor/xterm', express.static(pkgDir('@xterm/xterm')));
   app.use('/vendor/xterm-addon-fit', express.static(pkgDir('@xterm/addon-fit')));
+  app.use('/vendor/marked', express.static(path.join(pkgDir('marked'), 'lib')));
+  app.use('/vendor/dompurify', express.static(path.join(pkgDir('dompurify'), 'dist')));
+  app.use('/vendor/mermaid', express.static(path.join(pkgDir('mermaid'), 'dist')));
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
   const api = express.Router();
@@ -69,6 +81,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     }),
   );
   api.post('/general', wrap((req) => manager.createGeneral(req.body ?? {})));
+  api.get('/agents/:id/brief', wrap((req) => manager.briefFile(req.params.id)));
   api.post('/agents/:id/plan', wrap((req) => manager.startPlanning(req.params.id)));
   api.post('/agents/:id/handoff', wrap((req) => manager.maybeHandoff(manager.mustGet(req.params.id).id, { force: true })));
   api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id)));

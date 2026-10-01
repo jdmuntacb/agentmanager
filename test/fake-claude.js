@@ -24,6 +24,34 @@ write({
 });
 write({ type: 'pr-link', prNumber: 7, prUrl: 'https://github.com/example/repo/pull/7' });
 
+const briefDir = flag('--add-dir');
+if (briefDir) {
+  fs.writeFileSync(
+    path.join(briefDir, 'BRIEF.md'),
+    [
+      '# Brief',
+      '## Problem',
+      'Login fails for **SSO** users.',
+      '## Solution',
+      'Fix the token refresh in `auth/session.go`.',
+      '## Diagram',
+      '```mermaid',
+      'flowchart LR',
+      '  A[Browser] --> B[Auth service]',
+      '```',
+      'Token flow after the fix.',
+      '## References',
+      '- **PRD**: [SSO login PRD](https://confluence.example.com/prd/42) — sessions must survive token rotation',
+      '- **Tech Spec**: none on MB-4242',
+      '## Checks',
+      '- [x] go test ./auth/...',
+      '- [!] e2e login suite',
+      '- [~] lint',
+      '- [ ] manual SSO login',
+      '',
+    ].join('\n'),
+  );
+}
 process.stdout.write(`fake-claude ready ${args.includes('--resume') ? 'resumed' : 'new'} ${sid}\r\n`);
 process.stdin.setRawMode?.(true);
 process.stdin.on('data', (d) => {

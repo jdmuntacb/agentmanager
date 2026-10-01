@@ -508,3 +508,48 @@ test('agents branch from the fresh default branch, or from a requested base', as
   const viaUrl = await waitFor(async () => (['stopped', 'error'].includes((await agentNow(u.id)).status) ? agentNow(u.id) : null), 15000);
   assert.match(viaUrl.baseRef ?? viaUrl.error, /^origin\/release-1 @ /);
 });
+
+test('task agents keep a brief and are told to follow skills and hooks; general sessions are not', async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Brief me' })).body;
+  const launch = await waitFor(() => launches().find((l) => l.args.includes(a.sessionId)), 8000, 'launch');
+  const dir = fs.realpathSync(path.join(home, 'briefs', a.id));
+  assert.equal(launch.args[launch.args.indexOf('--add-dir') + 1], dir);
+  assert.ok(launch.args.includes(`Write(/${dir}/**)`) && launch.args.includes(`Edit(/${dir}/**)`));
+  const sys = launch.args[launch.args.indexOf('--append-system-prompt') + 1];
+  assert.match(sys, /## Problem[\s\S]*## Solution[\s\S]*## Diagram[\s\S]*## Checks/);
+  assert.match(sys, /CLAUDE\.md[\s\S]*skills[\s\S]*hooks/);
+  assert.match(sys, /Reviewed conventions/);
+
+  const withBrief = await waitFor(async () => ((await agentNow(a.id)).brief ? agentNow(a.id) : null), 8000, 'brief');
+  assert.equal(withBrief.brief.problem, 'Login fails for **SSO** users.');
+  assert.match(withBrief.brief.diagram, /^flowchart LR/);
+  assert.deepEqual(withBrief.brief.summary, { passed: 1, failed: 1, running: 1, pending: 1, total: 4 });
+  assert.deepEqual(
+    withBrief.brief.references.map((r) => [r.label, r.url, r.missing]),
+    [
+      ['PRD', 'https://confluence.example.com/prd/42', false],
+      ['Tech Spec', null, true],
+    ],
+  );
+  assert.match(sys, /## References[\s\S]*PRD and Tech Spec/);
+  const raw = (await call('GET', `/agents/${a.id}/brief`)).body;
+  assert.equal(raw.path, path.join(home, 'briefs', a.id, 'BRIEF.md'));
+  assert.match(raw.markdown, /## Checks/);
+
+  // Resumes get the instructions again (they only last for one process).
+  await call('POST', `/agents/${a.id}/stop`);
+  await call('POST', `/agents/${a.id}/start`, {});
+  await waitFor(
+    () => launches().filter((l) => l.args.includes(a.sessionId) && l.args.includes('--append-system-prompt')).length >= 2,
+    8000,
+    'resume with prompts',
+  );
+
+  const g = (await call('POST', '/general', { question: 'Just a question' })).body;
+  const gl = await waitFor(() => launches().find((l) => l.args.includes(g.sessionId)), 8000, 'general launch');
+  assert.ok(!gl.args.includes('--add-dir') && !gl.args.includes('--append-system-prompt'));
+
+  await call('DELETE', `/agents/${a.id}`);
+  assert.ok(!fs.existsSync(path.join(home, 'briefs', a.id)), 'brief removed with the agent');
+  await call('POST', `/agents/${g.id}/stop`);
+});

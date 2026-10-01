@@ -5,6 +5,7 @@ import path from 'node:path';
 import pty from 'node-pty';
 import { expandHome, paths } from './config.js';
 import { trustFolder } from './trust.js';
+import { briefDir, briefPath, briefPrompt, conventionsPrompt, loadBrief } from './brief.js';
 import * as git from './git.js';
 import {
   bugFromRef,
@@ -57,7 +58,8 @@ const planningPrompt = (agent) =>
 
 const handoffMessage = (agent) =>
   `The repository is ready. You are now in its working copy at ${agent.workdir}` +
-  `${agent.branch ? ` (branch ${agent.branch})` : ''}. Continue with the plan we agreed on.`;
+  `${agent.branch ? ` (branch ${agent.branch})` : ''}. First review its CLAUDE.md, skills and hooks as instructed, ` +
+  'then continue with the plan we agreed on.';
 
 export function slugify(text, max = 30) {
   return (
@@ -476,10 +478,24 @@ export class AgentManager extends EventEmitter {
     return this.view(this.store.get(agent.id));
   }
 
-  baseArgs(agent) {
+  baseArgs(agent, { planning = false } = {}) {
     const args = [...(this.config.claudeArgs ?? [])];
     if (agent.permissionMode && agent.permissionMode !== 'default') args.push('--permission-mode', agent.permissionMode);
     if (agent.model) args.push('--model', agent.model);
+    const prompts = [];
+    const task = agent.kind !== 'general';
+    const withBrief = Boolean(this.config.brief && task);
+    if (this.config.reviewConventions && task) prompts.push(conventionsPrompt({ withBrief }));
+    if (withBrief) {
+      // Let Claude write its brief without a permission prompt: that one folder only.
+      fs.mkdirSync(briefDir(agent.id), { recursive: true });
+      const dir = fs.realpathSync(briefDir(agent.id));
+      args.push('--add-dir', dir, '--allowedTools', `Write(/${dir}/**)`, `Edit(/${dir}/**)`);
+      prompts.push(briefPrompt(path.join(dir, path.basename(briefPath(agent.id)))));
+    }
+    if (planning) prompts.push(planningPrompt(agent));
+    // Appended system prompts last only for the process they're passed to, so they go on every launch.
+    if (prompts.length) args.push('--append-system-prompt', prompts.join('\n\n'));
     return args;
   }
 
@@ -583,11 +599,11 @@ export class AgentManager extends EventEmitter {
     }
     fs.mkdirSync(paths.planning, { recursive: true });
     const sid = agent.sessionId;
-    const args = this.baseArgs(agent);
+    const args = this.baseArgs(agent, { planning: true });
     if (fs.existsSync(transcriptPath(paths.planning, sid))) {
       args.push('--resume', sid);
     } else {
-      args.push('--session-id', sid, '--name', agent.name, '--append-system-prompt', planningPrompt(agent));
+      args.push('--session-id', sid, '--name', agent.name);
       if (agent.intent) args.push('--', agent.intent);
     }
     const proc = this.spawnClaude(agent, paths.planning, args, { planning: true });
@@ -708,6 +724,7 @@ export class AgentManager extends EventEmitter {
       }
     }
     this.closeShell(agent.id);
+    fs.rmSync(briefDir(agent.id), { recursive: true, force: true });
     for (const client of this.shells.get(agent.id)?.clients ?? []) client.close?.();
     this.shells.delete(agent.id);
     for (const key of this.cursors.keys()) {
@@ -917,11 +934,26 @@ export class AgentManager extends EventEmitter {
     return true;
   }
 
+  /** Pick up changes to the agent's brief file. */
+  reloadBrief(id) {
+    const agent = this.store.get(id);
+    if (!agent) return;
+    const brief = loadBrief(id, agent.brief);
+    if (brief) this.patch(id, { brief });
+  }
+
+  briefFile(ref) {
+    const agent = this.mustGet(ref);
+    const file = briefPath(agent.id);
+    return { path: file, markdown: fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null };
+  }
+
   async refresh(ref, { withPrs = false } = {}) {
     const id = this.mustGet(ref).id;
     if (this.refreshing.has(id)) return this.view(this.store.get(id));
     this.refreshing.add(id);
     try {
+      this.reloadBrief(id);
       const agent = this.store.get(id);
       // Before handoff, a planning session's transcript lives in the planning folder.
       const planningOnly = agent?.planning && !agent.planning.handedOffAt && !agent.workdir;
@@ -1000,6 +1032,9 @@ export class AgentManager extends EventEmitter {
         const a = this.store.get(id);
         if (a) this.changed(a);
       }
+    }
+    for (const [id, rt] of this.runtimes) {
+      if (rt.pty) this.reloadBrief(id);
     }
     for (const [id, rt] of this.runtimes) {
       if (!rt.pty || !rt.planning) continue;

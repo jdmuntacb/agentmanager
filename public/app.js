@@ -1,5 +1,7 @@
 import { Terminal } from '/vendor/xterm/lib/xterm.mjs';
 import { FitAddon } from '/vendor/xterm-addon-fit/lib/addon-fit.mjs';
+import { marked } from '/vendor/marked/marked.esm.js';
+import DOMPurify from '/vendor/dompurify/purify.es.mjs';
 
 const $ = (sel) => document.querySelector(sel);
 const agents = new Map();
@@ -64,6 +66,109 @@ function usageTitle(u) {
   return `input ${u.input.toLocaleString()} · output ${u.output.toLocaleString()} · cache write ${u.cacheCreation.toLocaleString()} · cache read ${u.cacheRead.toLocaleString()} · ${u.requests} API requests`;
 }
 
+// ------------------------------------------------------------------ brief
+
+// Agent-written Markdown: render, then sanitize (this page also drives terminals).
+const md = (text) => DOMPurify.sanitize(marked.parse(text || '', { gfm: true, breaks: false }));
+
+const CHECK_ICON = { passed: '✓', failed: '✗', running: '◔', pending: '○' };
+
+function checksSummary(b) {
+  if (!b?.summary?.total) return '';
+  const { passed, failed, running, pending } = b.summary;
+  return [passed && `${passed} passed`, failed && `${failed} failed`, running && `${running} running`, pending && `${pending} pending`]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+const diagrams = new Map(); // mermaid source -> rendered SVG (or an error)
+const expanded = new Set(); // "<agent id>:<section>" the user opened with Show more
+
+/** Long sections are clamped; Show more toggles them. */
+const clamp = (a, key, html) =>
+  `<div class="clamp ${expanded.has(`${a.id}:${key}`) ? 'open' : ''}" data-clamp="${a.id}:${key}"><div class="md">${html}</div>` +
+  `<button class="link more" data-more="${a.id}:${key}"></button></div>`;
+
+function markOverflow(root) {
+  for (const el of root.querySelectorAll('.clamp')) {
+    const inner = el.querySelector('.md');
+    el.classList.toggle('overflowing', el.classList.contains('open') || inner.scrollHeight > inner.clientHeight + 4);
+    el.querySelector('.more').textContent = el.classList.contains('open') ? 'Show less' : 'Show more';
+  }
+}
+let mermaidLib = null;
+
+async function renderDiagrams(root) {
+  const slots = [...root.querySelectorAll('[data-mermaid]')];
+  if (!slots.length) return;
+  for (const slot of slots) {
+    const src = slot.dataset.mermaid;
+    if (!diagrams.has(src)) {
+      try {
+        if (!mermaidLib) {
+          mermaidLib = (await import('/vendor/mermaid/mermaid.esm.min.mjs')).default;
+          const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+          mermaidLib.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default' });
+        }
+        const { svg } = await mermaidLib.render(`mmd-${diagrams.size}-${Date.now()}`, src);
+        diagrams.set(src, { svg });
+      } catch (err) {
+        diagrams.set(src, { error: String(err?.message || err).split('\n')[0] });
+      }
+    }
+    const out = diagrams.get(src);
+    // The detail pane may have re-rendered while we were drawing; fill whichever slot is current.
+    for (const el of document.querySelectorAll('[data-mermaid]')) {
+      if (el.dataset.mermaid !== src || el.dataset.filled) continue;
+      el.dataset.filled = '1';
+      if (out.svg) el.innerHTML = out.svg;
+      else el.innerHTML = `<div class="hint">Diagram could not be drawn (${esc(out.error)}). Source:</div><pre>${esc(src)}</pre>`;
+    }
+  }
+}
+
+function briefPanel(a) {
+  if (a.kind === 'general') return '';
+  const b = a.brief;
+  if (!b) {
+    return `<div class="card brief">
+      <h3>Brief</h3>
+      <p class="hint">Problem, solution, diagram and checks appear here once the agent writes its brief.
+      ${a.lastStartedAt && !a.runtime.running ? ' Agents started before this feature write one after their next resume.' : ''}</p>
+    </div>`;
+  }
+  const checks = b.checks.length
+    ? `<ul class="checks">${b.checks
+        .map((c) => `<li class="${c.state}"><span class="icon" title="${c.state}">${CHECK_ICON[c.state]}</span><span>${md(c.text).replace(/^<p>|<\/p>\s*$/g, '')}</span></li>`)
+        .join('')}</ul>`
+    : '<p class="hint">No checks yet.</p>';
+  return `<div class="card brief">
+    <h3>Brief <span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span></h3>
+    <div class="brief-grid">
+      <section><h4>Problem</h4>${b.problem ? clamp(a, 'problem', md(b.problem)) : '<p class="hint">—</p>'}</section>
+      <section><h4>Solution</h4>${b.solution ? clamp(a, 'solution', md(b.solution)) : '<p class="hint">—</p>'}</section>
+      ${b.references?.length
+        ? `<section class="wide"><h4>References <span class="hint">from the linked issue</span></h4>
+            <ul class="refs">${b.references
+              .map(
+                (r) => `<li class="${r.key ? 'key' : ''} ${r.missing ? 'missing' : ''}">
+                  <span class="ref-label">${esc(r.label)}</span>
+                  ${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || r.url)}</a>` : ''}
+                  ${r.highlight ? `<span class="ref-hl">${md(r.highlight).replace(/^<p>|<\/p>\s*$/g, '')}</span>` : ''}
+                </li>`,
+              )
+              .join('')}</ul>
+          </section>`
+        : ''}
+      <section class="wide"><h4>Design / flow</h4>
+        ${b.diagram ? `<div class="diagram" data-mermaid="${esc(b.diagram)}"></div>` : '<p class="hint">No diagram yet.</p>'}
+        ${b.diagramNotes ? `<div class="md">${md(b.diagramNotes)}</div>` : ''}
+      </section>
+      <section class="wide"><h4>Checks <span class="hint">${esc(checksSummary(b))}</span></h4>${checks}</section>
+    </div>
+  </div>`;
+}
+
 const pillText = (st) => (st === 'attention' ? 'needs input' : st);
 
 /** "Cloning · Receiving objects 45% · 2.10 GiB · 2.40 MiB/s" */
@@ -118,6 +223,10 @@ function renderList() {
           ${a.prs.length ? `<span>${a.prs.length} PR</span>` : ''}
           ${a.bugs.length ? `<span>${a.bugs.length} bug</span>` : ''}
           ${a.usage?.total ? `<span title="${esc(usageTitle(a.usage))}">${fmtTokens(a.usage.total)} tok</span>` : ''}
+          ${(a.brief?.references ?? []).filter((r) => r.key && r.url).map((r) => `<span class="tag key-ref" title="${esc(r.title || r.url)}">${esc(r.label)}</span>`).join('')}
+          ${a.brief?.summary?.total
+            ? `<span class="${a.brief.summary.failed ? 'fail' : ''}" title="${esc(checksSummary(a.brief))}">✓${a.brief.summary.passed}/${a.brief.summary.total}${a.brief.summary.failed ? ` ✗${a.brief.summary.failed}` : ''}</span>`
+            : ''}
           ${a.runtime.clients ? `<span title="terminals attached">◉ ${a.runtime.clients}</span>` : ''}
         </div>
       </li>`;
@@ -207,6 +316,8 @@ function renderDetail() {
       : ''}
     ${a.runtime.attention ? `<div class="error-box">${esc(a.runtime.attention)}: the agent is waiting for an answer. Open its terminal to respond.</div>` : ''}
 
+    ${briefPanel(a)}
+
     <div class="grid">
       <div class="card">
         <h3>Session</h3>
@@ -277,6 +388,9 @@ function renderDetail() {
         <textarea class="notes" data-field="notes" placeholder="Anything worth remembering about this agent">${esc(drafts.notes ?? a.notes ?? '')}</textarea>
       </div>
     </div>`;
+
+  renderDiagrams(body);
+  markOverflow(body);
 
   if (keep) {
     const el = body.querySelector(`[data-field="${keep.field}"]`);
@@ -456,6 +570,12 @@ $('#detail-body').addEventListener('click', async (e) => {
   const btn = e.target.closest('button');
   if (!btn) return;
 
+  if (btn.dataset.more) {
+    const key = btn.dataset.more;
+    if (expanded.has(key)) expanded.delete(key);
+    else expanded.add(key);
+    return renderDetail();
+  }
   if (btn.dataset.copy) {
     await navigator.clipboard.writeText(btn.dataset.copy).catch(() => {});
     return toast('Copied');
