@@ -39,6 +39,35 @@ test('extractRefs finds PR, Jira, GitHub issue and custom bug refs', () => {
   assert.deepEqual(bugs.map((b) => b.key).sort(), ['MB-777', 'PROJ-9', 'acme/api#5']);
 });
 
+test('extractRefs finds Jira keys in board, Polaris and issue links', () => {
+  const polaris =
+    'https://jira.issues.couchbase.com/jira/polaris/projects/IDEA/ideas/view/d2229b85-2dc4-49b3-b232-65879a8b360e?selectedIssue=IDEA-872';
+  const text = `Study this request and propose the fix: ${polaris}. Also https://acme.atlassian.net/jira/software/projects/PROJ/issues/PROJ-12, see (https://acme.atlassian.net/browse/OPS-3).`;
+  const { bugs } = extractRefs(text);
+  assert.deepEqual(
+    bugs.map((b) => [b.key, b.url]),
+    [
+      ['IDEA-872', polaris],
+      ['PROJ-12', 'https://acme.atlassian.net/jira/software/projects/PROJ/issues/PROJ-12'],
+      ['OPS-3', 'https://acme.atlassian.net/browse/OPS-3'],
+    ],
+  );
+  // A custom pattern does not duplicate a key already found in a link.
+  assert.equal(extractRefs(`${polaris} IDEA-872`, ['\\bIDEA-\\d+\\b']).bugs.length, 1);
+});
+
+test('parseProgress reads git progress lines', async () => {
+  const { parseProgress } = await import('../src/git.js');
+  assert.deepEqual(parseProgress('Receiving objects:  45% (10/22), 2.10 GiB | 2.40 MiB/s'), {
+    step: 'Receiving objects',
+    percent: 45,
+    size: '2.10 GiB',
+    rate: '2.40 MiB/s',
+  });
+  assert.equal(parseProgress('remote: Counting objects:  12% (1/8)').percent, 12);
+  assert.equal(parseProgress('Cloning into x...'), null);
+});
+
 test('scanTranscript reads incrementally and ignores partial lines', () => {
   const file = path.join(tmp(), 's.jsonl');
   fs.writeFileSync(file, JSON.stringify({ type: 'ai-title', aiTitle: 'T1' }) + '\n{"type":"pr-li');

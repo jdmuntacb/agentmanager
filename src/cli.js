@@ -18,6 +18,10 @@ const STATUS_COLOR = { running: green, preparing: yellow, stopped: dim, exited: 
 
 function statusLabel(a) {
   const color = STATUS_COLOR[a.status] ?? ((s) => s);
+  if (a.status === 'preparing' && a.progress) {
+    const p = a.progress;
+    return color(p.step ? `${p.phase.toLowerCase()} ${p.percent}%` : p.phase.toLowerCase());
+  }
   if (a.status === 'running') {
     if (a.runtime?.attention) return red('needs input');
     return color(a.runtime?.busy ? 'working' : 'waiting');
@@ -58,6 +62,11 @@ function printAgent(a) {
   kv('worktree of', a.worktree ? a.sourceDir : null);
   kv('permissions', a.permissionMode !== 'default' ? a.permissionMode : null);
   kv('error', a.error && red(a.error));
+  if (a.status === 'preparing' && a.progress) {
+    const p = a.progress;
+    kv('setup', [p.phase, p.step && `${p.step} ${p.percent}%`, p.size, p.rate].filter(Boolean).join(' · '));
+  }
+  if (a.status === 'error' && !a.workdir) kv('retry', `agentmgr start ${a.id}`);
   kv('attention', a.runtime.attention && red(`${a.runtime.attention}: run "agentmgr attach ${a.id}" to answer`));
   const cost = a.sessions.reduce((sum, s) => sum + (s.cost?.usd ?? 0), 0);
   kv('cost', cost ? `$${cost.toFixed(2)}` : null);

@@ -259,3 +259,114 @@ test('daemon restart resumes running agents, not ones the user closed', async ()
   assert.ok((await m2.resumeAll({ staggerMs: 0 })).includes(ids[1]));
   await m2.stopAll();
 });
+
+const makeOrigin = (name) => {
+  const origin = path.join(home, `${name}.git`);
+  const seed = path.join(home, `${name}-seed`);
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', origin]);
+  execFileSync('git', ['clone', '-q', origin, seed]);
+  fs.writeFileSync(path.join(seed, 'README.md'), 'hi\n');
+  execFileSync('git', ['add', '.'], { cwd: seed });
+  execFileSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'seed'], { cwd: seed });
+  execFileSync('git', ['push', '-q', 'origin', 'main'], { cwd: seed });
+  return origin;
+};
+const baseFor = async (url) => {
+  const crypto = await import('node:crypto');
+  const { repoNameFromUrl } = await import('../src/git.js');
+  return path.join(home, 'repos', `${repoNameFromUrl(url)}-${crypto.createHash('sha1').update(url).digest('hex').slice(0, 6)}`);
+};
+
+test('clone reports progress, and an interrupted clone is repaired', async () => {
+  const url = `file://${makeOrigin('progress')}`;
+  // Leave behind what a killed clone looks like: a repo folder with no commits.
+  const base = await baseFor(url);
+  fs.mkdirSync(base, { recursive: true });
+  execFileSync('git', ['init', '-q', base]);
+
+  const events = new WebSocket(`ws://127.0.0.1:${port}/ws/events`);
+  const phases = new Set();
+  events.on('message', (m) => {
+    const msg = JSON.parse(m.toString());
+    if (msg.t === 'agent' && msg.agent.progress) phases.add(msg.agent.progress.phase);
+  });
+  await new Promise((r) => events.on('open', r));
+  const [a] = (await call('POST', '/agents', { intent: 'Progress check', repo: url, start: false })).body;
+  const ready = await waitFor(async () => ((await agentNow(a.id)).status === 'stopped' ? agentNow(a.id) : null), 20000, 'setup');
+  events.close();
+  assert.ok(phases.has('Cloning') && phases.has('Checking out'), `phases seen: ${[...phases]}`);
+  assert.equal(ready.progress, null);
+  assert.ok(fs.existsSync(path.join(ready.workdir, 'README.md')));
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: ready.workdir }).toString(), '');
+});
+
+test('deleting an agent cancels a clone in progress', async () => {
+  // A git server that accepts connections and never answers: the clone hangs.
+  const net = await import('node:net');
+  const sockets = [];
+  const silent = net.createServer((s) => sockets.push(s));
+  await new Promise((r) => silent.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${silent.address().port}/stuck/repo.git`;
+  try {
+    const [a] = (await call('POST', '/agents', { intent: 'Never finishes cloning', repo: url })).body;
+    await waitFor(() => sockets.length > 0, 8000, 'git to connect');
+    assert.equal((await agentNow(a.id)).status, 'preparing');
+    const t0 = Date.now();
+    const del = await call('DELETE', `/agents/${a.id}`);
+    assert.equal(del.status, 200);
+    assert.ok(Date.now() - t0 < 5000, 'delete returns promptly');
+    assert.equal((await call('GET', `/agents/${a.id}`)).status, 404);
+    assert.ok(!fs.existsSync(await baseFor(url)), 'partial clone removed');
+    assert.ok(!execFileSync('ps', ['-ax', '-o', 'command']).toString().includes(url), 'git process gone');
+  } finally {
+    sockets.forEach((s) => s.destroy());
+    silent.close();
+  }
+});
+
+test('failed setup can be retried', async () => {
+  const origin = path.join(home, 'later.git');
+  const url = `file://${origin}`;
+  const [a] = (await call('POST', '/agents', { intent: 'Retry me', repo: url, start: false })).body;
+  const failed = await waitFor(async () => ((await agentNow(a.id)).status === 'error' ? agentNow(a.id) : null), 15000, 'error');
+  assert.match(failed.error, /git clone failed/);
+  fs.renameSync(makeOrigin('later-src'), origin);
+  const retried = (await call('POST', `/agents/${a.id}/start`, {})).body;
+  assert.equal(retried.status, 'preparing');
+  const sid = retried.sessionId;
+  await waitFor(() => launches().some((l) => l.args.includes(sid)), 20000, 'launch after retry');
+  assert.ok((await agentNow(a.id)).workdir);
+  await call('POST', `/agents/${a.id}/stop`);
+});
+
+test('Jira keys in intent links are tracked as bugs', async () => {
+  const link =
+    'https://jira.issues.couchbase.com/jira/polaris/projects/IDEA/ideas/view/d2229b85-2dc4-49b3-b232-65879a8b360e?selectedIssue=IDEA-872';
+  const [a] = (await call('POST', '/agents', { intent: `Study this request and propose the fix: ${link}`, start: false })).body;
+  assert.deepEqual(a.bugs.map((b) => [b.key, b.url, b.source]), [['IDEA-872', link, 'intent']]);
+});
+
+test('setup interrupted by a daemon restart is retried on the next start', async () => {
+  const { AgentManager } = await import('../src/manager.js');
+  const { Store } = await import('../src/store.js');
+  const { loadConfig } = await import('../src/config.js');
+  const url = `file://${makeOrigin('interrupted')}`;
+  const [a] = (await call('POST', '/agents', { intent: 'Interrupted setup', repo: url })).body;
+  await waitFor(async () => (await agentNow(a.id)).status === 'running', 20000, 'first setup');
+  await manager.stopAll();
+
+  // Rewrite the saved state as if the daemon died halfway through cloning.
+  const stateFile = path.join(home, 'state.json');
+  const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  Object.assign(raw.agents[a.id], { status: 'preparing', workdir: null, desired: 'running' });
+  fs.writeFileSync(stateFile, JSON.stringify(raw));
+
+  const m3 = new AgentManager({ store: new Store(stateFile), config: loadConfig() });
+  test.after(() => m3.stopAll());
+  assert.equal(m3.get(a.id).status, 'error');
+  assert.ok(m3.get(a.id).setupInterrupted);
+  assert.ok((await m3.resumeAll({ staggerMs: 0 })).includes(a.id));
+  await waitFor(() => m3.get(a.id).runtime.running, 20000, 'retried setup to launch');
+  assert.ok(m3.get(a.id).workdir);
+  assert.equal(m3.get(a.id).setupInterrupted, undefined);
+});

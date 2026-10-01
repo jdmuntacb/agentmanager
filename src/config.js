@@ -34,6 +34,9 @@ const DEFAULTS = {
   prRefreshSec: 120,
   // On daemon start, resume agents that were running when it stopped (restart, crash, reboot).
   autoResume: true,
+  // Partial clone for repo URLs: history now, file contents only when checked out.
+  // Much faster for big repos. Set to null for full clones.
+  cloneFilter: 'blob:none',
   // Shell used for the ancillary terminal in an agent's folder.
   shell: process.env.SHELL || '/bin/zsh',
 };

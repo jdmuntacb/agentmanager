@@ -53,6 +53,16 @@ function statusOf(a) {
 
 const pillText = (st) => (st === 'attention' ? 'needs input' : st);
 
+/** "Cloning · Receiving objects 45% · 2.10 GiB · 2.40 MiB/s" */
+function progressText(p) {
+  if (!p) return '';
+  const parts = [p.phase];
+  if (p.step) parts.push(`${p.step} ${p.percent}%`);
+  if (p.size) parts.push(p.size);
+  if (p.rate) parts.push(p.rate);
+  return parts.join(' · ');
+}
+
 function ago(iso) {
   if (!iso) return '';
   const s = Math.round((Date.now() - new Date(iso)) / 1000);
@@ -88,6 +98,7 @@ function renderList() {
       return `<li data-id="${a.id}" class="${a.id === selectedId ? 'selected' : ''}">
         <div class="line1"><span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
         <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${esc(a.intent || 'General session')}</div>
+        ${a.status === 'preparing' && a.progress ? `<div class="progress-line">${esc(progressText(a.progress))}</div>` : ''}
         <div class="meta">
           <span class="mono">${a.id}</span>
           ${a.git?.branch ? `<span>⎇ ${esc(a.git.branch)}</span>` : ''}
@@ -146,10 +157,14 @@ function renderDetail() {
         <p class="intent">${esc(a.intent || (a.kind === 'general' ? 'General session: ask Claude anything in the terminal.' : ''))}</p>
       </div>
       <div class="d-actions">
-        <button class="primary" data-act="terminal" ${a.status === 'preparing' ? 'disabled' : ''}>${running ? 'Open terminal' : 'Resume & open terminal'}</button>
+        ${a.status === 'error' && !a.workdir
+          ? `<button class="primary" data-act="start" title="Run the clone / worktree setup again">Retry setup</button>`
+          : `<button class="primary" data-act="terminal" ${a.status === 'preparing' ? 'disabled' : ''}>${running ? 'Open terminal' : 'Resume & open terminal'}</button>`}
         ${running
           ? `<button data-act="stop" title="Close the claude process; the session ID is kept">Close session</button>`
-          : `<button data-act="start" ${a.status === 'preparing' ? 'disabled' : ''}>Resume in background</button>`}
+          : a.status === 'error' && !a.workdir
+            ? ''
+            : `<button data-act="start" ${a.status === 'preparing' ? 'disabled' : ''}>Resume in background</button>`}
         <button data-act="fresh" ${running || a.status === 'preparing' ? 'disabled' : ''} title="Start over with a new session ID (old ones are kept)">New session</button>
         <button data-act="shell" ${a.workdir && a.status !== 'preparing' ? '' : 'disabled'} title="A separate terminal in this agent's folder for running commands by hand">Open shell</button>
         <button data-act="refresh" title="Re-scan git, PRs and transcripts">Refresh</button>
@@ -157,6 +172,13 @@ function renderDetail() {
       </div>
     </div>
     ${a.error ? `<div class="error-box">${esc(a.error)}</div>` : ''}
+    ${a.status === 'preparing'
+      ? `<div class="progress-box">
+          <div>${esc(progressText(a.progress) || 'Preparing workspace…')}</div>
+          ${a.progress?.step ? `<div class="bar"><span style="width:${a.progress.percent}%"></span></div>` : ''}
+          <div class="hint">Claude starts as soon as the workspace is ready. Deleting the agent cancels setup.</div>
+        </div>`
+      : ''}
     ${a.runtime.attention ? `<div class="error-box">${esc(a.runtime.attention)}: the agent is waiting for an answer. Open its terminal to respond.</div>` : ''}
 
     <div class="grid">
@@ -175,7 +197,7 @@ function renderDetail() {
       <div class="card">
         <h3>Workspace</h3>
         <dl class="kv">
-          <dt>Folder</dt><dd><code>${esc(a.workdir ?? 'preparing…')}</code>${a.workdir ? copyBtn(a.workdir) : ''}</dd>
+          <dt>Folder</dt><dd><code>${esc(a.workdir ?? (a.status === 'preparing' ? 'preparing…' : '—'))}</code>${a.workdir ? copyBtn(a.workdir) : ''}</dd>
           <dt>Repo</dt><dd>${a.repo ? `<code>${esc(a.repo)}</code>` : '—'}</dd>
           <dt>Branch</dt><dd>${a.git?.branch ? `<code>${esc(a.git.branch)}</code>` : '—'}${a.git?.dirtyFiles ? ` <span class="tag">${a.git.dirtyFiles} changed</span>` : ''}</dd>
           <dt>Head</dt><dd>${a.git?.head ? `<code>${esc(a.git.head.sha)}</code> ${esc(a.git.head.subject)}` : '—'}</dd>
@@ -428,7 +450,10 @@ $('#detail-body').addEventListener('click', async (e) => {
       term.open(a.id, 'shell');
       break;
     case 'start':
-      act(async () => upsert(await api('POST', `/agents/${a.id}/start`, {})), 'Resumed in the background');
+      act(
+        async () => upsert(await api('POST', `/agents/${a.id}/start`, {})),
+        a.workdir ? 'Resumed in the background' : 'Retrying setup',
+      );
       break;
     case 'fresh':
       if (!confirm('Start a new claude session for this agent? Earlier session IDs are kept and can be resumed.')) return;
@@ -445,7 +470,8 @@ $('#detail-body').addEventListener('click', async (e) => {
       act(async () => upsert(await api('POST', `/agents/${a.id}/refresh`)), 'Refreshed');
       break;
     case 'delete': {
-      if (!confirm(`Delete agent "${a.name}"? Its session IDs will be forgotten by Agent Manager.`)) return;
+      const cancelNote = a.status === 'preparing' ? '\n\nThis also cancels the workspace setup (clone / checkout) in progress.' : '';
+      if (!confirm(`Delete agent "${a.name}"? Its session IDs will be forgotten by Agent Manager.${cancelNote}`)) return;
       const del = a.worktree && confirm('Also remove the git worktree Agent Manager created for it?\n(Uncommitted changes there will be lost.)');
       act(async () => {
         const res = await api('DELETE', `/agents/${a.id}${del ? '?deleteWorkspace=1' : ''}`);

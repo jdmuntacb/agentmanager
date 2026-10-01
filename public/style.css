@@ -122,6 +122,10 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 .d-title h2 { margin: 0 0 4px; font-size: 18px; display: flex; gap: 10px; align-items: center; }
 .d-title .intent { color: var(--muted); white-space: pre-wrap; margin: 0; }
 .d-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.progress-line { font-size: 12px; color: var(--yellow); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-box { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; display: grid; gap: 6px; background: var(--panel); }
+.progress-box .bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+.progress-box .bar span { display: block; height: 100%; background: var(--accent); transition: width .4s; }
 .error-box { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--red); color: var(--red); border-radius: 6px; font-size: 13px; }
 
 .grid {

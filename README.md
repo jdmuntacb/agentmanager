@@ -4,6 +4,10 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 
 - **Intents in, agents out.** Give one intent or a list (one per line). Each becomes its own `claude` process.
 - **Repo or folder.** Give a git URL (cloned once, then each agent gets its own worktree and branch) or a local folder.
+  - **Fast clones.** URLs are cloned as partial clones (`--filter=blob:none`): history now, file contents only for what's checked out.
+  - **Progress.** Clone and checkout progress shows in the UI and `agentmgr ls`.
+  - **Cancel and retry.** Deleting an agent during setup cancels the clone. A failed or interrupted setup can be retried.
+  - **Big repo you already have?** `-d <your clone> -w` gives each agent its own worktree of it in seconds.
 - **Background terminals.** Agents run inside the daemon's PTYs. Open any agent's live terminal in the browser (**Open terminal**) or in your shell (`agentmgr attach`). Closing the view leaves the agent running.
 - **Session IDs are kept.** Each agent is started with a known `--session-id`. **Close session** stops the process but keeps the ID, and bringing it back runs `claude --resume <id>`. **New session** adds another ID to the agent's history; earlier ones stay resumable.
 - **Tracking.** For each agent you see its session ID, working folder, repo, branch, head commit, uncommitted changes, cost, PRs and bugs.
@@ -51,13 +55,13 @@ agentmgr service status | uninstall
 
 | Status | Meaning |
 | --- | --- |
-| `preparing` | Cloning or creating the worktree |
+| `preparing` | Cloning or checking out the worktree (with progress) |
 | `working` | Claude is producing output |
 | `waiting` | Claude is idle, waiting for its next instruction |
 | `needs input` | A trust or permission prompt is blocking the agent. Open its terminal to answer. |
 | `stopped` | Closed by you or by a daemon restart. Resumable. |
 | `exited` | Claude exited on its own (for example `/exit`). Resumable. |
-| `error` | Workspace setup or launch failed. See the error message. |
+| `error` | Workspace setup or launch failed. See the error message. If setup failed, **Retry setup** (or `agentmgr start <agent>`) runs it again. Setup interrupted by a daemon restart is retried automatically. |
 
 The first launch in a new folder shows Claude's "trust this folder" prompt, so new agents usually start in `needs input`.
 
@@ -89,7 +93,7 @@ agentmgr service status
 | Session ID | Assigned by agentmgr (`--session-id`). If Claude switches sessions mid-run (`/clear`), the new transcript in the agent's folder is adopted. |
 | Folder / repo / branch | The workspace agentmgr prepared, plus `git` in that folder |
 | PRs | `pr-link` records in the session transcript (PRs Claude created), `gh pr list --head <branch>`, PR URLs mentioned in the conversation, and links you add |
-| Bugs | Refs in the intent, Jira `/browse/KEY-1` and GitHub issue URLs in the conversation, custom `bugPatterns`, and links you add |
+| Bugs | Refs in the intent and the conversation (Jira links with `/browse/KEY-1`, `?selectedIssue=KEY-1` or `/issues/KEY-1`; GitHub issue URLs), custom `bugPatterns`, and links you add |
 | Title / cost | `ai-title` and `cost-state` records in the transcript |
 
 Removing a detected link dismisses it, so it doesn't come back on the next scan.
@@ -111,6 +115,7 @@ State lives in `~/.agentmanager/` (`state.json`, `daemon.log`, `repos/` for shar
   "gitRefreshSec": 15,
   "prRefreshSec": 120,
   "autoResume": true,
+  "cloneFilter": "blob:none",
   "shell": "/bin/zsh"
 }
 ```

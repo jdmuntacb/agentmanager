@@ -37,33 +37,47 @@ export function recentSessionFiles(cwd, sinceMs) {
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
 }
 
-const PR_URL = /https?:\/\/[\w.-]+\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/g;
-const ISSUE_URL = /https?:\/\/[\w.-]+\/[\w.-]+\/[\w.-]+\/issues\/(\d+)/g;
-const JIRA_URL = /https?:\/\/[\w.-]+\/browse\/([A-Z][A-Z0-9]+-\d+)/g;
+const URL_TOKEN = /https?:\/\/[^\s"'<>`\\)\]]+/g;
+const PR_PATH = /^https?:\/\/[\w.-]+\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/;
+const GH_ISSUE_PATH = /^https?:\/\/[\w.-]+\/([\w.-]+\/[\w.-]+)\/issues\/(\d+)(?:[/?#]|$)/;
+// Jira keys in links: /browse/KEY-1, ?selectedIssue=KEY-1 (boards, Polaris ideas), /issues/KEY-1.
+const JIRA_KEY = /(?:\/browse\/|[?&]selectedIssue=|\/issues\/)([A-Z][A-Z0-9_]+-\d+)\b/;
+
+const trimUrl = (url) => url.replace(/[.,;:!?'"]+$/, '');
 
 export function prFromUrl(url, source) {
-  const m = url.match(/https?:\/\/[\w.-]+\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/);
+  const m = url.match(PR_PATH);
   return { url, repo: m?.[1] ?? null, number: m ? Number(m[2]) : null, source };
 }
 
+/** A bug from a key ("MB-123") or a Jira / GitHub issue URL. */
 export function bugFromRef(ref, source) {
-  const jira = ref.match(/\/browse\/([A-Z][A-Z0-9]+-\d+)/);
-  if (jira) return { key: jira[1], url: ref, source };
-  const gh = ref.match(/https?:\/\/[\w.-]+\/([\w.-]+\/[\w.-]+)\/issues\/(\d+)/);
-  if (gh) return { key: `${gh[1]}#${gh[2]}`, url: ref, source };
-  return { key: ref, url: /^https?:\/\//.test(ref) ? ref : null, source };
+  if (/^https?:\/\//.test(ref)) {
+    const url = trimUrl(ref);
+    const jira = url.match(JIRA_KEY);
+    if (jira) return { key: jira[1], url, source };
+    const gh = url.match(GH_ISSUE_PATH);
+    if (gh) return { key: `${gh[1]}#${gh[2]}`, url, source };
+    return { key: url, url, source };
+  }
+  return { key: ref, url: null, source };
 }
 
 /** Extract PR and bug references from free text. */
 export function extractRefs(text, bugPatterns = []) {
-  const prs = [...text.matchAll(PR_URL)].map((m) => prFromUrl(m[0], 'mentioned'));
-  const bugs = [
-    ...[...text.matchAll(JIRA_URL)].map((m) => bugFromRef(m[0], 'mentioned')),
-    ...[...text.matchAll(ISSUE_URL)].map((m) => bugFromRef(m[0], 'mentioned')),
-  ];
+  const prs = [];
+  const bugs = [];
+  for (const [raw] of text.matchAll(URL_TOKEN)) {
+    const url = trimUrl(raw);
+    const pr = url.match(PR_PATH);
+    if (pr) prs.push(prFromUrl(pr[0], 'mentioned'));
+    else if (JIRA_KEY.test(url) || GH_ISSUE_PATH.test(url)) bugs.push(bugFromRef(url, 'mentioned'));
+  }
   for (const pattern of bugPatterns) {
     const re = new RegExp(pattern, 'g');
-    for (const m of text.matchAll(re)) bugs.push({ key: m[0], url: null, source: 'mentioned' });
+    for (const m of text.matchAll(re)) {
+      if (!bugs.some((b) => b.key === m[0])) bugs.push({ key: m[0], url: null, source: 'mentioned' });
+    }
   }
   return { prs, bugs };
 }

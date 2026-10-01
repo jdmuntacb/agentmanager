@@ -76,13 +76,18 @@ export class AgentManager extends EventEmitter {
     for (const agent of store.list()) {
       if (!agent.desired) store.patch(agent.id, { desired: agent.status === 'running' ? 'running' : 'stopped' });
       if (agent.status === 'running' || agent.status === 'preparing') {
+        const interrupted = agent.status === 'preparing';
         store.patch(agent.id, {
-          status: agent.status === 'running' ? 'stopped' : 'error',
-          error: agent.status === 'preparing' ? 'Daemon restarted while preparing workspace' : agent.error,
+          status: interrupted ? 'error' : 'stopped',
+          error: interrupted ? 'Workspace setup was interrupted by a daemon restart' : agent.error,
+          // resumeAll() retries interrupted setups the user still wants running.
+          setupInterrupted: interrupted || undefined,
           pid: null,
         });
       }
+      if (agent.progress) store.patch(agent.id, { progress: null });
     }
+    this.preparing = new Map(); // agent id -> { controller, done } for workspace setup in flight
 
     this.timer = setInterval(() => this.tick(), 1000);
     this.timer.unref();
@@ -200,21 +205,57 @@ export class AgentManager extends EventEmitter {
     return this.view(agent);
   }
 
-  async prepare(agent, { start }) {
-    try {
-      const ws = await this.prepareWorkspace(agent);
-      const info = await git.gitInfo(ws.workdir);
-      this.patch(agent.id, {
-        ...ws,
-        repo: ws.repo || agent.repo || info?.remote || null,
-        git: info,
-        status: 'stopped',
-      });
-      if (start) this.start(agent.id);
-    } catch (err) {
-      this.patch(agent.id, { status: 'error', error: err.message });
-      throw err;
+  prepare(agent, { start }) {
+    const controller = new AbortController();
+    const { signal } = controller;
+    // Progress is transient: broadcast it, but don't rewrite state.json for every tick.
+    let last = 0;
+    const progress = (p) => {
+      const cur = this.store.get(agent.id);
+      if (!cur) return;
+      const t = Date.now();
+      if (t - last < 500 && p.percent !== 100 && cur.progress?.phase === p.phase) return;
+      last = t;
+      cur.progress = { ...p, at: new Date(t).toISOString() };
+      this.changed(cur);
+    };
+    const done = (async () => {
+      try {
+        const ws = await this.prepareWorkspace(agent, { signal, progress });
+        progress({ phase: 'Reading git info' });
+        const info = await git.gitInfo(ws.workdir);
+        if (!this.store.get(agent.id)) return;
+        this.patch(agent.id, {
+          ...ws,
+          repo: ws.repo || agent.repo || info?.remote || null,
+          git: info,
+          status: 'stopped',
+          progress: null,
+          setupInterrupted: undefined,
+        });
+        if (start) this.start(agent.id);
+      } catch (err) {
+        if (this.store.get(agent.id)) {
+          this.patch(agent.id, { status: 'error', error: err.message, progress: null, setupInterrupted: undefined });
+        }
+        throw err;
+      } finally {
+        this.preparing.delete(agent.id);
+      }
+    })();
+    this.preparing.set(agent.id, { controller, done });
+    return done;
+  }
+
+  /** Re-run workspace setup for an agent whose setup failed or was interrupted. */
+  retrySetup(ref) {
+    const agent = this.mustGet(ref);
+    if (agent.status !== 'error' || agent.workdir) {
+      throw Object.assign(new Error('Only agents whose setup failed can be retried'), { status: 409 });
     }
+    this.patch(agent.id, { status: 'preparing', error: null, desired: 'running' });
+    this.prepare(agent, { start: true }).catch(() => {});
+    return this.view(agent);
   }
 
   withLock(key, fn) {
@@ -224,8 +265,13 @@ export class AgentManager extends EventEmitter {
     return next;
   }
 
-  async prepareWorkspace(agent) {
+  async prepareWorkspace(agent, { signal, progress = () => {} } = {}) {
     const { id, slug } = agent;
+    const cloneOpts = (phase) => ({
+      signal,
+      filter: this.config.cloneFilter || undefined,
+      onProgress: (p) => progress({ phase, ...p }),
+    });
     if (agent.kind === 'general') {
       fs.mkdirSync(paths.general, { recursive: true });
       return { workdir: paths.general };
@@ -245,17 +291,33 @@ export class AgentManager extends EventEmitter {
       const name = git.repoNameFromUrl(repo);
       const hash = crypto.createHash('sha1').update(repo).digest('hex').slice(0, 6);
       const base = path.join(paths.repos, `${name}-${hash}`);
+      if (this.locks.has(base)) progress({ phase: 'Waiting for another agent to finish cloning' });
       await this.withLock(base, async () => {
-        if (!fs.existsSync(base)) await git.clone(repo, base);
-        else await git.fetch(base).catch(() => {});
+        signal?.throwIfAborted();
+        // A clone interrupted by a crash or restart is unusable; start it over.
+        if (fs.existsSync(base) && !(await git.isValidClone(base))) fs.rmSync(base, { recursive: true, force: true });
+        if (!fs.existsSync(base)) {
+          progress({ phase: 'Cloning' });
+          await git.clone(repo, base, { ...cloneOpts('Cloning'), noCheckout: true });
+        } else {
+          progress({ phase: 'Fetching' });
+          await git.fetch(base, { signal }).catch((err) => {
+            if (err.cancelled) throw err;
+          });
+        }
       });
       const workdir = path.join(paths.workspaces, `${name}-${slug}-${id}`);
-      await this.withLock(base, async () => git.addWorktree(base, workdir, branch, await git.remoteRef(base)));
+      await this.withLock(base, async () => {
+        signal?.throwIfAborted();
+        progress({ phase: 'Checking out' });
+        await git.addWorktree(base, workdir, branch, await git.remoteRef(base), cloneOpts('Checking out'));
+      });
       return { workdir, sourceDir: base, branch, worktree: true, repo };
     }
 
     if (repo && dir && !fs.existsSync(dir)) {
-      await git.clone(repo, dir);
+      progress({ phase: 'Cloning' });
+      await git.clone(repo, dir, cloneOpts('Cloning'));
       return { workdir: dir, repo };
     }
 
@@ -270,7 +332,8 @@ export class AgentManager extends EventEmitter {
       if (!(await git.isGitRepo(dir))) throw new Error(`Worktree requested but ${dir} is not a git repository`);
       const top = await git.run('git', ['rev-parse', '--show-toplevel'], { cwd: dir });
       const workdir = path.join(paths.workspaces, `${path.basename(top)}-${slug}-${id}`);
-      await this.withLock(top, () => git.addWorktree(top, workdir, branch, 'HEAD'));
+      progress({ phase: 'Checking out' });
+      await this.withLock(top, () => git.addWorktree(top, workdir, branch, 'HEAD', cloneOpts('Checking out')));
       return { workdir, sourceDir: top, branch, worktree: true, repo };
     }
     return { workdir: dir, repo };
@@ -287,6 +350,7 @@ export class AgentManager extends EventEmitter {
     const agent = this.mustGet(ref);
     if (this.runtimes.get(agent.id)?.pty) return this.view(agent);
     if (agent.status === 'preparing') throw Object.assign(new Error('Workspace is still being prepared'), { status: 409 });
+    if (agent.status === 'error' && !agent.workdir) return this.retrySetup(agent.id);
     if (!agent.workdir || !fs.existsSync(agent.workdir)) {
       throw Object.assign(new Error(`Working folder ${agent.workdir} no longer exists`), { status: 409 });
     }
@@ -427,7 +491,8 @@ export class AgentManager extends EventEmitter {
   async resumeAll({ staggerMs = 400 } = {}) {
     const resumed = [];
     for (const agent of this.store.list()) {
-      if (agent.desired !== 'running' || !agent.workdir || this.runtimes.get(agent.id)?.pty) continue;
+      const retry = agent.setupInterrupted && !agent.workdir;
+      if (agent.desired !== 'running' || (!agent.workdir && !retry) || this.runtimes.get(agent.id)?.pty) continue;
       try {
         this.start(agent.id);
         resumed.push(agent.id);
@@ -447,6 +512,12 @@ export class AgentManager extends EventEmitter {
 
   async remove(ref, { deleteWorkspace = false } = {}) {
     const agent = this.mustGet(ref);
+    const setup = this.preparing.get(agent.id);
+    if (setup) {
+      // Cancel the clone / checkout; git helpers clean up their partial output.
+      setup.controller.abort();
+      await setup.done.catch(() => {});
+    }
     await this.stop(agent.id);
     const warnings = [];
     if (deleteWorkspace && agent.workdir) {
