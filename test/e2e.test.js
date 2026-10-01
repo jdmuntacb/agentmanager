@@ -20,7 +20,12 @@ process.env.FAKE_CLAUDE_LOG = claudeLog;
 process.env.AGENTMGR_NO_GH = '1';
 fs.writeFileSync(
   path.join(home, 'config.json'),
-  JSON.stringify({ claudeBin: process.execPath, claudeArgs: [path.join(here, 'fake-claude.js')], gitRefreshSec: 1 }),
+  JSON.stringify({
+    claudeBin: process.execPath,
+    claudeArgs: [path.join(here, 'fake-claude.js')],
+    gitRefreshSec: 1,
+    shell: '/bin/sh',
+  }),
 );
 
 const { startServer } = await import('../src/server.js');
@@ -35,12 +40,12 @@ const call = async (method, route, body, headers = { 'x-agentmgr': '1' }) => {
   });
   return { status: res.status, body: await res.json() };
 };
-const waitFor = async (fn, ms = 8000) => {
+const waitFor = async (fn, ms = 8000, label = 'condition') => {
   const end = Date.now() + ms;
   for (;;) {
     const v = await fn();
     if (v) return v;
-    if (Date.now() > end) throw new Error('timed out');
+    if (Date.now() > end) throw new Error(`timed out waiting for ${label}`);
     await new Promise((r) => setTimeout(r, 100));
   }
 };
@@ -178,4 +183,79 @@ test('repo URL: one shared clone, one worktree + branch per intent', async () =>
     assert.ok(fs.existsSync(path.join(a.workdir, 'README.md')));
     assert.match(a.git.branch, /^agent\/task-(one|two)-/);
   }
+});
+
+test('general session: no repo or folder, optional first question', async () => {
+  const blank = (await call('POST', '/general', {})).body;
+  assert.equal(blank.kind, 'general');
+  const ran = await waitFor(async () => ((await agentNow(blank.id)).status === 'running' ? agentNow(blank.id) : null));
+  assert.equal(ran.workdir, path.join(home, 'general'));
+  assert.equal(ran.repo, null);
+  const launch = await waitFor(() => launches().find((l) => l.args.includes(blank.sessionId)));
+  assert.ok(!launch.args.includes('--'), 'no prompt when no question was given');
+
+  const asked = (await call('POST', '/general', { question: 'What is a B-tree?' })).body;
+  const l2 = await waitFor(() => launches().find((l) => l.args.includes(asked.sessionId)));
+  assert.deepEqual(l2.args.slice(-2), ['--', 'What is a B-tree?']);
+  assert.equal(asked.name, 'what-is-a-b-tree');
+  await call('POST', `/agents/${blank.id}/stop`);
+  await call('POST', `/agents/${asked.id}/stop`);
+});
+
+test("ancillary shell runs in the agent's folder", async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Shell host', start: false })).body;
+  const ready = await waitFor(async () => ((await agentNow(a.id)).status === 'stopped' ? agentNow(a.id) : null));
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/term/${a.id}?kind=shell`);
+  let out = '';
+  ws.on('message', (m) => {
+    const msg = JSON.parse(m.toString());
+    if (msg.t === 'o') out += msg.d;
+  });
+  await new Promise((r) => ws.on('open', r));
+  ws.send(JSON.stringify({ t: 'i', d: 'echo "dir=$(pwd -P) sum=$((40+2))"\r' }));
+  await waitFor(() => out.includes('sum=42'));
+  assert.ok(out.includes(`dir=${fs.realpathSync(ready.workdir)}`));
+  assert.equal((await agentNow(a.id)).runtime.shell, true);
+  assert.equal((await agentNow(a.id)).status, 'stopped', 'opening a shell does not start claude');
+  ws.send(JSON.stringify({ t: 'i', d: 'exit\r' }));
+  await waitFor(async () => (await agentNow(a.id)).runtime.shell === false);
+  ws.close();
+});
+
+test('daemon restart resumes running agents, not ones the user closed', async () => {
+  const { AgentManager } = await import('../src/manager.js');
+  const { Store } = await import('../src/store.js');
+  const { loadConfig } = await import('../src/config.js');
+  const ids = (await call('POST', '/agents', { intents: ['Keep me running', 'I will be closed'] })).body.map((a) => a.id);
+  for (const id of ids) {
+    const { sessionId } = await waitFor(async () => ((await agentNow(id)).status === 'running' ? agentNow(id) : null));
+    // Wait until claude has actually started (and written its transcript) before shutting down.
+    await waitFor(() => launches().some((l) => l.args.includes(sessionId)), 8000, `${id} launch`);
+  }
+  await call('POST', `/agents/${ids[1]}/stop`); // user closes this one
+
+  await manager.stopAll(); // what a daemon shutdown does
+  const stateFile = path.join(home, 'state.json');
+  let m2 = new AgentManager({ store: new Store(stateFile), config: loadConfig() });
+  test.after(() => m2.stopAll());
+  assert.equal(m2.get(ids[0]).status, 'stopped');
+  assert.equal(m2.get(ids[0]).desired, 'running');
+  assert.equal(m2.get(ids[1]).desired, 'stopped');
+  const resumed = await m2.resumeAll({ staggerMs: 0 });
+  assert.ok(resumed.includes(ids[0]));
+  assert.ok(!resumed.includes(ids[1]));
+  const sid = m2.get(ids[0]).sessionId;
+  await waitFor(() => launches().some((l) => l.args.join(' ').includes(`--resume ${sid}`)), 8000, 'resume launch');
+  assert.equal(m2.get(ids[1]).runtime.running, false);
+
+  // Crash / power loss: state still says "running" and nobody shut down cleanly.
+  const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  await m2.stopAll();
+  raw.agents[ids[1]].status = 'running';
+  delete raw.agents[ids[1]].desired; // also covers state files from before `desired` existed
+  fs.writeFileSync(stateFile, JSON.stringify(raw));
+  m2 = new AgentManager({ store: new Store(stateFile), config: loadConfig() });
+  assert.equal(m2.get(ids[1]).desired, 'running');
+  assert.ok((await m2.resumeAll({ staggerMs: 0 })).includes(ids[1]));
+  await m2.stopAll();
 });

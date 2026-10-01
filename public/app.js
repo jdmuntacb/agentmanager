@@ -6,7 +6,7 @@ const agents = new Map();
 // #<id> selects an agent; #<id>/term also opens its terminal.
 const [hashId, hashView] = location.hash.slice(1).split('/');
 let selectedId = hashId || null;
-let openTermOnLoad = hashView === 'term';
+let openTermOnLoad = hashView === 'term' || hashView === 'shell';
 let filterText = '';
 
 // ------------------------------------------------------------------ helpers
@@ -87,7 +87,7 @@ function renderList() {
       const st = statusOf(a);
       return `<li data-id="${a.id}" class="${a.id === selectedId ? 'selected' : ''}">
         <div class="line1"><span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
-        <div class="intent">${esc(a.intent)}</div>
+        <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${esc(a.intent || 'General session')}</div>
         <div class="meta">
           <span class="mono">${a.id}</span>
           ${a.git?.branch ? `<span>⎇ ${esc(a.git.branch)}</span>` : ''}
@@ -142,8 +142,8 @@ function renderDetail() {
   body.innerHTML = `
     <div class="d-head">
       <div class="d-title">
-        <h2>${esc(a.name)} <span class="pill ${st}">${pillText(st)}</span></h2>
-        <p class="intent">${esc(a.intent)}</p>
+        <h2>${esc(a.name)} <span class="pill ${st}">${pillText(st)}</span>${a.kind === 'general' ? ' <span class="tag">general</span>' : ''}</h2>
+        <p class="intent">${esc(a.intent || (a.kind === 'general' ? 'General session: ask Claude anything in the terminal.' : ''))}</p>
       </div>
       <div class="d-actions">
         <button class="primary" data-act="terminal" ${a.status === 'preparing' ? 'disabled' : ''}>${running ? 'Open terminal' : 'Resume & open terminal'}</button>
@@ -151,6 +151,7 @@ function renderDetail() {
           ? `<button data-act="stop" title="Close the claude process; the session ID is kept">Close session</button>`
           : `<button data-act="start" ${a.status === 'preparing' ? 'disabled' : ''}>Resume in background</button>`}
         <button data-act="fresh" ${running || a.status === 'preparing' ? 'disabled' : ''} title="Start over with a new session ID (old ones are kept)">New session</button>
+        <button data-act="shell" ${a.workdir && a.status !== 'preparing' ? '' : 'disabled'} title="A separate terminal in this agent's folder for running commands by hand">Open shell</button>
         <button data-act="refresh" title="Re-scan git, PRs and transcripts">Refresh</button>
         <button class="danger" data-act="delete">Delete</button>
       </div>
@@ -284,29 +285,36 @@ const term = {
     } catch {}
   },
 
-  open(id) {
+  kind: 'claude', // 'claude' = the agent's session, 'shell' = ancillary shell in its folder
+  shellExited: false,
+
+  open(id, kind = 'claude') {
     const a = agents.get(id);
-    history.replaceState(null, '', `#${id}/term`);
+    history.replaceState(null, '', `#${id}/${kind === 'shell' ? 'shell' : 'term'}`);
     $('#term-wrap').hidden = false;
     $('#detail').classList.add('with-term');
-    $('#term-title').textContent = `${a.name} · ${a.sessionId}`;
     this.ensure();
-    if (this.agentId === id && this.ws) {
+    if (this.agentId === id && this.kind === kind && this.ws) {
       this.xterm.focus();
       return;
     }
     this.disconnect();
     this.agentId = id;
+    this.kind = kind;
+    this.shellExited = false;
     this.xterm.reset();
+    this.syncOverlay();
     requestAnimationFrame(() => this.refit());
 
-    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term/${id}`);
+    const q = kind === 'shell' ? '?kind=shell' : '';
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term/${id}${q}`);
     this.ws = ws;
     ws.onopen = () => {
       this.refit();
       this.send({ t: 'r', cols: this.xterm.cols, rows: this.xterm.rows });
     };
     ws.onmessage = (ev) => {
+      if (this.ws !== ws) return;
       const msg = JSON.parse(ev.data);
       if (msg.t === 'hello') {
         this.xterm.write(msg.backlog);
@@ -314,19 +322,29 @@ const term = {
       } else if (msg.t === 'o') {
         this.xterm.write(msg.d);
       } else if (msg.t === 'exit') {
-        this.xterm.write(`\r\n\x1b[2m[claude exited with code ${msg.code}; session kept]\x1b[0m\r\n`);
+        if (this.kind === 'shell') this.shellExited = true;
+        else this.xterm.write(`\r\n\x1b[2m[claude exited with code ${msg.code}; session kept]\x1b[0m\r\n`);
       }
       this.syncOverlay();
     };
-    ws.onclose = () => {
-      if (this.ws === ws) this.ws = null;
+    ws.onclose = (ev) => {
+      if (this.ws !== ws) return;
+      this.ws = null;
+      if (ev.code === 1008) toast(`Terminal unavailable: ${ev.reason}`, 5000);
     };
   },
 
   syncOverlay() {
     const a = this.agentId && agents.get(this.agentId);
-    $('#term-overlay').hidden = !a || a.runtime.running || a.status === 'preparing';
-    if (a) $('#term-title').textContent = `${a.name} · session ${a.sessionId}`;
+    const shell = this.kind === 'shell';
+    const closed = shell ? this.shellExited : a && !a.runtime.running && a.status !== 'preparing';
+    $('#term-overlay').hidden = !a || !closed;
+    $('#term-overlay-msg').textContent = shell ? 'The shell has exited.' : "This agent's session is closed.";
+    $('#term-resume').textContent = shell ? 'Start a new shell' : 'Resume session';
+    for (const tab of document.querySelectorAll('.term-tab')) tab.classList.toggle('active', tab.dataset.kind === this.kind);
+    if (a) {
+      $('#term-title').textContent = shell ? `shell · ${a.workdir}` : `${a.name} · session ${a.sessionId}`;
+    }
   },
 
   disconnect() {
@@ -347,11 +365,25 @@ $('#term-close').onclick = () => term.close();
 $('#term-fit').onclick = () => term.refit();
 $('#term-resume').onclick = () => {
   const id = term.agentId;
+  if (term.kind === 'shell') {
+    term.disconnect();
+    return term.open(id, 'shell');
+  }
   act(async () => {
     upsert(await api('POST', `/agents/${id}/start`, {}));
     term.xterm.focus();
   });
 };
+for (const tab of document.querySelectorAll('.term-tab')) {
+  tab.onclick = async () => {
+    const id = term.agentId;
+    const a = agents.get(id);
+    if (tab.dataset.kind === 'claude' && a && !a.runtime.running) {
+      await act(async () => upsert(await api('POST', `/agents/${id}/start`, {})));
+    }
+    term.open(id, tab.dataset.kind);
+  };
+}
 
 // ------------------------------------------------------------------ events
 
@@ -391,6 +423,9 @@ $('#detail-body').addEventListener('click', async (e) => {
     case 'terminal':
       if (!a.runtime.running) await act(async () => upsert(await api('POST', `/agents/${a.id}/start`, {})));
       term.open(a.id);
+      break;
+    case 'shell':
+      term.open(a.id, 'shell');
       break;
     case 'start':
       act(async () => upsert(await api('POST', `/agents/${a.id}/start`, {})), 'Resumed in the background');
@@ -485,6 +520,45 @@ $('#new-form').addEventListener('submit', async (e) => {
   }
 });
 
+// ------------------------------------------------------------------ ask (general session)
+
+const askDialog = $('#ask-dialog');
+$('#ask-btn').onclick = () => {
+  $('#ask-error').hidden = true;
+  askDialog.showModal();
+  askDialog.querySelector('textarea').focus();
+};
+$('#ask-cancel').onclick = () => askDialog.close();
+$('#ask-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    const a = await api('POST', '/general', {
+      question: String(f.get('question') || '').trim() || undefined,
+      name: String(f.get('name') || '').trim() || undefined,
+    });
+    agents.set(a.id, a);
+    askDialog.close();
+    e.target.reset();
+    select(a.id);
+    // The shared general folder is ready almost immediately; open the terminal once it runs.
+    const t0 = Date.now();
+    const wait = setInterval(() => {
+      const cur = agents.get(a.id);
+      if (cur?.runtime.running || Date.now() - t0 > 10000) {
+        clearInterval(wait);
+        if (cur?.runtime.running && selectedId === a.id) term.open(a.id);
+      }
+    }, 150);
+  } catch (err) {
+    $('#ask-error').textContent = err.message;
+    $('#ask-error').hidden = false;
+  }
+});
+$('#ask-form textarea').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#ask-form').requestSubmit();
+});
+
 // ------------------------------------------------------------------ live updates
 
 function connectEvents() {
@@ -499,7 +573,10 @@ function connectEvents() {
       agents.clear();
       msg.agents.forEach((a) => agents.set(a.id, a));
       if (selectedId && !agents.has(selectedId)) selectedId = null;
-      if (openTermOnLoad && selectedId && agents.get(selectedId).runtime.running) term.open(selectedId);
+      if (openTermOnLoad && selectedId) {
+        if (hashView === 'shell') term.open(selectedId, 'shell');
+        else if (agents.get(selectedId).runtime.running) term.open(selectedId);
+      }
       openTermOnLoad = false;
     } else if (msg.t === 'agent') {
       agents.set(msg.agent.id, msg.agent);

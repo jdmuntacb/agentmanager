@@ -68,6 +68,8 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
       return manager.createMany(Array.isArray(intents) ? intents : [intent], opts);
     }),
   );
+  api.post('/general', wrap((req) => manager.createGeneral(req.body ?? {})));
+  api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id)));
   api.get(
     '/agents/:id',
     wrap((req) => {
@@ -134,8 +136,9 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
         send: (msg) => ws.readyState === ws.OPEN && ws.send(JSON.stringify(msg)),
         close: () => ws.close(1000, 'agent removed'),
       };
-      session = manager.attach(agent.id, client);
-      client.send({ t: 'hello', id: agent.id, running: session.running, backlog: session.backlog });
+      const kind = url.searchParams.get('kind') === 'shell' ? 'shell' : 'claude';
+      session = kind === 'shell' ? manager.attachShell(agent.id, client) : manager.attach(agent.id, client);
+      client.send({ t: 'hello', id: agent.id, kind, running: session.running, backlog: session.backlog });
       ws.on('message', (raw) => {
         let msg;
         try {
@@ -143,8 +146,8 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
         } catch {
           return;
         }
-        if (msg.t === 'i' && typeof msg.d === 'string') manager.write(agent.id, msg.d);
-        else if (msg.t === 'r') manager.resize(agent.id, msg.cols | 0, msg.rows | 0);
+        if (msg.t === 'i' && typeof msg.d === 'string') manager.write(agent.id, msg.d, kind);
+        else if (msg.t === 'r') manager.resize(agent.id, msg.cols | 0, msg.rows | 0, kind);
       });
       ws.on('close', () => session.detach());
     } catch (err) {
@@ -172,6 +175,11 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     server.listen(port, host, resolve);
   });
   fs.writeFileSync(paths.pid, String(process.pid));
+  if (config.autoResume) {
+    manager.resumeAll().then((ids) => {
+      if (ids.length) console.log(`[agentmgr] resumed ${ids.length} agent(s) from before the restart: ${ids.join(', ')}`);
+    });
+  }
   manager.refreshAll().catch(() => {});
   return { server, manager, url: `http://${host}:${port}` };
 }

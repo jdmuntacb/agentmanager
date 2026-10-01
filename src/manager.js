@@ -64,13 +64,17 @@ export class AgentManager extends EventEmitter {
     this.store = store;
     this.config = config;
     this.runtimes = new Map(); // agent id -> { pty, chunks, size, clients, lastOutputAt, busy, stopping, exited }
+    this.shells = new Map(); // agent id -> ancillary shell runtime in the agent's folder
     this.cursors = new Map(); // session id -> transcript scan cursor
     this.locks = new Map();
     this.refreshing = new Set();
     this.lastPrCheck = new Map();
 
     // Processes do not survive a daemon restart, but their session IDs do.
+    // `desired` records whether the user wants the agent running; a restart,
+    // crash or reboot leaves it alone, so resumeAll() can bring agents back.
     for (const agent of store.list()) {
+      if (!agent.desired) store.patch(agent.id, { desired: agent.status === 'running' ? 'running' : 'stopped' });
       if (agent.status === 'running' || agent.status === 'preparing') {
         store.patch(agent.id, {
           status: agent.status === 'running' ? 'stopped' : 'error',
@@ -113,6 +117,7 @@ export class AgentManager extends EventEmitter {
         busy: Boolean(rt?.pty && rt.busy),
         attention: (rt?.pty && !rt.busy && rt.attention) || null,
         clients: rt?.clients.size ?? 0,
+        shell: Boolean(this.shells.get(agent.id)?.pty),
         lastOutputAt: rt?.lastOutputAt ? new Date(rt.lastOutputAt).toISOString() : null,
       },
     };
@@ -141,28 +146,36 @@ export class AgentManager extends EventEmitter {
     );
   }
 
-  create({ intent, name, repo, dir, worktree = false, permissionMode, model, start = true }) {
+  /** A general Claude session with no repo or folder; the question (if any) is its first prompt. */
+  createGeneral({ question, name, permissionMode, model } = {}) {
+    return this.create({ kind: 'general', intent: question, name, permissionMode, model });
+  }
+
+  create({ kind = 'task', intent, name, repo, dir, worktree = false, permissionMode, model, start = true }) {
     intent = (intent ?? '').trim();
-    if (!intent) throw Object.assign(new Error('Intent is required'), { status: 400 });
+    const general = kind === 'general';
+    if (!intent && !general) throw Object.assign(new Error('Intent is required'), { status: 400 });
     const id = crypto.randomBytes(3).toString('hex');
     const sessionId = crypto.randomUUID();
-    const slug = slugify(name || intent);
+    const slug = name || intent ? slugify(name || intent) : `general-${id}`;
     const refs = extractRefs(intent, this.config.bugPatterns);
 
     const agent = {
       id,
+      kind: general ? 'general' : 'task',
       name: name?.trim() || slug,
       slug,
       intent,
-      repo: repo?.trim() || null,
-      requestedDir: dir?.trim() || null,
+      repo: general ? null : repo?.trim() || null,
+      requestedDir: general ? null : dir?.trim() || null,
       workdir: null,
       sourceDir: null,
       branch: null,
-      worktree: Boolean(worktree),
+      worktree: !general && Boolean(worktree),
       permissionMode: permissionMode || this.config.permissionMode,
       model: model || null,
       status: 'preparing',
+      desired: start ? 'running' : 'stopped',
       error: null,
       exitCode: null,
       pid: null,
@@ -213,6 +226,10 @@ export class AgentManager extends EventEmitter {
 
   async prepareWorkspace(agent) {
     const { id, slug } = agent;
+    if (agent.kind === 'general') {
+      fs.mkdirSync(paths.general, { recursive: true });
+      return { workdir: paths.general };
+    }
     let repo = agent.repo;
     let dir = agent.requestedDir ? path.resolve(expandHome(agent.requestedDir)) : null;
     const branch = `agent/${slug}-${id}`;
@@ -292,12 +309,11 @@ export class AgentManager extends EventEmitter {
     if (resuming) {
       args.push('--resume', sid);
     } else {
-      args.push('--session-id', sid, '--name', agent.name, '--', agent.intent);
+      args.push('--session-id', sid, '--name', agent.name);
+      if (agent.intent) args.push('--', agent.intent);
     }
 
-    const env = { ...process.env, AGENTMGR_AGENT_ID: agent.id, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
-    for (const key of STRIP_ENV) delete env[key];
-
+    const env = this.childEnv(agent);
     const prev = this.runtimes.get(agent.id);
     const rt = {
       pty: null,
@@ -352,6 +368,8 @@ export class AgentManager extends EventEmitter {
       if (!a) return;
       this.patch(agent.id, {
         status: rt.stopping ? 'stopped' : 'exited',
+        // Claude exiting by itself (e.g. /exit) is a deliberate close; don't auto-resume it.
+        ...(rt.stopping ? {} : { desired: 'stopped' }),
         exitCode,
         pid: null,
         stoppedAt: now(),
@@ -366,6 +384,7 @@ export class AgentManager extends EventEmitter {
     }
     this.patch(agent.id, {
       status: 'running',
+      desired: 'running',
       error: null,
       exitCode: null,
       pid: proc.pid,
@@ -376,9 +395,13 @@ export class AgentManager extends EventEmitter {
     return this.view(this.store.get(agent.id));
   }
 
-  /** Close the claude process. Session IDs are kept so it can be resumed later. */
-  stop(ref, { timeoutMs = 5000 } = {}) {
+  /**
+   * Close the claude process. Session IDs are kept so it can be resumed later.
+   * `keepDesired` is for daemon shutdown: the agent comes back on next start.
+   */
+  stop(ref, { timeoutMs = 5000, keepDesired = false } = {}) {
     const agent = this.mustGet(ref);
+    if (!keepDesired && agent.desired !== 'stopped') this.patch(agent.id, { desired: 'stopped' });
     const rt = this.runtimes.get(agent.id);
     if (!rt?.pty) return Promise.resolve(this.view(agent));
     rt.stopping = true;
@@ -392,8 +415,34 @@ export class AgentManager extends EventEmitter {
     });
   }
 
+  /** Daemon shutdown: close everything but remember which agents should come back. */
   async stopAll() {
-    await Promise.all([...this.runtimes.entries()].filter(([, rt]) => rt.pty).map(([id]) => this.stop(id)));
+    for (const id of this.shells.keys()) this.closeShell(id);
+    await Promise.all(
+      [...this.runtimes.entries()].filter(([, rt]) => rt.pty).map(([id]) => this.stop(id, { keepDesired: true })),
+    );
+  }
+
+  /** Bring back every agent that was running when the daemon last stopped. */
+  async resumeAll({ staggerMs = 400 } = {}) {
+    const resumed = [];
+    for (const agent of this.store.list()) {
+      if (agent.desired !== 'running' || !agent.workdir || this.runtimes.get(agent.id)?.pty) continue;
+      try {
+        this.start(agent.id);
+        resumed.push(agent.id);
+      } catch (err) {
+        this.patch(agent.id, { status: 'error', error: `Auto-resume failed: ${err.message}` });
+      }
+      await new Promise((r) => setTimeout(r, staggerMs));
+    }
+    return resumed;
+  }
+
+  childEnv(agent) {
+    const env = { ...process.env, AGENTMGR_AGENT_ID: agent.id, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
+    for (const key of STRIP_ENV) delete env[key];
+    return env;
   }
 
   async remove(ref, { deleteWorkspace = false } = {}) {
@@ -413,6 +462,9 @@ export class AgentManager extends EventEmitter {
         warnings.push(err.message);
       }
     }
+    this.closeShell(agent.id);
+    for (const client of this.shells.get(agent.id)?.clients ?? []) client.close?.();
+    this.shells.delete(agent.id);
     for (const s of agent.sessions) this.cursors.delete(s.id);
     for (const client of this.runtimes.get(agent.id)?.clients ?? []) client.close?.();
     this.runtimes.delete(agent.id);
@@ -462,18 +514,77 @@ export class AgentManager extends EventEmitter {
     };
   }
 
-  write(id, data) {
-    this.runtimes.get(id)?.pty?.write(data);
+  write(id, data, kind = 'claude') {
+    (kind === 'shell' ? this.shells : this.runtimes).get(id)?.pty?.write(data);
   }
 
-  resize(id, cols, rows) {
-    const rt = this.runtimes.get(id);
+  resize(id, cols, rows, kind = 'claude') {
+    const rt = (kind === 'shell' ? this.shells : this.runtimes).get(id);
     if (!rt || !(cols > 0 && rows > 0)) return;
     rt.cols = cols;
     rt.rows = rows;
     try {
       rt.pty?.resize(cols, rows);
     } catch {}
+  }
+
+  // ------------------------------------------------------- ancillary shell
+
+  /** Start (if needed) a login shell in the agent's folder, for running commands by hand. */
+  openShell(ref) {
+    const agent = this.mustGet(ref);
+    const prev = this.shells.get(agent.id);
+    if (prev?.pty) return prev;
+    if (!agent.workdir || !fs.existsSync(agent.workdir)) {
+      throw Object.assign(new Error('The working folder is not ready yet'), { status: 409 });
+    }
+    const rt = {
+      pty: null,
+      chunks: prev?.chunks ?? [],
+      size: prev?.size ?? 0,
+      clients: prev?.clients ?? new Set(),
+      cols: prev?.cols ?? 120,
+      rows: prev?.rows ?? 34,
+    };
+    if (rt.size) this.appendOutput(rt, '\r\n\x1b[2m── new shell ──\x1b[0m\r\n');
+    const proc = pty.spawn(this.config.shell, ['-l'], {
+      name: 'xterm-256color',
+      cols: rt.cols,
+      rows: rt.rows,
+      cwd: agent.workdir,
+      env: this.childEnv(agent),
+    });
+    rt.pty = proc;
+    this.shells.set(agent.id, rt);
+    proc.onData((data) => {
+      this.appendOutput(rt, data);
+      this.broadcast(rt, { t: 'o', d: data });
+    });
+    proc.onExit(({ exitCode }) => {
+      rt.pty = null;
+      this.broadcast(rt, { t: 'exit', code: exitCode });
+      const a = this.store.get(agent.id);
+      if (a) this.changed(a);
+    });
+    this.changed(agent);
+    return rt;
+  }
+
+  attachShell(ref, client) {
+    const agent = this.mustGet(ref);
+    const rt = this.openShell(agent.id);
+    rt.clients.add(client);
+    return {
+      backlog: rt.chunks.join(''),
+      running: true,
+      detach: () => rt.clients.delete(client),
+    };
+  }
+
+  closeShell(ref) {
+    const rt = this.shells.get(this.store.resolve(ref)?.id ?? ref);
+    rt?.pty?.kill('SIGHUP');
+    return { ok: true };
   }
 
   // --------------------------------------------------------------- tracking

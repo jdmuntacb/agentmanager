@@ -14,6 +14,8 @@ export const paths = {
   pid: path.join(HOME, 'daemon.pid'),
   workspaces: path.join(HOME, 'workspaces'),
   repos: path.join(HOME, 'repos'),
+  // Shared working folder for general (no repo / folder) sessions.
+  general: path.join(HOME, 'general'),
 };
 
 const DEFAULTS = {
@@ -30,10 +32,14 @@ const DEFAULTS = {
   // How often (seconds) running agents get git / PR info refreshed.
   gitRefreshSec: 15,
   prRefreshSec: 120,
+  // On daemon start, resume agents that were running when it stopped (restart, crash, reboot).
+  autoResume: true,
+  // Shell used for the ancillary terminal in an agent's folder.
+  shell: process.env.SHELL || '/bin/zsh',
 };
 
 export function ensureHome() {
-  for (const dir of [paths.home, paths.workspaces, paths.repos]) {
+  for (const dir of [paths.home, paths.workspaces, paths.repos, paths.general]) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }

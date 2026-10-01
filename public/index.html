@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Agent Manager</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22M8 1l7 7-7 7-7-7z%22 fill=%22%233b5bdb%22/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
     <link rel="stylesheet" href="/style.css" />
   </head>
@@ -16,6 +17,7 @@
       </div>
       <div class="top-actions">
         <input id="filter" type="search" placeholder="Filter agents" aria-label="Filter agents" />
+        <button id="ask-btn" title="A general Claude session with no repo or folder">Ask Claude</button>
         <button id="new-btn" class="primary">+ New agents</button>
       </div>
     </header>
@@ -35,6 +37,10 @@
         <div id="detail-body" hidden></div>
         <div class="term-wrap" id="term-wrap" hidden>
           <div class="term-bar">
+            <div class="term-tabs" role="tablist">
+              <button class="term-tab" data-kind="claude" role="tab">Claude</button>
+              <button class="term-tab" data-kind="shell" role="tab" title="A shell in the agent's folder">Shell</button>
+            </div>
             <span id="term-title"></span>
             <span class="spacer"></span>
             <button id="term-fit" class="ghost small" title="Refit the terminal to the panel">Fit</button>
@@ -42,7 +48,7 @@
           </div>
           <div id="terminal" class="terminal"></div>
           <div id="term-overlay" class="term-overlay" hidden>
-            <p>This agent's session is closed.</p>
+            <p id="term-overlay-msg">This agent's session is closed.</p>
             <button id="term-resume" class="primary">Resume session</button>
           </div>
         </div>
@@ -94,6 +100,26 @@
         <div class="dialog-actions">
           <button type="button" id="new-cancel" class="ghost">Cancel</button>
           <button type="submit" class="primary">Create agents</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="ask-dialog">
+      <form id="ask-form" method="dialog">
+        <h2>Ask Claude</h2>
+        <p class="hint">A general session with no repo or folder. It is tracked and resumable like any other agent.</p>
+        <label>
+          Question <span class="hint">optional; you can also just type in the terminal</span>
+          <textarea name="question" rows="4" placeholder="How do I tune GC for a JVM with a 32 GB heap?"></textarea>
+        </label>
+        <label>
+          Name <span class="hint">optional</span>
+          <input name="name" placeholder="jvm-gc-questions" />
+        </label>
+        <p id="ask-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="ask-cancel" class="ghost">Cancel</button>
+          <button type="submit" class="primary">Start session</button>
         </div>
       </form>
     </dialog>

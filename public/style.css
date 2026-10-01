@@ -148,6 +148,10 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 .term-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #161a22; color: #c9d1d9; font-size: 12.5px; }
 .term-bar button { color: #c9d1d9; border-color: #30363d; }
 .spacer { flex: 1; }
+.term-tabs { display: flex; gap: 2px; }
+.term-tab { background: transparent; border: 1px solid transparent; padding: 3px 10px; font-size: 12px; }
+.term-tab.active { background: #262c38; border-color: #30363d; }
+#term-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; color: #8b93a7; }
 .terminal { flex: 1; padding: 6px 8px; min-height: 0; }
 .term-overlay {
   position: absolute; inset: 36px 0 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -160,9 +164,10 @@ dialog {
   background: var(--panel); color: var(--text);
 }
 dialog::backdrop { background: rgba(0, 0, 0, .45); }
-#new-form { padding: 20px; display: grid; gap: 12px; }
-#new-form h2 { margin: 0; font-size: 17px; }
-#new-form label { display: grid; gap: 4px; font-size: 13px; font-weight: 500; }
+#new-form, #ask-form { padding: 20px; display: grid; gap: 12px; }
+#new-form h2, #ask-form h2 { margin: 0; font-size: 17px; }
+#ask-form .hint { margin: 0; }
+#new-form label, #ask-form label { display: grid; gap: 4px; font-size: 13px; font-weight: 500; }
 #new-form label.check { display: flex; gap: 8px; align-items: baseline; font-weight: 400; }
 #new-form label.check input { width: auto; }
 .hint { color: var(--muted); font-weight: 400; font-size: 12px; }

@@ -78,16 +78,18 @@ function printAgent(a) {
   }
 }
 
-/** Interactive attach: pipes this terminal to the agent's PTY. Ctrl-] detaches. */
-async function attach(ref, { resume = true } = {}) {
+/** Interactive attach: pipes this terminal to the agent's PTY (or its shell). Ctrl-] detaches. */
+async function attach(ref, { resume = true, kind = 'claude' } = {}) {
   let agent = await resolveAgent(ref);
-  if (!agent.runtime.running && resume) {
+  const shell = kind === 'shell';
+  if (!shell && !agent.runtime.running && resume) {
     process.stderr.write(dim(`Resuming ${agent.name} (session ${agent.sessionId})…\n`));
     agent = await api('POST', `/agents/${agent.id}/start`, {});
   }
   if (!process.stdin.isTTY) throw new Error('attach needs an interactive terminal');
 
-  const ws = new WebSocket(`ws://${HOST}:${PORT}/ws/term/${agent.id}`);
+  const ws = new WebSocket(`ws://${HOST}:${PORT}/ws/term/${agent.id}${shell ? '?kind=shell' : ''}`);
+  const what = shell ? `shell for ${agent.name}` : agent.name;
   const send = (msg) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(msg));
   const sendSize = () => send({ t: 'r', cols: process.stdout.columns, rows: process.stdout.rows });
 
@@ -121,17 +123,23 @@ async function attach(ref, { resume = true } = {}) {
       } else if (msg.t === 'o') {
         process.stdout.write(msg.d);
       } else if (msg.t === 'exit') {
-        finish(dim(`[agent exited (code ${msg.code}). Session ${agent.sessionId} kept; run "agentmgr attach ${agent.id}" to resume]`));
+        finish(
+          dim(
+            shell
+              ? '[shell exited]'
+              : `[agent exited (code ${msg.code}). Session ${agent.sessionId} kept; run "agentmgr attach ${agent.id}" to resume]`,
+          ),
+        );
       }
     });
-    ws.on('close', () => finish(dim(`[detached from ${agent.name}; it keeps running in the background]`)));
+    ws.on('close', () => finish(dim(`[detached from ${what}; it keeps running in the background]`)));
     ws.on('error', (err) => finish(red(`connection error: ${err.message}`)));
 
     process.stdin.on('data', (buf) => {
       const i = buf.indexOf(0x1d); // Ctrl-]
       if (i >= 0) {
         if (i > 0) send({ t: 'i', d: buf.subarray(0, i).toString('utf8') });
-        return finish(dim(`[detached from ${agent.name}; it keeps running in the background]`));
+        return finish(dim(`[detached from ${what}; it keeps running in the background]`));
       }
       send({ t: 'i', d: buf.toString('utf8') });
     });
@@ -157,7 +165,10 @@ export async function main(argv) {
     .command('serve')
     .description('Run the agent daemon (API + web UI) in the foreground')
     .action(async () => {
-      if (await isRunning()) throw new Error(`A daemon is already running at ${BASE}`);
+      if (await isRunning()) {
+        // Clean exit, so a login service doesn't keep retrying while another daemon owns the port.
+        return console.log(`[agentmgr] a daemon is already running at ${BASE}; not starting another`);
+      }
       const { startServer } = await import('./server.js');
       const { url } = await startServer();
       console.log(`[agentmgr] listening on ${url}`);
@@ -224,6 +235,66 @@ export async function main(argv) {
     });
 
   program
+    .command('ask')
+    .description('Open a general Claude session (no repo or folder) and attach to it')
+    .argument('[question...]', 'optional first question')
+    .option('-n, --name <name>', 'display name')
+    .option('-m, --model <model>', 'claude model')
+    .option('--no-attach', 'start it in the background only')
+    .action(async (words, opts) => {
+      await daemon();
+      let a = await api('POST', '/general', { question: words.join(' '), name: opts.name, model: opts.model });
+      console.log(`${green('+')} ${bold(a.name)} ${dim(a.id)}  session ${cyan(a.sessionId)}`);
+      for (let i = 0; i < 100 && a.status === 'preparing'; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        a = await resolveAgent(a.id);
+      }
+      if (opts.attach) await attach(a.id);
+    });
+
+  program
+    .command('shell')
+    .description("Open a shell in the agent's folder, for running commands by hand. Ctrl-] detaches.")
+    .argument('<agent>')
+    .action(async (ref) => {
+      await daemon();
+      await attach(ref, { kind: 'shell' });
+    });
+
+  const service = program.command('service').description('Start the daemon at login so agents come back after a reboot');
+  service
+    .command('install')
+    .description('Register the daemon with launchd (macOS) or systemd --user (Linux) and start it')
+    .action(async () => {
+      const svc = await import('./service.js');
+      if (await isRunning()) {
+        // Hand over to the service-managed daemon; running agents are resumed by it.
+        await api('POST', '/shutdown');
+        for (let i = 0; i < 50 && (await isRunning()); i++) await new Promise((r) => setTimeout(r, 200));
+      }
+      const res = await svc.install();
+      for (let i = 0; i < 100 && !(await isRunning()); i++) await new Promise((r) => setTimeout(r, 200));
+      console.log(`${green('✓')} installed ${res.manager} service: ${res.file}`);
+      console.log((await isRunning()) ? `  daemon is up at ${BASE}` : yellow('  daemon did not come up yet; check the log'));
+      if (res.note) console.log(`  ${res.note}`);
+    });
+  service
+    .command('uninstall')
+    .description('Remove the login service (stops the daemon; agents resume next time it starts)')
+    .action(async () => {
+      const res = await (await import('./service.js')).uninstall();
+      console.log(`removed ${res.file}`);
+    });
+  service
+    .command('status')
+    .description('Show whether the login service is installed and running')
+    .action(async () => {
+      const st = await (await import('./service.js')).status();
+      console.log(`service ${st.installed ? green('installed') : dim('not installed')}${st.installed ? `, ${st.loaded ? green('loaded') : yellow('not loaded')}` : ''}  ${dim(st.file ?? '')}`);
+      console.log(`daemon  ${(await isRunning()) ? green(`running at ${BASE}`) : dim('not running')}`);
+    });
+
+  program
     .command('ls')
     .alias('list')
     .description('List agents')
@@ -236,7 +307,7 @@ export async function main(argv) {
       table(
         agents.map((a) => [
           a.id,
-          truncate(a.name, 28),
+          truncate(a.kind === 'general' ? `${a.name} (general)` : a.name, 28),
           statusLabel(a),
           a.git?.branch ?? '',
           String(a.prs.length || ''),
