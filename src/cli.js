@@ -63,7 +63,7 @@ async function resolveAgent(ref) {
 
 function printAgent(a) {
   const kv = (k, v) => v != null && v !== '' && console.log(`  ${dim(k.padEnd(12))} ${v}`);
-  console.log(`${bold(a.name)} ${dim(`(${a.id})`)}  ${statusLabel(a)}`);
+  console.log(`${a.priority <= 1 ? red(bold(`P${a.priority} `)) : dim(`P${a.priority} `)}${bold(a.name)} ${dim(`(${a.id})`)}  ${statusLabel(a)}`);
   kv('intent', a.intent);
   kv('session', cyan(a.sessionId));
   kv('folder', a.workdir);
@@ -233,6 +233,7 @@ export async function main(argv) {
     .option('-f, --file <path>', 'read intents from a file, one per line ("-" for stdin)')
     .option('-n, --name <name>', 'display name')
     .option('--project <name>', 'group under this project (default: from the repo)')
+    .option('--priority <P0-P3>', 'priority: P0 urgent, P1 high, P2 normal (default), P3 low')
     .option('-w, --worktree', 'give each agent its own git worktree of --dir')
     .option('-b, --base <ref>', "branch each agent from this branch, tag or SHA (default: the repo's default branch, fetched)")
     .option('--no-worktree', 'run all agents directly in --dir')
@@ -263,6 +264,7 @@ export async function main(argv) {
         worktree: worktreeSource === 'cli' ? opts.worktree : undefined,
         base: opts.base,
         project: opts.project,
+        priority: opts.priority,
         permissionMode: opts.permissionMode,
         model: opts.model,
         start: opts.start,
@@ -324,6 +326,28 @@ export async function main(argv) {
     });
 
   program
+    .command('doc')
+    .description('Write a stakeholder document from the agent work: analysis, design, flow or proposal')
+    .argument('<agent>')
+    .argument('<kind>', 'analysis, design, flow or proposal')
+    .option('-o, --output <file>', 'also save the Markdown to this file')
+    .option('--cached', 'print the last version instead of writing a new one')
+    .action(async (ref, kind, opts) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      let d = a.docs?.[kind];
+      if (!opts.cached || !d?.markdown) {
+        process.stderr.write(dim(`Writing the ${kind} document… (a separate Claude call; the agent is not interrupted)\n`));
+        d = (await api('POST', `/agents/${a.id}/docs/${encodeURIComponent(kind)}`)).docs[kind];
+      }
+      if (opts.output) {
+        fs.writeFileSync(opts.output, `${d.markdown}\n`);
+        process.stderr.write(dim(`saved ${opts.output}\n`));
+      }
+      process.stdout.write(`${d.markdown}\n`);
+    });
+
+  program
     .command('insights')
     .description('Why / What / How / Now for an agent, three tidy points each (one-off Claude call)')
     .argument('<agent>')
@@ -333,6 +357,18 @@ export async function main(argv) {
       process.stderr.write(dim('Thinking… (a separate Claude call; the agent is not interrupted)\n'));
       const res = await api('POST', `/agents/${a.id}/insights`);
       process.stdout.write(`${res.insights.markdown}\n`);
+    });
+
+  program
+    .command('priority')
+    .description('Set an agent priority: P0 urgent, P1 high, P2 normal, P3 low')
+    .argument('<agent>')
+    .argument('<priority>', 'P0, P1, P2 or P3')
+    .action(async (ref, p) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      const res = await api('PATCH', `/agents/${a.id}`, { priority: p });
+      console.log(`${res.name}: P${res.priority}`);
     });
 
   program
@@ -402,14 +438,14 @@ export async function main(argv) {
     .option('-d, --dir <path>', 'existing working folder (each item gets its own worktree)')
     .option('-b, --base <ref>', 'branch each item from this ref')
     .option('--project <name>', 'project name (default: from the repo)')
-    .option('-p, --priority <1|2|3>', '1 high, 2 normal, 3 low', '2')
+    .option('-p, --priority <P0-P3>', 'P0 urgent, P1 high, P2 normal, P3 low', '2')
     .option('--plan', 'plan with Claude while the repo clones')
     .option('-m, --model <model>', 'claude model')
     .action(async (items, opts) => {
       if (opts.file) items = [...items, ...readIntentsFile(opts.file)];
       if (!items.length) throw new Error('Give at least one item, or --file');
       await daemon();
-      const added = await api('POST', '/backlog', { items, ...opts, priority: Number(opts.priority) });
+      const added = await api('POST', '/backlog', { items, ...opts, priority: opts.priority });
       for (const it of added) console.log(`${green('+')} ${it.id}  P${it.priority}  ${it.title}`);
       printBacklog(await api('GET', '/backlog'));
     });
@@ -444,12 +480,12 @@ export async function main(argv) {
       printBacklog(await api('GET', '/backlog'));
     });
   bl.command('priority')
-    .description('Set an item priority (1 high, 2 normal, 3 low)')
+    .description('Set an item priority: P0 urgent, P1 high, P2 normal, P3 low')
     .argument('<item>')
     .argument('<priority>')
     .action(async (id, p) => {
       await daemon();
-      await api('PATCH', `/backlog/${id}`, { priority: Number(p) });
+      await api('PATCH', `/backlog/${id}`, { priority: p });
       printBacklog(await api('GET', '/backlog'));
     });
   bl.command('rm')
@@ -635,12 +671,19 @@ export async function main(argv) {
       if (!agents.length) return console.log('No agents yet. Try: agentmgr add "fix the flaky login test" -d .');
       const proj = (a) => a.projectInfo?.name ?? 'Other';
       const order = (p) => (p === 'General' ? 1 : p === 'Other' ? 2 : 0);
-      agents.sort((a, b) => order(proj(a)) - order(proj(b)) || proj(a).localeCompare(proj(b)) || a.createdAt.localeCompare(b.createdAt));
+      agents.sort(
+        (a, b) =>
+          order(proj(a)) - order(proj(b)) ||
+          proj(a).localeCompare(proj(b)) ||
+          a.priority - b.priority ||
+          a.createdAt.localeCompare(b.createdAt),
+      );
       const groups = new Set(agents.map(proj));
       console.log(dim(`${groups.size} project${groups.size === 1 ? '' : 's'}, ${agents.length} agents, ${agents.filter((a) => a.runtime.running).length} running`));
       table(
         agents.map((a, i) => [
           i === 0 || proj(agents[i - 1]) !== proj(a) ? bold(truncate(proj(a), 24)) : '',
+          a.priority === 0 ? red(bold('P0')) : a.priority === 1 ? red('P1') : a.priority === 3 ? dim('P3') : 'P2',
           a.id,
           truncate(a.kind === 'general' ? `${a.name} (general)` : a.name, 28),
           statusLabel(a),
@@ -651,7 +694,7 @@ export async function main(argv) {
           a.sessionId.slice(0, 8),
           truncate(a.workdir ?? '', 50),
         ]),
-        ['PROJECT', 'ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'I/O TOK', 'SESSION', 'FOLDER'],
+        ['PROJECT', 'PRIO', 'ID', 'NAME', 'STATUS', 'BRANCH', 'PRS', 'BUGS', 'I/O TOK', 'SESSION', 'FOLDER'],
       );
     });
 

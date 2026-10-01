@@ -18,6 +18,8 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Projects.** The sidebar is a tree, project → agents, so you see how many projects are in flight and how many parallel sessions each has.
 - **Backlog.** Queue asks as work orders. Agents pick them up one by one, up to N in parallel per project, until each is done. You accept or reopen each one.
 - **Slack alerts.** A message in your channel when an agent needs input, finishes a backlog item, or fails.
+- **Priority.** Mark agents P0–P3. P0 and P1 are highlighted, and lists sort by priority.
+- **Share for review.** One click writes an **Analysis**, **Design**, **Flow** or **Proposal** document from the agent's work. Copy it as Markdown, download it, or print it to PDF with diagrams.
 - **Insights.** Why, What, How and Now for any agent, three memorable points each.
 - **Explain.** One click gives a plain-language explanation of the intent and the insight behind the problem and solution. It comes from a separate tool-less Claude call, so the agent isn't interrupted.
 - **From your phone.** On by default: HTTPS access on your local network at a plain `https://<ip>:<port>`. Sign in with a QR code, and answer Claude's prompts with a key bar and reply box. Nothing to install.
@@ -56,6 +58,8 @@ agentmgr show <agent>                         # everything tracked for one agent
 agentmgr attach <agent>                       # live terminal here; Ctrl-] detaches (resumes a closed agent)
 agentmgr shell <agent>                        # a shell in the agent's folder; Ctrl-] detaches
 agentmgr brief <agent>                        # print the agent's brief (Markdown)
+agentmgr priority <agent> P0                  # P0 urgent, P1 high, P2 normal (default), P3 low
+agentmgr doc <agent> proposal -o p.md         # analysis | design | flow | proposal, for stakeholders
 agentmgr insights <agent>                     # Why / What / How / Now, three points each
 agentmgr explain <agent>                      # full briefing: ask, status, plan, solution, conclusions, needs
 agentmgr remote on | off | status | rotate    # phone / remote access (see below)
@@ -176,6 +180,37 @@ How it behaves:
 - **Conventions.** With `reviewConventions` on (the default), agents are also told to read `CLAUDE.md` / `AGENTS.md`, the relevant skills (`.claude/skills`, `~/.claude/skills`), hooks and permissions (`.claude/settings*.json`, `~/.claude/settings.json`), and project commands and agents before working. They record what applies as the first check.
 - **Off switch.** Set `"brief": false` or `"reviewConventions": false` to turn these off. Neither applies to general sessions.
 - **Existing agents.** Agents started before this version pick it up on their next resume.
+
+## Priority
+
+Every agent has a priority, **P0** (urgent) to **P3** (low). **P2** is the default.
+
+- **Look.** P0 shows a solid red chip and a red bar on the agent. P1 shows a red outline chip, and P3 a muted chip. P2 shows nothing, to keep the list calm.
+- **Ordering.** Within a project, agents sort by priority, then needs-input, then running. Projects holding a P0 or P1 agent move to the top and show the chip in their header.
+- **Setting it.** Use the selector next to the agent's name, the New agents dialog, `add --priority P1`, or `agentmgr priority <agent> P0`.
+- **Backlog.** Items use the same P0–P3 scale and pass it on to their agents.
+- **Slack.** Alerts are tagged `[P0]` / `[P1]`.
+
+## Share for review: Analysis, Design, Flow, Proposal
+
+The Brief panel's **Share for review** buttons, or `agentmgr doc <agent> <kind>`, write a stakeholder document from the agent's live context: its ask, conversation and actions, repository changes and brief.
+
+| Document | Sections |
+| --- | --- |
+| **Analysis** | Summary, context, findings, root cause, constraints and assumptions, options considered, open questions |
+| **Design** | Summary, goals and non-goals, architecture (with a diagram), components and changes, interfaces and data, trade-offs, risks, testing and rollout |
+| **Flow** | Summary, end-to-end flowchart with a step-by-step walk-through, key interactions as a sequence diagram, failure and edge cases |
+| **Proposal** | Summary, problem, recommendation, scope, plan, effort and dependencies, risks, decisions needed |
+
+**How they're written.** Documents name the real files, tickets and docs, separate facts from proposals, and say "To be confirmed" where the context doesn't. They're written for reviewers: no mention of the agent or its tools.
+
+**Sharing.** Each document opens in a viewer:
+
+- **Copy Markdown** pastes cleanly into Confluence, Google Docs, Slack or a PR.
+- **Download .md** saves the file.
+- **Print / PDF** opens a print-ready page with the Mermaid diagrams rendered. Use your browser's *Save as PDF*.
+
+**Behaviour.** Documents are kept per agent and marked out of date when the brief changes. They come from the same separate, tool-less Claude call as Explain, so the agent isn't interrupted. On the phone link, the print page needs sign-in like everything else.
 
 ## Insights
 

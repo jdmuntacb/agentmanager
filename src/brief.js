@@ -219,3 +219,93 @@ export function insightsPrompt({ intent, status, digest, repo, briefMarkdown }) 
     '</brief>',
   ].join('\n');
 }
+
+/** Stakeholder documents built from an agent's live context. */
+export const DOC_KINDS = {
+  analysis: {
+    title: 'Analysis',
+    sections: [
+      ['Summary', 'Two or three sentences a stakeholder can read on their own.'],
+      ['Context', 'The background and why this came up (link the ticket or idea if there is one).'],
+      ['Findings', 'What was learned from the code, docs and discussion, as specific facts.'],
+      ['Root cause / core problem', 'The real problem or constraint behind the request.'],
+      ['Constraints and assumptions', 'Limits, dependencies and assumptions that shape any solution.'],
+      ['Options considered', 'The options, each with pros and cons, and which one is favoured and why.'],
+      ['Open questions', 'What still needs an answer, and from whom.'],
+    ],
+    diagram: 'Include a diagram only if it clarifies the problem.',
+  },
+  design: {
+    title: 'Design',
+    sections: [
+      ['Summary', 'What is being built and the key design decision, in two or three sentences.'],
+      ['Goals and non-goals', 'Bullets.'],
+      ['Architecture', 'Components and how they interact, with one ```mermaid flowchart or graph of the architecture.'],
+      ['Components and changes', 'Each component or module touched: its responsibility and the change.'],
+      ['Interfaces and data', 'APIs, configuration, schemas or data flows that change.'],
+      ['Trade-offs and alternatives', 'What was chosen over what, and why.'],
+      ['Risks and mitigations', 'Bullets.'],
+      ['Testing and rollout', 'How it is verified and released (flags, phases, rollback).'],
+    ],
+    diagram: 'Include exactly one architecture diagram.',
+  },
+  flow: {
+    title: 'Flow',
+    sections: [
+      ['Summary', 'What the flow covers, in one or two sentences.'],
+      ['End-to-end flow', 'A ```mermaid flowchart of the main path, then a numbered step-by-step walk-through.'],
+      ['Key interactions', 'A ```mermaid sequenceDiagram of the most important interaction between components or services.'],
+      ['Failure and edge cases', 'What happens when steps fail or inputs are unusual.'],
+    ],
+    diagram: 'Use two diagrams: a flowchart and a sequenceDiagram.',
+  },
+  proposal: {
+    title: 'Proposal',
+    sections: [
+      ['Summary', 'The recommendation in two or three sentences, written for a decision-maker.'],
+      ['Problem', 'What is wrong or needed and why it matters now.'],
+      ['Recommendation', 'The proposed approach and why it is the best option.'],
+      ['Scope', 'In scope and out of scope.'],
+      ['Plan', 'Phases or milestones with what each delivers.'],
+      ['Effort and dependencies', 'Rough size, teams or systems involved, prerequisites.'],
+      ['Risks', 'Main risks with mitigations.'],
+      ['Decisions needed', 'The specific decisions or approvals requested from reviewers, as a list.'],
+    ],
+    diagram: 'Include one small diagram if it helps the decision.',
+  },
+};
+
+export function docPrompt(kind, { intent, status, digest, repo, briefMarkdown, agentName }) {
+  const d = DOC_KINDS[kind];
+  return [
+    `Write a ${d.title} document about an AI coding agent's work, for stakeholders who will review it.`,
+    'Base it only on the context below: the original ask, the agent conversation and actions, repository changes',
+    'and its brief. Write for reviewers, not for the agent: no mention of the agent, its tools or this prompt.',
+    '',
+    `Start with a level-1 title: "# ${d.title}: <short name of the work>". Then these sections, as level-2 headings, in order:`,
+    ...d.sections.map(([h, what]) => `## ${h}\n${what}`),
+    '',
+    'Rules:',
+    `- ${d.diagram} Diagrams go in \`\`\`mermaid code blocks with valid Mermaid syntax; keep node labels short and quote labels that contain punctuation.`,
+    '- Be specific: name the real files, components, tickets and documents from the context.',
+    '- Separate facts from proposals. Where the context does not say, write "To be confirmed" rather than guessing.',
+    '- Clear, neutral, professional prose; bullets where they help. Roughly 400-900 words.',
+    '- Output only the Markdown document.',
+    '',
+    '<agent_status>',
+    status,
+    '</agent_status>',
+    '<intent>',
+    intent || '(none)',
+    '</intent>',
+    '<conversation>',
+    digest || '(no conversation recorded yet)',
+    '</conversation>',
+    '<repository>',
+    repo || '(no repository changes recorded)',
+    '</repository>',
+    '<brief>',
+    briefMarkdown || '(no brief yet)',
+    '</brief>',
+  ].join('\n');
+}

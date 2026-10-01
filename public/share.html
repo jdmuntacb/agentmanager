@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Document</title>
+    <style>
+      :root { color-scheme: light; }
+      body { margin: 0; background: #f4f5f7; color: #1c2330; font: 15px/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+      .bar { position: sticky; top: 0; display: flex; gap: 8px; align-items: center; padding: 10px 16px; background: #fff; border-bottom: 1px solid #dde1e7; }
+      .bar .grow { flex: 1; color: #667085; font-size: 13px; }
+      .bar button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid #3b5bdb; background: #3b5bdb; color: #fff; cursor: pointer; }
+      main { max-width: 860px; margin: 24px auto; padding: 32px 40px; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
+      h1 { font-size: 26px; margin: 0 0 14px; }
+      h2 { font-size: 19px; margin: 26px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #e3e6eb; }
+      code { background: #f0f2f5; padding: 0 4px; border-radius: 4px; font-size: 13px; }
+      pre { background: #f0f2f5; padding: 10px; border-radius: 6px; overflow-x: auto; }
+      table { border-collapse: collapse; } th, td { border: 1px solid #dde1e7; padding: 4px 8px; text-align: left; }
+      .diagram { margin: 10px 0 16px; text-align: center; } .diagram svg { max-width: 100%; height: auto; }
+      .meta { color: #667085; font-size: 12.5px; margin-top: 28px; border-top: 1px solid #e3e6eb; padding-top: 8px; }
+      .error { color: #d64545; }
+      @media print {
+        body { background: #fff; } .bar { display: none; }
+        main { box-shadow: none; margin: 0; padding: 0; max-width: none; }
+        h2 { break-after: avoid; } .diagram, pre, table { break-inside: avoid; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="bar"><span class="grow" id="status">Loading…</span><button id="print">Print / Save as PDF</button></div>
+    <main id="doc"></main>
+    <script type="module" src="/share.js"></script>
+  </body>
+</html>

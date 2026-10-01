@@ -156,6 +156,90 @@ function explainBox(a) {
 
 const INSIGHT_ICONS = { why: '🎯', what: '📦', how: '🛠', now: '📍' };
 
+// ------------------------------------------------------------------ stakeholder documents
+
+const DOCS = { analysis: 'Analysis', design: 'Design', flow: 'Flow', proposal: 'Proposal' };
+
+/** Markdown with ```mermaid blocks drawn as diagrams (everything else sanitized). */
+function docHtml(markdown) {
+  const blocks = [];
+  const text = (markdown ?? '').replace(/```mermaid\s*\n([\s\S]*?)```/g, (_, src) => {
+    blocks.push(src.trim());
+    return `\n\nMERMAIDBLOCK${blocks.length - 1}\n\n`;
+  });
+  return md(text).replace(/<p>MERMAIDBLOCK(\d+)<\/p>/g, (_, i) => `<div class="diagram" data-mermaid="${esc(blocks[Number(i)])}"></div>`);
+}
+
+function docButtons(a) {
+  return `<span class="doc-buttons" title="Documents to share with stakeholders">${Object.entries(DOCS)
+    .map(([k, label]) => {
+      const d = a.docs?.[k];
+      const stale = d?.markdown && a.brief?.updatedAt && d.briefUpdatedAt !== a.brief.updatedAt;
+      return `<button class="small doc-btn ${d?.markdown ? 'has' : ''}" data-doc="${k}" ${d?.pending ? 'disabled' : ''}
+        title="${d?.markdown ? `Open the ${label.toLowerCase()} document${stale ? ' (the brief changed since)' : ''}` : `Write a ${label.toLowerCase()} document for stakeholders`}">${d?.pending ? `${label}…` : label}${d?.markdown ? (stale ? ' •' : ' ✓') : ''}</button>`;
+    })
+    .join('')}</span>`;
+}
+
+let docView = null; // { agentId, kind }
+
+function renderDocDialog() {
+  if (!docView) return;
+  const a = agents.get(docView.agentId);
+  const d = a?.docs?.[docView.kind];
+  const label = DOCS[docView.kind];
+  $('#doc-title').textContent = `${label} · ${a?.name ?? ''}`;
+  const body = $('#doc-body');
+  if (d?.pending) body.innerHTML = `<p class="hint">Writing the ${label.toLowerCase()} document from the agent's work so far…</p>`;
+  else if (d?.error) body.innerHTML = `<p class="error">Couldn't write it: ${esc(d.error)}</p>`;
+  else if (d?.markdown) {
+    if (body.dataset.rendered !== d.at) {
+      body.innerHTML = docHtml(d.markdown);
+      body.dataset.rendered = d.at;
+      renderDiagrams(body);
+    }
+  }
+  const stale = d?.markdown && a.brief?.updatedAt && d.briefUpdatedAt !== a.brief.updatedAt;
+  $('#doc-meta').textContent = d?.markdown ? `Written ${ago(d.at)}${stale ? ' · the brief has changed since; Regenerate for the latest' : ''}` : '';
+  for (const id of ['doc-copy', 'doc-download', 'doc-print']) $(`#${id}`).disabled = !d?.markdown;
+  $('#doc-regen').disabled = Boolean(d?.pending);
+}
+
+function openDoc(agentId, kind) {
+  docView = { agentId, kind };
+  $('#doc-body').dataset.rendered = '';
+  $('#doc-dialog').showModal();
+  const a = agents.get(agentId);
+  if (!a.docs?.[kind]?.markdown && !a.docs?.[kind]?.pending) generateDoc();
+  renderDocDialog();
+}
+
+function generateDoc() {
+  const { agentId, kind } = docView;
+  act(async () => upsert(await api('POST', `/agents/${agentId}/docs/${kind}`)));
+}
+
+$('#doc-close').onclick = () => {
+  docView = null;
+  $('#doc-dialog').close();
+};
+$('#doc-regen').onclick = () => generateDoc();
+$('#doc-copy').onclick = async () => {
+  const d = agents.get(docView.agentId)?.docs?.[docView.kind];
+  await navigator.clipboard.writeText(d.markdown).then(
+    () => toast('Markdown copied; paste into Confluence, Google Docs, Slack or a PR'),
+    () => toast('Copy failed: your browser blocked clipboard access'),
+  );
+};
+$('#doc-download').onclick = () => {
+  const a = agents.get(docView.agentId);
+  const blob = new Blob([a.docs[docView.kind].markdown], { type: 'text/markdown' });
+  const link = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `${a.slug}-${docView.kind}.md` });
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+};
+$('#doc-print').onclick = () => window.open(`/share.html#${docView.agentId}/${docView.kind}`, '_blank', 'noopener');
+
 /** Why / What / How / Now as four cards. */
 function insightsBox(a) {
   const ins = a.insights;
@@ -191,6 +275,7 @@ function briefPanel(a) {
   if (!b) {
     return `<div class="card brief">
       <h3>Brief <span class="brief-actions">${ins.button} ${ex.button}</span></h3>
+      <div class="share-row"><span class="hint">Share for review:</span> ${docButtons(a)}</div>
       ${ins.box}
       ${ex.box}
       <p class="hint">Problem, solution, diagram and checks appear here once the agent writes its brief.
@@ -204,6 +289,7 @@ function briefPanel(a) {
     : '<p class="hint">No checks yet.</p>';
   return `<div class="card brief">
     <h3>Brief <span class="brief-actions"><span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span> ${ins.button} ${ex.button}</span></h3>
+    <div class="share-row"><span class="hint">Share for review:</span> ${docButtons(a)}</div>
     ${ins.box}
     ${ex.box}
     <div class="brief-grid">
@@ -275,10 +361,14 @@ function saveCollapsed() {
   } catch {}
 }
 
+/** P0 solid red, P1 red outline, P3 muted; P2 (the default) only shown where asked. */
+const prioChip = (p, { always = false } = {}) =>
+  p === 2 && !always ? '' : `<span class="prio p${p}" title="Priority P${p}">P${p}</span>`;
+
 function agentItem(a) {
   const st = statusOf(a);
-  return `<li data-id="${a.id}" class="agent ${a.id === selectedId ? 'selected' : ''}">
-    <div class="line1"><span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
+  return `<li data-id="${a.id}" class="agent pr${a.priority ?? 2} ${a.id === selectedId ? 'selected' : ''}">
+    <div class="line1">${prioChip(a.priority ?? 2)}<span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
     <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${esc(a.intent || 'General session')}</div>
     ${a.status === 'preparing' && a.progress ? `<div class="progress-line">${esc(progressText(a.progress))}</div>` : ''}
     <div class="meta">
@@ -306,7 +396,9 @@ function projectGroups(list) {
   }
   const out = [...groups.values()];
   for (const g of out) {
-    g.agents.sort((a, b) => rank(a) - rank(b) || b.createdAt.localeCompare(a.createdAt));
+    // Highest priority first, then agents needing you, then running ones, then newest.
+    g.agents.sort((a, b) => (a.priority ?? 2) - (b.priority ?? 2) || rank(a) - rank(b) || b.createdAt.localeCompare(a.createdAt));
+    g.top = Math.min(...g.agents.map((a) => a.priority ?? 2));
     g.running = g.agents.filter((a) => a.runtime.running).length;
     g.waiting = g.agents.filter((a) => a.runtime.attention).length;
     g.tokens = g.agents.reduce((n, a) => n + (a.usage?.total ?? 0), 0);
@@ -318,7 +410,9 @@ function projectGroups(list) {
     g.label = same > 1 && g.full ? g.full : g.name;
   }
   const special = (g) => (g.key === 'general' ? 1 : g.key === 'other' ? 2 : 0);
-  return out.sort((a, b) => special(a) - special(b) || b.waiting - a.waiting || b.running - a.running || a.label.localeCompare(b.label));
+  return out.sort(
+    (a, b) => special(a) - special(b) || a.top - b.top || b.waiting - a.waiting || b.running - a.running || a.label.localeCompare(b.label),
+  );
 }
 
 function renderList() {
@@ -349,6 +443,7 @@ function renderList() {
           <span class="caret">${open ? '▾' : '▸'}</span>
           <span class="pname">${esc(g.label)}</span>
           <span class="pcounts">
+            ${g.top <= 1 ? prioChip(g.top) : ''}
             ${g.waiting ? `<span class="pill attention" title="needs input">${g.waiting}</span>` : ''}
             <span title="running / agents">${g.running}/${g.agents.length}</span>
           </span>
@@ -462,7 +557,7 @@ $('#backlog-view').addEventListener('click', async (e) => {
       return blApi('POST', '/backlog/settings', { project: el.dataset.project, limit: Number(n) });
     }
     case 'prio':
-      return blApi('PATCH', `/backlog/${id}`, { priority: (it.priority % 3) + 1 });
+      return blApi('PATCH', `/backlog/${id}`, { priority: (it.priority + 1) % 4 });
     case 'up':
     case 'down':
       return blApi('POST', `/backlog/${id}/move`, { where: what });
@@ -532,7 +627,11 @@ function renderDetail() {
   body.innerHTML = `
     <div class="d-head">
       <div class="d-title">
-        <h2>${esc(a.name)} <span class="pill ${st}">${pillText(st)}</span>${a.kind === 'general' ? ' <span class="tag">general</span>' : ''}</h2>
+        <h2>
+          <select class="prio-select p${a.priority ?? 2}" data-priority="${a.id}" title="Priority: P0 most urgent … P3 lowest">
+            ${[0, 1, 2, 3].map((p) => `<option value="${p}" ${p === (a.priority ?? 2) ? 'selected' : ''}>P${p}</option>`).join('')}
+          </select>
+          ${esc(a.name)} <span class="pill ${st}">${pillText(st)}</span>${a.kind === 'general' ? ' <span class="tag">general</span>' : ''}</h2>
         <p class="intent">${esc(a.intent || (a.kind === 'general' ? 'General session: ask Claude anything in the terminal.' : ''))}</p>
       </div>
       <div class="d-actions">
@@ -671,6 +770,7 @@ function renderDetail() {
 function render() {
   renderList();
   renderBacklog();
+  renderDocDialog();
   renderDetail();
   term.syncOverlay();
 }
@@ -868,6 +968,7 @@ $('#detail-body').addEventListener('click', async (e) => {
     if (note === null) return;
     return act(() => api('POST', `/backlog/${btn.dataset.backlogReopen}/reopen`, { note }), 'Reopened');
   }
+  if (btn.dataset.doc) return openDoc(a.id, btn.dataset.doc);
   if (btn.dataset.tokens) {
     const id = btn.dataset.tokens;
     if (tokensOpen.has(id)) tokensOpen.delete(id);
@@ -979,6 +1080,12 @@ $('#detail-body').addEventListener('submit', (e) => {
 });
 
 let notesTimer;
+$('#detail-body').addEventListener('change', (e) => {
+  const id = e.target.dataset.priority;
+  if (!id) return;
+  act(async () => upsert(await api('PATCH', `/agents/${id}`, { priority: Number(e.target.value) })), `Priority set to P${e.target.value}`);
+});
+
 $('#detail-body').addEventListener('input', (e) => {
   if (e.target.dataset.field !== 'notes') return;
   const id = selectedId;
@@ -1043,6 +1150,7 @@ $('#new-form').addEventListener('submit', async (e) => {
   }
   try {
     const created = await api('POST', '/agents', {
+      priority: Number(f.get('priority')),
       intents,
       repo: f.get('repo') || undefined,
       dir: f.get('dir') || undefined,

@@ -2,7 +2,7 @@
 // agent, up to a parallel limit per project, until each item is complete.
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { projectOf } from './manager.js';
+import { parsePriority, projectOf } from './manager.js';
 
 const now = () => new Date().toISOString();
 const err = (status, message) => Object.assign(new Error(message), { status });
@@ -89,7 +89,7 @@ export class Backlog extends EventEmitter {
   add(titles, { repo, dir, base, project, worktree, permissionMode, model, plan, priority = 2 } = {}) {
     const list = titles.map((t) => String(t ?? '').trim()).filter(Boolean);
     if (!list.length) throw err(400, 'At least one item is required');
-    const pr = [1, 2, 3].includes(Number(priority)) ? Number(priority) : 2;
+    const pr = parsePriority(priority);
     const p = projectOf({ project: project?.trim() || null, repo: repo?.trim() || null, requestedDir: dir?.trim() || null });
     const order = Math.max(0, ...Object.values(this.data.items).map((i) => i.order ?? 0)) + 1;
     const added = list.map((title, i) => {
@@ -128,7 +128,10 @@ export class Backlog extends EventEmitter {
   update(id, fields) {
     const it = this.get(id);
     if ('title' in fields && it.status === 'queued') it.title = String(fields.title).trim() || it.title;
-    if ('priority' in fields && [1, 2, 3].includes(Number(fields.priority))) it.priority = Number(fields.priority);
+    if ('priority' in fields) {
+      it.priority = parsePriority(fields.priority, it.priority);
+      if (it.agentId && this.store.get(it.agentId)) this.manager.update(it.agentId, { priority: it.priority });
+    }
     if ('notes' in fields) it.notes = String(fields.notes ?? '');
     this.changed();
     return it;
@@ -198,6 +201,7 @@ export class Backlog extends EventEmitter {
       permissionMode: it.permissionMode,
       model: it.model,
       plan: it.plan,
+      priority: it.priority,
       name: undefined,
     });
     Object.assign(it, { status: 'active', agentId: agent.id, startedAt: now(), activeSince: now() });

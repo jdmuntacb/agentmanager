@@ -5,13 +5,28 @@ import path from 'node:path';
 import pty from 'node-pty';
 import { expandHome, paths } from './config.js';
 import { trustFolder } from './trust.js';
-import { briefDir, briefPath, briefPrompt, conventionsPrompt, explainPrompt, insightsPrompt, loadBrief } from './brief.js';
+import {
+  DOC_KINDS,
+  briefDir,
+  briefPath,
+  briefPrompt,
+  conventionsPrompt,
+  docPrompt,
+  explainPrompt,
+  insightsPrompt,
+  loadBrief,
+} from './brief.js';
 
-// One-off summaries of an agent's live context, each stored on the agent under `field`.
+// One-off summaries / documents built from an agent's live context.
 const SUMMARIES = {
   explain: { field: 'explanation', prompt: explainPrompt },
   insights: { field: 'insights', prompt: insightsPrompt },
+  ...Object.fromEntries(Object.keys(DOC_KINDS).map((k) => [k, { doc: k, prompt: (ctx) => docPrompt(k, ctx) }])),
 };
+/** Read / write where a summary of `kind` is kept on the agent record. */
+const getSummary = (agent, kind) => (SUMMARIES[kind].doc ? agent.docs?.[kind] : agent[SUMMARIES[kind].field]);
+const summaryPatch = (agent, kind, value) =>
+  SUMMARIES[kind].doc ? { docs: { ...agent.docs, [kind]: value } } : { [SUMMARIES[kind].field]: value };
 import { spawn } from 'node:child_process';
 import * as git from './git.js';
 import {
@@ -108,6 +123,11 @@ export function slugify(text, max = 30) {
 }
 
 const now = () => new Date().toISOString();
+/** Priority 0 (P0, most urgent) to 3 (P3); P2 is the default. Accepts 0-3, "P0"-"P3". */
+export const parsePriority = (v, fallback = 2) => {
+  const n = Number(String(v ?? '').replace(/^p/i, ''));
+  return v !== undefined && v !== null && v !== '' && Number.isInteger(n) && n >= 0 && n <= 3 ? n : fallback;
+};
 const scrollbackFile = (id) => path.join(paths.scrollback, `${id}.log`);
 
 /** Terminal output saved by the last flush, so a restarted daemon's terminal isn't blank. */
@@ -149,8 +169,10 @@ export class AgentManager extends EventEmitter {
         });
       }
       if (agent.progress) store.patch(agent.id, { progress: null });
-      for (const { field } of Object.values(SUMMARIES)) {
-        if (agent[field]?.pending) store.patch(agent.id, { [field]: { ...agent[field], pending: false } });
+      for (const kind of Object.keys(SUMMARIES)) {
+        const cur = store.get(agent.id);
+        const v = getSummary(cur, kind);
+        if (v?.pending) store.patch(agent.id, summaryPatch(cur, kind, { ...v, pending: false }));
       }
     }
     this.preparing = new Map(); // agent id -> { controller, done } for workspace setup in flight
@@ -185,6 +207,7 @@ export class AgentManager extends EventEmitter {
     const costs = (agent.sessions ?? []).map((s) => s.cost?.usd).filter((c) => c != null);
     return {
       ...agent,
+      priority: agent.priority ?? 2,
       projectInfo: projectOf(agent),
       usage,
       // Claude Code's own cost figure from the transcripts (absent until it records one).
@@ -244,6 +267,7 @@ export class AgentManager extends EventEmitter {
     start = true,
     plan = false,
     project,
+    priority,
   }) {
     intent = (intent ?? '').trim();
     const general = kind === 'general';
@@ -257,6 +281,7 @@ export class AgentManager extends EventEmitter {
       id,
       kind: general ? 'general' : 'task',
       project: project?.trim() || null,
+      priority: parsePriority(priority),
       name: name?.trim() || slug,
       slug,
       intent,
@@ -835,6 +860,11 @@ export class AgentManager extends EventEmitter {
     const agent = this.mustGet(ref);
     const allowed = {};
     for (const key of ['name', 'notes', 'permissionMode', 'model', 'project']) if (key in fields) allowed[key] = fields[key];
+    if ('priority' in fields) {
+      const p = parsePriority(fields.priority, null);
+      if (p === null) throw Object.assign(new Error('priority must be P0, P1, P2 or P3'), { status: 400 });
+      allowed.priority = p;
+    }
     if ('project' in allowed) allowed.project = String(allowed.project ?? '').trim() || null;
     return this.view(this.patch(agent.id, allowed));
   }
@@ -1050,19 +1080,23 @@ export class AgentManager extends EventEmitter {
     return this.summarize(ref, 'insights');
   }
 
+  /** A stakeholder document: analysis, design, flow or proposal. */
+  document(ref, kind) {
+    if (!DOC_KINDS[kind]) throw Object.assign(new Error(`Unknown document "${kind}"`), { status: 400 });
+    return this.summarize(ref, kind);
+  }
+
   summarize(ref, kind) {
-    const { field } = SUMMARIES[kind];
     const agent = this.mustGet(ref);
     this.explaining ??= new Map();
     const key = `${kind}:${agent.id}`;
     if (this.explaining.has(key)) return this.explaining.get(key);
-    this.patch(agent.id, { [field]: { ...agent[field], pending: true, error: null } });
+    this.patch(agent.id, summaryPatch(agent, kind, { ...getSummary(agent, kind), pending: true, error: null }));
     const run = this.explainContext(agent)
-      .then((ctx) => this.runExplain(agent, ctx, kind))
+      .then((ctx) => this.runExplain(agent, { ...ctx, agentName: agent.name }, kind))
       .catch((e) => {
-        if (this.store.get(agent.id)) {
-          this.patch(agent.id, { [field]: { ...this.store.get(agent.id)[field], pending: false, error: e.message } });
-        }
+        const cur = this.store.get(agent.id);
+        if (cur) this.patch(agent.id, summaryPatch(cur, kind, { ...getSummary(cur, kind), pending: false, error: e.message }));
         throw e;
       })
       .finally(() => this.explaining.delete(key));
@@ -1081,6 +1115,7 @@ export class AgentManager extends EventEmitter {
     const phase = v.runtime.planning ? 'planning while the workspace is prepared' : agent.status;
     const status = [
       `status: ${phase}${v.runtime.running ? (v.runtime.busy ? ' (working right now)' : ' (idle, waiting for the next instruction)') : ''}`,
+      `priority: P${agent.priority ?? 2}`,
       v.runtime.attention ? `blocked on: ${v.runtime.attention} (waiting for the user to answer in the terminal)` : null,
       agent.error ? `error: ${agent.error}` : null,
       `last activity: ${v.runtime.lastOutputAt ?? agent.sessions.find((s) => s.id === agent.sessionId)?.lastActivity ?? 'unknown'}`,
@@ -1109,7 +1144,7 @@ export class AgentManager extends EventEmitter {
   }
 
   runExplain(agent, ctx, kind = 'explain') {
-    const { field, prompt } = SUMMARIES[kind];
+    const { prompt } = SUMMARIES[kind];
     const args = [...(this.config.claudeArgs ?? []), '-p', '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
     args.push('--output-format', 'text');
     if (this.config.explainModel) args.push('--model', this.config.explainModel);
@@ -1117,7 +1152,7 @@ export class AgentManager extends EventEmitter {
       const child = spawn(this.config.claudeBin, args, { cwd: paths.home, env: this.childEnv(agent), stdio: ['pipe', 'pipe', 'pipe'] });
       let out = '';
       let err = '';
-      const timer = setTimeout(() => child.kill('SIGTERM'), 180_000);
+      const timer = setTimeout(() => child.kill('SIGTERM'), 300_000);
       child.stdout.on('data', (d) => (out += d));
       child.stderr.on('data', (d) => (err += d));
       child.on('error', reject);
@@ -1131,9 +1166,10 @@ export class AgentManager extends EventEmitter {
       const cur = this.store.get(agent.id);
       if (!cur) return null;
       return this.view(
-        this.patch(agent.id, {
-          [field]: { markdown, at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null },
-        }),
+        this.patch(
+          agent.id,
+          summaryPatch(cur, kind, { markdown, at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null }),
+        ),
       );
     });
   }

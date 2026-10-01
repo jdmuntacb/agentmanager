@@ -135,8 +135,10 @@
         </label>
         <div class="row when">
           <label class="check"><input type="radio" name="when" value="now" checked /> Start now</label>
-          <label class="check"><input type="radio" name="when" value="backlog" /> Queue in backlog
+          <label class="check"><input type="radio" name="when" value="backlog" /> Queue in backlog</label>
+          <label class="check">Priority
             <select name="priority" aria-label="Priority">
+              <option value="0">P0 urgent</option>
               <option value="1">P1 high</option>
               <option value="2" selected>P2 normal</option>
               <option value="3">P3 low</option>
@@ -183,6 +185,20 @@
         <p id="login-error" class="error" hidden></p>
         <div class="dialog-actions"><button class="primary">Sign in</button></div>
       </form>
+    </dialog>
+
+    <dialog id="doc-dialog" class="doc-dialog">
+      <div class="doc-head">
+        <h2 id="doc-title"></h2>
+        <span class="spacer"></span>
+        <button type="button" id="doc-regen" class="small" title="Write it again from the agent's latest work">Regenerate</button>
+        <button type="button" id="doc-copy" class="small" title="Copy as Markdown">Copy Markdown</button>
+        <button type="button" id="doc-download" class="small">Download .md</button>
+        <button type="button" id="doc-print" class="small primary" title="Open a print-ready page (Save as PDF)">Print / PDF</button>
+        <button type="button" id="doc-close" class="small ghost">Close</button>
+      </div>
+      <p id="doc-meta" class="hint"></p>
+      <article id="doc-body" class="md doc-body"></article>
     </dialog>
 
     <dialog id="alerts-dialog">

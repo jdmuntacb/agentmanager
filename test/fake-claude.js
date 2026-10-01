@@ -14,6 +14,14 @@ if (args.includes('-p')) {
     const ok = args[args.indexOf('--tools') + 1] === '' && args.includes('--strict-mcp-config');
     const section = (tag) => input.match(new RegExp(`<${tag}>\\n([\\s\\S]*?)\\n</${tag}>`))?.[1] ?? '';
     const conv = section('conversation');
+    const doc = input.match(/^Write a (\w+) document/)?.[1];
+    if (doc) {
+      process.stdout.write(
+        `# ${doc}: ${section('intent')}\n## Summary\n${ok ? 'Safe call.' : 'UNSAFE call.'}\n## Architecture\n\`\`\`mermaid\nflowchart LR\n  A --> B\n\`\`\`\n`,
+        () => process.exit(0),
+      );
+      return;
+    }
     if (/Why[\s\S]*What[\s\S]*How[\s\S]*Now/.test(input.split('<agent_status>')[0])) {
       process.stdout.write(
         `### Why\n- ${ok ? 'Safe call' : 'UNSAFE'}: ${section('intent')}\n### What\n- One\n### How\n- Two\n### Now\n- saw agent text: ${conv.includes('[agent] Looking at')}\n`,

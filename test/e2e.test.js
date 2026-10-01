@@ -873,3 +873,36 @@ test('Slack Workflow Builder webhooks get only the "text" variable, as plain tex
     hook.close();
   }
 });
+
+test('agent priority P0-P3: default P2, set on create and later, validated, inherited from the backlog', async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Default prio', start: false })).body;
+  assert.equal(a.priority, 2);
+  const [b] = (await call('POST', '/agents', { intent: 'Urgent one', start: false, priority: 'P0' })).body;
+  assert.equal(b.priority, 0);
+  assert.equal((await call('PATCH', `/agents/${a.id}`, { priority: 'P1' })).body.priority, 1);
+  assert.equal((await call('PATCH', `/agents/${a.id}`, { priority: 7 })).status, 400);
+
+  const [it] = (await call('POST', '/backlog', { items: ['prio item'], project: 'PRIO', priority: 'P0' })).body;
+  assert.equal(it.priority, 0);
+  const agentId = await waitFor(async () => (await call('GET', '/backlog')).body.items.find((x) => x.id === it.id)?.agent?.id, 8000, 'dispatch');
+  assert.equal((await agentNow(agentId)).priority, 0, 'agent inherits the item priority');
+  await call('PATCH', `/backlog/${it.id}`, { priority: 3 });
+  assert.equal((await agentNow(agentId)).priority, 3, 'changing the item updates its agent');
+  await call('POST', `/backlog/${it.id}/cancel`);
+});
+
+test('stakeholder documents: analysis, design, flow, proposal; stored per kind; unknown kinds rejected', async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Doc me', start: false })).body;
+  await waitFor(async () => (await agentNow(a.id)).status === 'stopped', 8000, 'ready');
+  for (const kind of ['analysis', 'design', 'flow', 'proposal']) {
+    const res = await call('POST', `/agents/${a.id}/docs/${kind}`);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    const title = { analysis: 'Analysis', design: 'Design', flow: 'Flow', proposal: 'Proposal' }[kind];
+    assert.match(res.body.docs[kind].markdown, new RegExp(`^# ${title}: Doc me\\n## Summary\\nSafe call\\.`));
+    assert.equal(res.body.docs[kind].pending, false);
+  }
+  const all = await agentNow(a.id);
+  assert.deepEqual(Object.keys(all.docs).sort(), ['analysis', 'design', 'flow', 'proposal']);
+  assert.equal((await call('POST', `/agents/${a.id}/docs/novel`)).status, 400);
+  assert.equal((await fetch(`${base}/share.html`)).status, 200);
+});
