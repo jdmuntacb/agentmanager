@@ -150,6 +150,11 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 
 /* ---------- brief */
 .card.brief { margin-top: 16px; }
+.card.brief h3 { align-items: center; }
+.brief-actions { display: flex; gap: 10px; align-items: center; text-transform: none; letter-spacing: 0; }
+.explain { margin: 0 0 12px; padding: 10px 12px; border-radius: 8px; background: var(--panel-2); border-left: 3px solid var(--accent); }
+.explain .md h3 { font-size: 13px; text-transform: none; letter-spacing: 0; color: var(--text); margin: 8px 0 2px; display: block; }
+.explain .md h3:first-child { margin-top: 0; }
 .brief-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; }
 .brief-grid section { min-width: 0; }
 .brief-grid .wide { grid-column: 1 / -1; }
@@ -198,6 +203,33 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
   gap: 8px; background: rgba(15, 17, 23, .78); color: #e5e8ef;
 }
 
+/* ---------- phone keys and reply box */
+.keybar, .compose { display: none; }
+.keybar { gap: 4px; padding: 6px 8px; background: #161a22; flex-wrap: wrap; }
+/* Every key within thumb reach: two rows on a phone instead of a sideways-scrolling strip. */
+.keybar button { flex: 1 0 44px; min-width: 44px; min-height: 40px; padding: 6px 4px; color: #e5e8ef; background: #262c38; border-color: #30363d; font-size: 14px; touch-action: manipulation; }
+.compose { gap: 6px; padding: 6px 8px calc(6px + env(safe-area-inset-bottom)); background: #161a22; align-items: flex-end; }
+.compose textarea { flex: 1; resize: none; font: 15px/1.35 -apple-system, BlinkMacSystemFont, sans-serif; background: #0f1117; color: #e5e8ef; border-color: #30363d; max-height: 140px; }
+@media (pointer: coarse), (max-width: 800px) {
+  .keybar, .compose { display: flex; }
+}
+body.remote .local-only { display: none; }
+
+/* ---------- remote dialog */
+.remote-body { padding: 20px; display: grid; gap: 10px; }
+.remote-body h2 { margin: 0; font-size: 17px; }
+.remote-body h3 { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
+.remote-state { display: flex; align-items: center; gap: 10px; margin: 0; flex-wrap: wrap; }
+.remote-url { display: flex; gap: 14px; align-items: center; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.remote-url .qr { width: 150px; flex: none; background: #fff; padding: 6px; border-radius: 6px; }
+.remote-url .qr svg { display: block; width: 100%; height: auto; }
+.remote-url > div:last-child { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.remote-notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.fp { font-size: 11px; overflow-wrap: anywhere; }
+.devices td, .devices th { text-align: left; padding: 3px 10px 3px 0; font-size: 13px; }
+#login-form { padding: 20px; display: grid; gap: 12px; }
+#login-form h2 { margin: 0; font-size: 17px; }
+
 /* ---------- dialog */
 dialog {
   border: 1px solid var(--border); border-radius: 12px; padding: 0; width: min(640px, calc(100vw - 32px));
@@ -221,6 +253,18 @@ dialog::backdrop { background: rgba(0, 0, 0, .45); }
 }
 
 @media (max-width: 800px) {
+  /* Nothing may be wider than the phone, or the browser zooms the whole page out. */
+  html, body { overflow-x: hidden; max-width: 100vw; }
+  .topbar { flex-wrap: wrap; padding: 8px 12px; }
+  .top-actions { width: 100%; flex-wrap: wrap; }
+  .top-actions input { flex: 1 1 140px; width: auto; min-width: 0; }
+  .d-head, .d-actions { min-width: 0; }
+  .d-actions button { flex: 1 1 auto; }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  #detail-body { padding: 12px; }
+  /* On a phone the terminal takes the whole screen; "Hide terminal" goes back. */
+  .detail.with-term .term-wrap { position: fixed; inset: 0; z-index: 5; min-height: 0; padding-top: env(safe-area-inset-top); }
+  .term-bar #term-title { display: none; }
   .layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .sidebar { max-height: 38vh; border-right: 0; border-bottom: 1px solid var(--border); }
   .top-actions input { width: 130px; }

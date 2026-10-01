@@ -553,3 +553,181 @@ test('task agents keep a brief and are told to follow skills and hooks; general 
   assert.ok(!fs.existsSync(path.join(home, 'briefs', a.id)), 'brief removed with the agent');
   await call('POST', `/agents/${g.id}/stop`);
 });
+
+// ---------------------------------------------------------------- remote access (HTTPS, phone)
+
+const https = await import('node:https');
+const httpsReq = (rport, method, route, { headers = {}, body } = {}) =>
+  new Promise((resolve, reject) => {
+    const req = https.request(
+      // agent: false: a fresh connection per request, so "listener closed" shows up as ECONNREFUSED.
+      { host: '127.0.0.1', port: rport, method, path: route, rejectUnauthorized: false, agent: false, headers: { host: `127.0.0.1:${rport}`, ...headers } },
+      (res) => {
+        let data = '';
+        res.on('data', (c) => (data += c));
+        res.on('end', () => {
+          let json = null;
+          try {
+            json = JSON.parse(data);
+          } catch {}
+          resolve({ status: res.statusCode, headers: res.headers, text: data, json });
+        });
+      },
+    );
+    req.on('error', reject);
+    if (body !== undefined) req.end(JSON.stringify(body));
+    else req.end();
+  });
+/** Read an SSE stream until `until(messages)` is true. */
+const sseUntil = (rport, route, cookie, until, ms = 8000) =>
+  new Promise((resolve, reject) => {
+    const msgs = [];
+    const req = https.request(
+      { host: '127.0.0.1', port: rport, path: route, rejectUnauthorized: false, headers: { host: `127.0.0.1:${rport}`, cookie } },
+      (res) => {
+        if (res.statusCode !== 200) return reject(new Error(`SSE status ${res.statusCode}`));
+        let buf = '';
+        res.on('data', (c) => {
+          buf += c;
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const frame = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            const line = frame.split('\n').find((l) => l.startsWith('data: '));
+            if (line) msgs.push(JSON.parse(line.slice(6)));
+          }
+          if (until(msgs)) {
+            req.destroy();
+            resolve(msgs);
+          }
+        });
+      },
+    );
+    req.on('error', (err) => (err.code === 'ECONNRESET' ? null : reject(err)));
+    req.end();
+    setTimeout(() => {
+      req.destroy();
+      reject(new Error(`SSE timed out; got ${JSON.stringify(msgs).slice(0, 300)}`));
+    }, ms);
+  });
+
+test('remote access: HTTPS, token sign-in, local-only management, SSE terminal, revocation', async () => {
+  const remote = await import('../src/remote.js');
+  const rport = 20000 + Math.floor(Math.random() * 20000);
+  remote.saveSettings({ extraHosts: ['127.0.0.1'] }); // the test connects over loopback
+  const st = (await call('POST', '/remote/enable', { port: rport })).body;
+  assert.equal(st.running, true);
+  assert.equal(st.port, rport);
+  assert.match(st.fingerprint, /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
+  // Named curve, not explicit EC parameters (which browsers reject in the TLS handshake).
+  const crypto = await import('node:crypto');
+  const cert = new crypto.X509Certificate(fs.readFileSync(path.join(home, 'remote', 'cert.pem')));
+  assert.ok(cert.raw.includes(Buffer.from('06082a8648ce3d030107', 'hex')), 'P-256 named curve OID present');
+  const token = remote.accessToken();
+  for (const u of st.urls) {
+    assert.equal(u.loginUrl, `${u.url}#login=${token}`);
+    assert.match(u.qr, /^<svg/);
+  }
+
+  // Page assets need no sign-in; the API does.
+  assert.equal((await httpsReq(rport, 'GET', '/')).status, 200);
+  assert.equal((await httpsReq(rport, 'GET', '/transport.js')).status, 200);
+  assert.equal((await httpsReq(rport, 'GET', '/api/agents')).status, 401);
+  assert.deepEqual((await httpsReq(rport, 'GET', '/api/session')).json, { remote: true, authenticated: false });
+
+  // Only this machine's addresses are valid Hosts, and cross-site Origins are refused.
+  assert.equal((await httpsReq(rport, 'GET', '/', { headers: { host: `evil.example:${rport}` } })).status, 403);
+  assert.equal((await httpsReq(rport, 'GET', '/api/session', { headers: { origin: 'https://evil.example' } })).status, 403);
+
+  const json = { 'content-type': 'application/json', 'x-agentmgr': '1' };
+  assert.equal((await httpsReq(rport, 'POST', '/api/login', { headers: json, body: { token: 'nope' } })).status, 401);
+  const ok = await httpsReq(rport, 'POST', '/api/login', { headers: json, body: { token } });
+  assert.equal(ok.status, 200);
+  const setCookie = ok.headers['set-cookie'][0];
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /SameSite=Strict/);
+  const cookie = setCookie.split(';')[0];
+
+  assert.equal((await httpsReq(rport, 'GET', '/api/agents', { headers: { cookie } })).status, 200);
+  assert.deepEqual((await httpsReq(rport, 'GET', '/api/session', { headers: { cookie } })).json, { remote: true, authenticated: true });
+  // Managing remote access and shutting down are only possible on this computer.
+  assert.equal((await httpsReq(rport, 'GET', '/api/remote', { headers: { cookie } })).status, 403);
+  assert.equal((await httpsReq(rport, 'POST', '/api/shutdown', { headers: { ...json, cookie } })).status, 403);
+  // Writes still need the client header.
+  assert.equal((await httpsReq(rport, 'POST', '/api/flush', { headers: { cookie } })).status, 403);
+
+  // The phone's terminal: SSE out, POST in.
+  const [a] = (await call('POST', '/agents', { intent: 'Remote terminal' })).body;
+  await waitFor(async () => (await agentNow(a.id)).status === 'running', 8000, 'running');
+  await waitFor(() => launches().some((l) => l.args.includes(a.sessionId)), 8000, 'launch');
+  setTimeout(() => httpsReq(rport, 'POST', `/api/agents/${a.id}/term/input`, { headers: { ...json, cookie }, body: { d: 'from-phone' } }), 500);
+  const msgs = await sseUntil(rport, `/api/agents/${a.id}/term/stream`, cookie, (m) =>
+    m.some((x) => x.t === 'o' && x.d.includes('echo:from-phone')),
+  );
+  assert.equal(msgs[0].t, 'hello');
+  const events = await sseUntil(rport, '/api/events/stream', cookie, (m) => m.some((x) => x.t === 'snapshot'));
+  assert.ok(events[0].agents.some((x) => x.id === a.id));
+  await call('POST', `/agents/${a.id}/stop`);
+
+  // Signing a device out, and rotating the token, both end access.
+  const device = (await call('GET', '/remote')).body.devices[0];
+  await call('DELETE', `/remote/devices/${device.id}`);
+  assert.equal((await httpsReq(rport, 'GET', '/api/agents', { headers: { cookie } })).status, 401);
+  const again = (await httpsReq(rport, 'POST', '/api/login', { headers: json, body: { token } })).headers['set-cookie'][0].split(';')[0];
+  await call('POST', '/remote/rotate');
+  assert.equal((await httpsReq(rport, 'GET', '/api/agents', { headers: { cookie: again } })).status, 401);
+  assert.equal((await httpsReq(rport, 'POST', '/api/login', { headers: json, body: { token } })).status, 401, 'old token stops working');
+
+  await call('POST', '/remote/disable');
+  await assert.rejects(httpsReq(rport, 'GET', '/'), /ECONNREFUSED/);
+});
+
+test('flush saves terminal scrollback so a restarted daemon shows it again', async () => {
+  const { AgentManager } = await import('../src/manager.js');
+  const { Store } = await import('../src/store.js');
+  const { loadConfig } = await import('../src/config.js');
+  const [a] = (await call('POST', '/agents', { intent: 'Remember my screen' })).body;
+  await waitFor(() => launches().some((l) => l.args.includes(a.sessionId)), 8000, 'launch');
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/term/${a.id}`);
+  let out = '';
+  ws.on('message', (m) => {
+    const msg = JSON.parse(m.toString());
+    if (msg.t === 'o' || msg.t === 'hello') out += msg.d ?? msg.backlog;
+  });
+  await new Promise((r) => ws.on('open', r));
+  ws.send(JSON.stringify({ t: 'i', d: 'marker-before-restart' }));
+  await waitFor(() => out.includes('echo:marker-before-restart'), 8000, 'echo');
+  ws.close();
+
+  // (The automatic 30s flush may already have saved it; either way the file must have it.)
+  const r = (await call('POST', '/flush')).body;
+  assert.ok(r.at);
+  const file = path.join(home, 'scrollback', `${a.id}.log`);
+  assert.match(fs.readFileSync(file, 'utf8'), /echo:marker-before-restart/);
+
+  await manager.stopAll();
+  const m4 = new AgentManager({ store: new Store(path.join(home, 'state.json')), config: loadConfig() });
+  test.after(() => m4.stopAll());
+  // Opening the closed agent's terminal shows the saved output...
+  const view = m4.attach(a.id, { send() {} });
+  assert.match(view.backlog, /echo:marker-before-restart/);
+  view.detach();
+  // ...and it carries over when the session resumes.
+  m4.start(a.id);
+  const resumed = m4.attach(a.id, { send() {} });
+  assert.match(resumed.backlog, /echo:marker-before-restart[\s\S]*daemon restarted; session resumed/);
+  resumed.detach();
+});
+
+test('Explain runs a separate tool-less Claude call and stores the result', async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Explain me please', start: false })).body;
+  await waitFor(async () => (await agentNow(a.id)).status === 'stopped', 8000, 'ready');
+  const res = await call('POST', `/agents/${a.id}/explain`);
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.match(res.body.explanation.markdown, /^### In one line\nSafe call\. Intent: Explain me please/);
+  assert.equal(res.body.explanation.pending, false);
+  assert.ok(res.body.explanation.at);
+  assert.equal(res.body.status, 'stopped', 'the agent itself was not started');
+  assert.ok(!launches().some((l) => l.args.includes(a.sessionId) && l.args.includes('-p')), 'not run inside the agent session');
+});

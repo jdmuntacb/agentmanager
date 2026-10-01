@@ -20,6 +20,8 @@ export const paths = {
   planning: path.join(HOME, 'planning'),
   // Per-agent briefs (Problem / Solution / Diagram / Checks), kept outside any repo.
   briefs: path.join(HOME, 'briefs'),
+  // Saved terminal output, restored into an agent's terminal after a daemon restart.
+  scrollback: path.join(HOME, 'scrollback'),
 };
 
 const DEFAULTS = {
@@ -41,8 +43,12 @@ const DEFAULTS = {
   // Partial clone for repo URLs: history now, file contents only when checked out.
   // Much faster for big repos. Set to null for full clones.
   cloneFilter: 'blob:none',
+  // Seconds between automatic flushes (scrollback, session IDs, usage, state) to disk.
+  flushSec: 30,
   // Ask task agents to keep a brief (Problem / Solution / Diagram / Checks) for the UI.
   brief: true,
+  // Model for the Explain button's one-off summary (null = Claude's default).
+  explainModel: null,
   // Tell agents to review and follow CLAUDE.md, skills, hooks and settings before working.
   reviewConventions: true,
   // Pre-accept Claude's "trust this folder" prompt for the folders agents run in.
@@ -55,7 +61,7 @@ const DEFAULTS = {
 };
 
 export function ensureHome() {
-  for (const dir of [paths.home, paths.workspaces, paths.repos, paths.general, paths.planning, paths.briefs]) {
+  for (const dir of [paths.home, paths.workspaces, paths.repos, paths.general, paths.planning, paths.briefs, paths.scrollback]) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }

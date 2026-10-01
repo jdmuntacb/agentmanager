@@ -306,6 +306,18 @@ export async function main(argv) {
     });
 
   program
+    .command('explain')
+    .description("Explain the agent's intent, problem and solution in plain language (one-off Claude call)")
+    .argument('<agent>')
+    .action(async (ref) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      process.stderr.write(dim('Explaining… (a separate Claude call; the agent is not interrupted)\n'));
+      const res = await api('POST', `/agents/${a.id}/explain`);
+      process.stdout.write(`${res.explanation.markdown}\n`);
+    });
+
+  program
     .command('plan')
     .description('While the workspace is still being prepared, plan the task with Claude and attach')
     .argument('<agent>')
@@ -334,6 +346,70 @@ export async function main(argv) {
     .action(async (ref) => {
       await daemon();
       await attach(ref, { kind: 'shell' });
+    });
+
+  const remoteCmd = program.command('remote').description('Open Agent Manager from a phone or another computer on the same network');
+  const printRemote = async (st, { qr = true } = {}) => {
+    if (!st.enabled || !st.running) return console.log(`remote access ${dim('off')}  (turn on: agentmgr remote on)`);
+    console.log(`remote access ${green('on')}  HTTPS port ${st.port}`);
+    const phone = st.urls.filter((u) => !u.vpn);
+    if (!phone.length) console.log(yellow("  No network address a phone can reach. Join Wi-Fi or your phone's Personal Hotspot."));
+    for (const u of phone) {
+      console.log(`\n  ${bold(u.url)}  ${dim(`(${u.iface})`)}`);
+      if (qr) {
+        const { qrTerminal } = await import('./remote.js');
+        console.log((await qrTerminal(u.loginUrl)).replace(/^/gm, '  '));
+        console.log(dim('  Scan with the phone camera to open and sign in.'));
+      }
+    }
+    for (const u of st.urls.filter((x) => x.vpn)) console.log(dim(`  VPN only: ${u.url}`));
+    console.log(dim(`\n  Certificate SHA-256: ${st.fingerprint}`));
+    console.log(dim('  First visit: accept the certificate warning (self-signed). Same Wi-Fi or Personal Hotspot only.'));
+    if (st.devices.length) {
+      console.log(`\n  Signed-in devices:`);
+      for (const d of st.devices) console.log(`    ${d.id}  ${d.ip ?? ''}  last seen ${d.lastSeen}  ${dim(d.ua.slice(0, 60))}`);
+    }
+  };
+  remoteCmd
+    .command('on')
+    .alias('enable')
+    .description('Turn on HTTPS access from the local network and show the sign-in QR code')
+    .option('-p, --port <port>', 'HTTPS port', '4718')
+    .action(async (opts) => {
+      await daemon();
+      await printRemote(await api('POST', '/remote/enable', { port: Number(opts.port) }));
+    });
+  remoteCmd
+    .command('off')
+    .alias('disable')
+    .description('Turn remote access off (devices stay signed in for next time)')
+    .action(async () => {
+      await daemon();
+      await printRemote(await api('POST', '/remote/disable'));
+    });
+  remoteCmd
+    .command('status')
+    .description('Show addresses, the sign-in QR code and signed-in devices')
+    .option('--no-qr', 'skip the QR code')
+    .action(async (opts) => {
+      await daemon();
+      await printRemote(await api('GET', '/remote'), opts);
+    });
+  remoteCmd
+    .command('rotate')
+    .description('New access token; signs out every device')
+    .action(async () => {
+      await daemon();
+      await printRemote(await api('POST', '/remote/rotate'));
+    });
+  remoteCmd
+    .command('signout')
+    .description('Sign out one device (id from "agentmgr remote status")')
+    .argument('<device>')
+    .action(async (id) => {
+      await daemon();
+      await api('DELETE', `/remote/devices/${encodeURIComponent(id)}`);
+      console.log(`signed out ${id}`);
     });
 
   const service = program.command('service').description('Start the daemon at login so agents come back after a reboot');
@@ -520,6 +596,35 @@ export async function main(argv) {
       await daemon();
       const a = await resolveAgent(ref);
       printAgent(await api('POST', `/agents/${a.id}/refresh`));
+    });
+
+  program
+    .command('flush')
+    .description('Save session IDs, terminal scrollback, usage and state to disk now (also runs every 30s)')
+    .action(async () => {
+      await daemon();
+      const r = await api('POST', '/flush');
+      console.log(`${green('✓')} saved ${r.agents} agents (${r.running} running), scrollback for ${r.scrollback}, at ${r.at}`);
+    });
+
+  program
+    .command('restart')
+    .description('Flush, stop the daemon, and start it again; running agents resume their sessions')
+    .action(async () => {
+      const svc = await import('./service.js');
+      if (await isRunning()) {
+        const r = await api('POST', '/flush');
+        console.log(dim(`saved ${r.agents} agents, scrollback for ${r.scrollback}`));
+        await api('POST', '/shutdown');
+        for (let i = 0; i < 100 && (await isRunning()); i++) await new Promise((res) => setTimeout(res, 200));
+      }
+      const st = await svc.status();
+      if (st.loaded) await svc.kickstart();
+      else await ensureDaemon({ quiet: true });
+      for (let i = 0; i < 100 && !(await isRunning()); i++) await new Promise((res) => setTimeout(res, 200));
+      if (!(await isRunning())) throw new Error('Daemon did not come back; check the log');
+      const agents = await api('GET', '/agents');
+      console.log(`${green('✓')} restarted${st.loaded ? ' (login service)' : ''}; ${agents.filter((a) => a.desired === 'running').length} agents set to resume`);
     });
 
   program

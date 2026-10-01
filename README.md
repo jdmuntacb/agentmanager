@@ -15,6 +15,9 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Brief per agent.** Each agent keeps a living brief that the UI shows next to its terminal:
   - **Problem**, **Solution**, a **design / flow diagram** (Mermaid) and **Checks** (passed / failed / running / pending);
   - when the intent links a Jira issue, **References** with its **PRD** and **Tech Spec** links and the points that matter.
+- **Explain.** One click gives a plain-language explanation of the intent and the insight behind the problem and solution. It comes from a separate tool-less Claude call, so the agent isn't interrupted.
+- **From your phone.** Opt-in HTTPS access on your local network at a plain `https://<ip>:<port>`. Sign in with a QR code, and answer Claude's prompts with a key bar and reply box. Nothing to install.
+- **Never loses state.** `agentmgr flush` (also every 30 s and on shutdown) saves session IDs, terminal scrollback and usage. `agentmgr restart` brings everything back.
 - **Follows your conventions.** Before changing anything, agents review `CLAUDE.md` / `AGENTS.md`, skills, hooks and settings (repo and `~/.claude`), and follow them.
 - **Tokens and cost.** Input, output and cache tokens are tracked per session, subagents included, alongside the cost Claude Code reports.
 - **No trust prompt.** Folders agents run in are pre-trusted, so Claude's "trust this folder" prompt doesn't block them.
@@ -49,6 +52,10 @@ agentmgr show <agent>                         # everything tracked for one agent
 agentmgr attach <agent>                       # live terminal here; Ctrl-] detaches (resumes a closed agent)
 agentmgr shell <agent>                        # a shell in the agent's folder; Ctrl-] detaches
 agentmgr brief <agent>                        # print the agent's brief (Markdown)
+agentmgr explain <agent>                      # plain-language explanation of intent, problem and solution
+agentmgr remote on | off | status | rotate    # phone / remote access (see below)
+agentmgr flush                                # save session IDs, scrollback, usage and state now
+agentmgr restart                              # flush, stop and start the daemon; agents resume
 agentmgr plan <agent>                         # plan with Claude while the workspace is still being prepared
 agentmgr handoff <agent>                      # move a planning session into its ready workspace now
 agentmgr ask ["question"]                     # general session with no repo or folder
@@ -163,6 +170,51 @@ How it behaves:
 - **Off switch.** Set `"brief": false` or `"reviewConventions": false` to turn these off. Neither applies to general sessions.
 - **Existing agents.** Agents started before this version pick it up on their next resume.
 
+## Explain
+
+**Explain** in the Brief panel, or `agentmgr explain <agent>`, writes a short plain-language explanation from the intent and the brief:
+
+- **Sections:** *In one line*, *The intent*, *The problem, explained*, *The solution, explained*, *Terms* and *Open questions & risks*.
+- **How it runs:** a separate one-shot call, `claude -p --tools "" --strict-mcp-config --no-session-persistence`. It has no tools and no MCP servers, and it never runs inside the agent's session, so the agent isn't interrupted and its context doesn't grow.
+- **Stale flag:** the explanation is stored with the agent and marked out of date when the brief changes.
+- **Model:** set `"explainModel"` to use a specific one.
+
+## Phone and remote access
+
+```sh
+agentmgr remote on        # prints https://<this-mac-ip>:4718/ and a QR code
+```
+
+Or use **Remote access** in the header of the UI on this computer.
+
+**Connecting a phone:**
+
+1. **Scan the QR code** with the phone camera. It opens the address and signs the phone in. The token rides in the `#fragment`, so it never reaches the server's logs, and the page removes it from the address bar.
+2. **Accept the certificate warning** on the first visit. The certificate is self-signed and generated with macOS's built-in `/usr/bin/openssl`. Check the SHA-256 fingerprint shown by `agentmgr remote status`, then use *Show Details → visit this website* in Safari or *Advanced → Proceed* in Chrome.
+3. **Use it.** On the phone, the terminal goes full screen with a key bar (Esc, Tab, ⇧Tab, arrows, Enter, ^C, 1–4 for Claude's menus) and a reply box. Agents that need input sort to the top, and the page title shows how many are waiting.
+
+**Reachability.** Nothing extra is installed and no relay or tunnel is used, so the phone must be able to reach this computer directly:
+
+- **Same network.** Use the same Wi-Fi, or join this computer to the phone's Personal Hotspot. Office Wi-Fi often blocks device-to-device traffic.
+- **Corporate VPN.** A full-tunnel VPN usually routes even local-network traffic into the tunnel, so other devices can't reach the Mac while it's connected. If the phone can't load the page, disconnect the VPN (where policy allows) or use the hotspot.
+- **Public IP.** A public address only works if your network forwards the port, which home routers can do and corporate networks won't. Ask IT before exposing it.
+
+**Security.**
+
+- **Separate listener.** Remote access is a second listener (HTTPS, all interfaces, port 4718 by default). The local `127.0.0.1:4717` listener is unchanged.
+- **What needs sign-in.** Every API call except sign-in needs a device session (HttpOnly, Secure, SameSite=Strict cookie, 30 days, sliding). Only this machine's own addresses are accepted as `Host`, and cross-site origins are refused. Failed sign-ins are rate limited.
+- **Local only.** Turning remote access on or off, the token and devices, and shutting down can only be done from this computer.
+- **Devices.** `agentmgr remote rotate` (or **New access token**) signs every device out. Devices are listed with their address and last-seen time and can be signed out one by one.
+- **Firewall.** If the macOS firewall is off, the port is open to your whole network while remote access is on. Turn it off when you don't need it.
+- **Streaming.** The phone UI streams with Server-Sent Events plus plain HTTPS requests. iOS Safari doesn't apply an accepted self-signed certificate to WebSockets.
+
+## Saving state: flush and restart
+
+- **What's saved immediately.** Agent records (session IDs, settings, links) are written to `state.json` on every change, fsynced, then atomically replaced. Claude writes each conversation to its own transcript as it goes.
+- **What flush adds.** Each agent's terminal scrollback (restored into the terminal after a restart), session IDs Claude switched to mid-run (`/clear`), and token usage.
+- **When it runs.** Every `flushSec` (30 s), on shutdown, and on demand: **Save now** in the agent list, or `agentmgr flush`.
+- **Restart.** `agentmgr restart` flushes, stops the daemon (closing agents so Claude saves its sessions), and starts it again, through the login service when installed. Agents that were running resume with the same session IDs.
+
 ## Folder trust
 
 Before launching Claude in a folder, agentmgr marks that folder as trusted in Claude Code's config (`~/.claude.json`, `projects[<path>].hasTrustDialogAccepted`). That is the same record Claude writes when you choose "Yes, I trust this folder". It only does this for the folders agents run in: workspaces, the planning folder, general sessions and folders you pass with `-d`.
@@ -196,6 +248,8 @@ State lives in `~/.agentmanager/` (`state.json`, `daemon.log`, `repos/` for shar
   "autoResume": true,
   "trustAgentFolders": true,
   "brief": true,
+  "explainModel": null,
+  "flushSec": 30,
   "reviewConventions": true,
   "handoffIdleSec": 5,
   "cloneFilter": "blob:none",

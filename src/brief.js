@@ -130,3 +130,34 @@ export const conventionsPrompt = ({ withBrief }) =>
     ? '\nRecord what applies as the first item under Checks in the brief, for example: ' +
       '"- [x] Reviewed conventions: skills go-testing, release-notes; hooks: gofmt on edit".'
     : '');
+
+/** Prompt for a one-off, tool-less "explain this task" call. */
+export function explainPrompt({ intent, briefMarkdown }) {
+  return [
+    'You are helping someone quickly understand a software task that an AI agent is working on.',
+    "Explain it in plain language for a busy engineer or manager who hasn't read the details.",
+    '',
+    'Write Markdown with exactly these sections:',
+    '### In one line',
+    '### The intent',
+    'What is being asked and why it matters: who benefits and what changes for them.',
+    '### The problem, explained',
+    'The key insight: the root cause or core constraint, in simple terms. Use an analogy only if it really helps.',
+    '### The solution, explained',
+    "Why this approach works, the main trade-offs, and what it deliberately doesn't do.",
+    '### Terms',
+    'A short glossary of the jargon and acronyms used above (omit the section if there are none).',
+    '### Open questions & risks',
+    'What is still uncertain or could go wrong.',
+    '',
+    'Rules: use only the information below. If something is unclear or missing (for example the agent has not',
+    'worked out a solution yet), say so plainly instead of guessing. Keep it under about 350 words.',
+    '',
+    '<intent>',
+    intent || '(none)',
+    '</intent>',
+    '<brief>',
+    briefMarkdown || '(the agent has not written its brief yet)',
+    '</brief>',
+  ].join('\n');
+}

@@ -139,3 +139,10 @@ export async function status() {
   }
   return { installed: false, loaded: false, file: null };
 }
+
+/** Start the service-managed daemon now (after "agentmgr shutdown", launchd won't on its own). */
+export async function kickstart() {
+  if (process.platform === 'darwin') return run('launchctl', ['kickstart', `gui/${uid()}/${LABEL}`]);
+  if (process.platform === 'linux') return run('systemctl', ['--user', 'start', UNIT_NAME]);
+  throw new Error(`Login service is not supported on ${process.platform}`);
+}

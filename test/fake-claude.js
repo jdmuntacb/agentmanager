@@ -6,6 +6,17 @@ import path from 'node:path';
 import { transcriptPath } from '../src/tracker.js';
 
 const args = process.argv.slice(2);
+if (args.includes('-p')) {
+  // Explain: a one-shot call that must have no tools and no MCP servers.
+  let input = '';
+  process.stdin.on('data', (d) => (input += d));
+  process.stdin.on('end', () => {
+    const ok = args[args.indexOf('--tools') + 1] === '' && args.includes('--strict-mcp-config');
+    const intent = input.match(/<intent>\n([\s\S]*?)\n<\/intent>/)?.[1];
+    process.stdout.write(`### In one line\n${ok ? 'Safe call.' : 'UNSAFE call.'} Intent: ${intent}\n### The intent\nx\n`, () => process.exit(0));
+  });
+  await new Promise(() => {});
+}
 const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
 const sid = flag('--session-id') ?? flag('--resume');
 fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ cwd: process.cwd(), args }) + '\n');

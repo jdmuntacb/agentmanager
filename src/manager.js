@@ -5,7 +5,8 @@ import path from 'node:path';
 import pty from 'node-pty';
 import { expandHome, paths } from './config.js';
 import { trustFolder } from './trust.js';
-import { briefDir, briefPath, briefPrompt, conventionsPrompt, loadBrief } from './brief.js';
+import { briefDir, briefPath, briefPrompt, conventionsPrompt, explainPrompt, loadBrief } from './brief.js';
+import { spawn } from 'node:child_process';
 import * as git from './git.js';
 import {
   bugFromRef,
@@ -73,6 +74,17 @@ export function slugify(text, max = 30) {
 }
 
 const now = () => new Date().toISOString();
+const scrollbackFile = (id) => path.join(paths.scrollback, `${id}.log`);
+
+/** Terminal output saved by the last flush, so a restarted daemon's terminal isn't blank. */
+function loadScrollback(id) {
+  try {
+    const text = fs.readFileSync(scrollbackFile(id), 'utf8');
+    return text ? { chunks: [text], size: text.length } : { chunks: [], size: 0 };
+  } catch {
+    return { chunks: [], size: 0 };
+  }
+}
 const baseLabel = ({ ref, sha }) => `${ref} @ ${sha.slice(0, 9)}`;
 
 export class AgentManager extends EventEmitter {
@@ -103,6 +115,7 @@ export class AgentManager extends EventEmitter {
         });
       }
       if (agent.progress) store.patch(agent.id, { progress: null });
+      if (agent.explanation?.pending) store.patch(agent.id, { explanation: { ...agent.explanation, pending: false } });
     }
     this.preparing = new Map(); // agent id -> { controller, done } for workspace setup in flight
 
@@ -501,12 +514,13 @@ export class AgentManager extends EventEmitter {
 
   /** Spawn claude in a PTY for this agent, reusing its terminal clients and scrollback. */
   spawnClaude(agent, cwd, args, { planning = false } = {}) {
-    const prev = this.runtimes.get(agent.id);
+    const prev = this.runtimes.get(agent.id) ?? { pty: null, ...loadScrollback(agent.id), restored: true };
     const rt = {
       pty: null,
       planning,
       chunks: prev?.chunks ?? [],
       size: prev?.size ?? 0,
+      version: prev?.version ?? 0,
       clients: prev?.clients ?? new Set(),
       cols: prev?.cols ?? 120,
       rows: prev?.rows ?? 34,
@@ -518,7 +532,11 @@ export class AgentManager extends EventEmitter {
       attention: null,
     };
     if (prev?.pty === null && rt.size) {
-      const note = prev.planning && !planning ? 'moved into the repository' : 'agent restarted';
+      const note = prev.restored
+        ? 'daemon restarted; session resumed'
+        : prev.planning && !planning
+          ? 'moved into the repository'
+          : 'agent restarted';
       this.appendOutput(rt, `\r\n\x1b[2m── ${note} ──\x1b[0m\r\n`);
     }
 
@@ -677,6 +695,39 @@ export class AgentManager extends EventEmitter {
     );
   }
 
+  /**
+   * Write everything a restart would otherwise lose: each terminal's scrollback,
+   * session IDs Claude switched to (e.g. after /clear), token usage, and the
+   * state file itself (fsynced). Runs every flushSec, on shutdown and on demand.
+   */
+  async flush() {
+    if (this.flushing) return this.flushing;
+    this.flushing = (async () => {
+      let scrollback = 0;
+      const live = [...this.runtimes.entries()].filter(([id, rt]) => rt.pty && this.store.get(id));
+      for (const [id] of live) await this.refresh(id).catch(() => {});
+      fs.mkdirSync(paths.scrollback, { recursive: true });
+      for (const [id, rt] of this.runtimes) {
+        if (!this.store.get(id) || !rt.size || rt.savedVersion === rt.version) continue;
+        const file = scrollbackFile(id);
+        const tmp = `${file}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, rt.chunks.join(''));
+        fs.renameSync(tmp, file);
+        rt.savedVersion = rt.version;
+        scrollback++;
+      }
+      this.store.save();
+      this.lastFlushAt = now();
+      this.emit('flushed', this.lastFlushAt);
+      return { at: this.lastFlushAt, agents: this.store.list().length, running: live.length, scrollback };
+    })();
+    try {
+      return await this.flushing;
+    } finally {
+      this.flushing = null;
+    }
+  }
+
   /** Bring back every agent that was running when the daemon last stopped. */
   async resumeAll({ staggerMs = 400 } = {}) {
     const resumed = [];
@@ -725,6 +776,7 @@ export class AgentManager extends EventEmitter {
     }
     this.closeShell(agent.id);
     fs.rmSync(briefDir(agent.id), { recursive: true, force: true });
+    fs.rmSync(scrollbackFile(agent.id), { force: true });
     for (const client of this.shells.get(agent.id)?.clients ?? []) client.close?.();
     this.shells.delete(agent.id);
     for (const key of this.cursors.keys()) {
@@ -749,6 +801,7 @@ export class AgentManager extends EventEmitter {
   // --------------------------------------------------------------- terminal
 
   appendOutput(rt, data) {
+    rt.version = (rt.version ?? 0) + 1;
     rt.chunks.push(data);
     rt.size += data.length;
     const max = this.config.scrollbackBytes;
@@ -764,7 +817,7 @@ export class AgentManager extends EventEmitter {
     const agent = this.mustGet(ref);
     let rt = this.runtimes.get(agent.id);
     if (!rt) {
-      rt = { pty: null, chunks: [], size: 0, clients: new Set(), cols: 120, rows: 34 };
+      rt = { pty: null, ...loadScrollback(agent.id), restored: true, clients: new Set(), cols: 120, rows: 34 };
       this.runtimes.set(agent.id, rt);
     }
     rt.clients.add(client);
@@ -942,6 +995,56 @@ export class AgentManager extends EventEmitter {
     if (brief) this.patch(id, { brief });
   }
 
+  /**
+   * Plain-language explanation of the intent and the brief's problem / solution, from a
+   * separate one-shot Claude call with no tools and no MCP servers. The agent's own
+   * session is never touched, so this never interrupts or adds context to its work.
+   */
+  explain(ref) {
+    const agent = this.mustGet(ref);
+    this.explaining ??= new Map();
+    if (this.explaining.has(agent.id)) return this.explaining.get(agent.id);
+    const file = briefPath(agent.id);
+    const briefMarkdown = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    const args = [...(this.config.claudeArgs ?? []), '-p', '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
+    args.push('--output-format', 'text');
+    if (this.config.explainModel) args.push('--model', this.config.explainModel);
+    this.patch(agent.id, { explanation: { ...agent.explanation, pending: true, error: null } });
+    const run = new Promise((resolve, reject) => {
+      const child = spawn(this.config.claudeBin, args, { cwd: paths.home, env: this.childEnv(agent), stdio: ['pipe', 'pipe', 'pipe'] });
+      let out = '';
+      let err = '';
+      const timer = setTimeout(() => child.kill('SIGTERM'), 180_000);
+      child.stdout.on('data', (d) => (out += d));
+      child.stderr.on('data', (d) => (err += d));
+      child.on('error', reject);
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0 && out.trim()) resolve(out.trim());
+        else reject(new Error(`claude -p failed (exit ${code}): ${(err || out).trim().slice(-300)}`));
+      });
+      child.stdin.end(explainPrompt({ intent: agent.intent, briefMarkdown }));
+    })
+      .then((markdown) => {
+        const cur = this.store.get(agent.id);
+        if (!cur) return null;
+        return this.view(
+          this.patch(agent.id, {
+            explanation: { markdown, at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null },
+          }),
+        );
+      })
+      .catch((e) => {
+        if (this.store.get(agent.id)) {
+          this.patch(agent.id, { explanation: { ...this.store.get(agent.id).explanation, pending: false, error: e.message } });
+        }
+        throw e;
+      })
+      .finally(() => this.explaining.delete(agent.id));
+    this.explaining.set(agent.id, run);
+    return run;
+  }
+
   briefFile(ref) {
     const agent = this.mustGet(ref);
     const file = briefPath(agent.id);
@@ -1041,6 +1144,7 @@ export class AgentManager extends EventEmitter {
       const a = this.store.get(id);
       if (a?.workdir && a.status !== 'preparing') this.maybeHandoff(id).catch(() => {});
     }
+    if (this.config.flushSec && this.tickCount % this.config.flushSec === 0) this.flush().catch(() => {});
     if (this.tickCount % this.config.gitRefreshSec !== 0) return;
     for (const [id, rt] of this.runtimes) {
       if (!rt.pty || !this.store.get(id)) continue;

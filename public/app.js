@@ -2,11 +2,13 @@ import { Terminal } from '/vendor/xterm/lib/xterm.mjs';
 import { FitAddon } from '/vendor/xterm-addon-fit/lib/addon-fit.mjs';
 import { marked } from '/vendor/marked/marked.esm.js';
 import DOMPurify from '/vendor/dompurify/purify.es.mjs';
+import { openStream, post, REMOTE } from '/transport.js';
 
 const $ = (sel) => document.querySelector(sel);
 const agents = new Map();
 // #<id> selects an agent; #<id>/term also opens its terminal.
-const [hashId, hashView] = location.hash.slice(1).split('/');
+const loginHash = location.hash.match(/(?:^#|&)login=([\w-]+)/)?.[1] ?? null;
+const [hashId, hashView] = loginHash ? [null, null] : location.hash.slice(1).split('/');
 let selectedId = hashId || null;
 let openTermOnLoad = hashView === 'term' || hashView === 'shell';
 let filterText = '';
@@ -127,12 +129,32 @@ async function renderDiagrams(root) {
   }
 }
 
+function explainBox(a) {
+  const ex = a.explanation;
+  const label = ex?.pending ? 'Explaining…' : ex?.markdown ? 'Explain again' : 'Explain';
+  const button = `<button class="small ${ex?.markdown ? '' : 'primary'}" data-act="explain" ${ex?.pending ? 'disabled' : ''}
+    title="A plain-language explanation of the intent and the problem / solution, from a separate one-off Claude call (does not interrupt the agent)">${label}</button>`;
+  if (!ex?.markdown && !ex?.error) return { button, box: '' };
+  const stale = ex.markdown && a.brief?.updatedAt && ex.briefUpdatedAt !== a.brief.updatedAt;
+  const box = `<div class="explain">
+      ${ex.error ? `<p class="error">Couldn't explain: ${esc(ex.error)}</p>` : ''}
+      ${ex.markdown
+        ? `${stale ? '<p class="hint">The brief has changed since this explanation; use <b>Explain again</b> to refresh it.</p>' : ''}
+           ${clamp(a, 'explain', md(ex.markdown))}
+           <p class="hint">Explained ${ago(ex.at)}.</p>`
+        : ''}
+    </div>`;
+  return { button, box };
+}
+
 function briefPanel(a) {
   if (a.kind === 'general') return '';
   const b = a.brief;
+  const ex = explainBox(a);
   if (!b) {
     return `<div class="card brief">
-      <h3>Brief</h3>
+      <h3>Brief ${ex.button}</h3>
+      ${ex.box}
       <p class="hint">Problem, solution, diagram and checks appear here once the agent writes its brief.
       ${a.lastStartedAt && !a.runtime.running ? ' Agents started before this feature write one after their next resume.' : ''}</p>
     </div>`;
@@ -143,7 +165,8 @@ function briefPanel(a) {
         .join('')}</ul>`
     : '<p class="hint">No checks yet.</p>';
   return `<div class="card brief">
-    <h3>Brief <span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span></h3>
+    <h3>Brief <span class="brief-actions"><span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span> ${ex.button}</span></h3>
+    ${ex.box}
     <div class="brief-grid">
       <section><h4>Problem</h4>${b.problem ? clamp(a, 'problem', md(b.problem)) : '<p class="hint">—</p>'}</section>
       <section><h4>Solution</h4>${b.solution ? clamp(a, 'solution', md(b.solution)) : '<p class="hint">—</p>'}</section>
@@ -194,10 +217,15 @@ const copyBtn = (value) => `<button class="link" data-copy="${esc(value)}" title
 
 // ------------------------------------------------------------------ list
 
+/** Agents waiting on you first, then running ones, then the rest. */
+const rank = (a) => (a.runtime.attention ? 0 : a.runtime.running ? 1 : 2);
+
 function renderList() {
+  const waiting = [...agents.values()].filter((a) => a.runtime.attention).length;
+  document.title = waiting ? `(${waiting}) Agent Manager` : 'Agent Manager';
   const list = [...agents.values()]
     .filter((a) => !filterText || `${a.name} ${a.intent} ${a.repo ?? ''} ${a.workdir ?? ''} ${a.id}`.toLowerCase().includes(filterText))
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    .sort((a, b) => rank(a) - rank(b) || b.createdAt.localeCompare(a.createdAt));
   $('#empty').hidden = agents.size > 0;
 
   const counts = { running: 0, stopped: 0, other: 0 };
@@ -207,7 +235,8 @@ function renderList() {
     else counts.other++;
   }
   $('#counts').innerHTML = agents.size
-    ? `<span>${agents.size} agents</span><span>${counts.running} running</span><span>${counts.stopped} closed</span>`
+    ? `<span>${agents.size} agents</span><span>${counts.running} running</span><span>${counts.stopped} closed</span>
+       <span class="spacer"></span><button class="link" id="flush-btn" title="Save session IDs, terminal scrollback and state to disk now (also automatic every 30s)">Save now</button>`
     : '';
 
   $('#agent-list').innerHTML = list
@@ -442,7 +471,7 @@ const term = {
   },
 
   send(msg) {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
+    this.conn?.send(msg);
   },
 
   refit() {
@@ -461,7 +490,7 @@ const term = {
     $('#term-wrap').hidden = false;
     $('#detail').classList.add('with-term');
     this.ensure();
-    if (this.agentId === id && this.kind === kind && this.ws) {
+    if (this.agentId === id && this.kind === kind && this.conn) {
       this.xterm.focus();
       return;
     }
@@ -473,19 +502,33 @@ const term = {
     this.syncOverlay();
     requestAnimationFrame(() => this.refit());
 
-    const q = kind === 'shell' ? '?kind=shell' : '';
-    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term/${id}${q}`);
-    this.ws = ws;
-    ws.onopen = () => {
-      this.refit();
-      this.send({ t: 'r', cols: this.xterm.cols, rows: this.xterm.rows });
-    };
-    ws.onmessage = (ev) => {
-      if (this.ws !== ws) return;
-      const msg = JSON.parse(ev.data);
+    const conn = openStream(
+      { agentId: id, kind },
+      {
+        onOpen: () => {
+          this.refit();
+          this.send({ t: 'r', cols: this.xterm.cols, rows: this.xterm.rows });
+        },
+        onMessage: (msg) => this.conn === conn && this.onMessage(msg),
+        onClose: (ev) => {
+          if (this.conn !== conn) return;
+          this.conn = null;
+          if (ev.code === 1008) toast(`Terminal unavailable: ${ev.reason}`, 5000);
+        },
+      },
+    );
+    this.conn = conn;
+  },
+
+  onMessage(msg) {
+    {
       if (msg.t === 'hello') {
+        // Also sent again after a reconnect: start from a clean screen and replay.
+        this.xterm.reset();
         this.xterm.write(msg.backlog);
-        this.xterm.focus();
+        if (!matchMedia('(pointer: coarse)').matches) this.xterm.focus();
+      } else if (msg.t === 'error') {
+        toast(`Terminal unavailable: ${msg.error}`, 5000);
       } else if (msg.t === 'o') {
         this.xterm.write(msg.d);
       } else if (msg.t === 'exit') {
@@ -493,12 +536,7 @@ const term = {
         else this.xterm.write(`\r\n\x1b[2m[claude exited with code ${msg.code}; session kept]\x1b[0m\r\n`);
       }
       this.syncOverlay();
-    };
-    ws.onclose = (ev) => {
-      if (this.ws !== ws) return;
-      this.ws = null;
-      if (ev.code === 1008) toast(`Terminal unavailable: ${ev.reason}`, 5000);
-    };
+    }
   },
 
   syncOverlay() {
@@ -515,8 +553,8 @@ const term = {
   },
 
   disconnect() {
-    this.ws?.close();
-    this.ws = null;
+    this.conn?.close();
+    this.conn = null;
   },
 
   close() {
@@ -558,6 +596,14 @@ function upsert(a) {
   agents.set(a.id, a);
   render();
 }
+
+$('#counts').addEventListener('click', (e) => {
+  if (e.target.id !== 'flush-btn') return;
+  act(async () => {
+    const r = await api('POST', '/flush');
+    toast(`Saved ${r.agents} agents · scrollback for ${r.scrollback}`);
+  });
+});
 
 $('#agent-list').addEventListener('click', (e) => {
   const li = e.target.closest('li[data-id]');
@@ -608,6 +654,11 @@ $('#detail-body').addEventListener('click', async (e) => {
         upsert(await api('POST', `/agents/${a.id}/handoff`));
         term.open(a.id);
       }, 'Moved into the repository');
+      break;
+    case 'explain':
+      btn.disabled = true;
+      btn.textContent = 'Explaining…';
+      act(async () => upsert(await api('POST', `/agents/${a.id}/explain`)));
       break;
     case 'shell':
       term.open(a.id, 'shell');
@@ -753,37 +804,211 @@ $('#ask-form textarea').addEventListener('keydown', (e) => {
 
 // ------------------------------------------------------------------ live updates
 
-function connectEvents() {
-  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/events`);
-  ws.onopen = () => {
-    $('#conn').textContent = 'daemon connected';
-    $('#conn').className = 'conn ok';
-  };
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.t === 'snapshot') {
-      agents.clear();
-      msg.agents.forEach((a) => agents.set(a.id, a));
-      if (selectedId && !agents.has(selectedId)) selectedId = null;
-      if (openTermOnLoad && selectedId) {
-        if (hashView === 'shell') term.open(selectedId, 'shell');
-        else if (agents.get(selectedId).runtime.running) term.open(selectedId);
-      }
-      openTermOnLoad = false;
-    } else if (msg.t === 'agent') {
-      agents.set(msg.agent.id, msg.agent);
-    } else if (msg.t === 'removed') {
-      agents.delete(msg.id);
-      if (selectedId === msg.id) select(null);
+function handleEvent(msg) {
+  if (msg.t === 'snapshot') {
+    agents.clear();
+    msg.agents.forEach((a) => agents.set(a.id, a));
+    if (selectedId && !agents.has(selectedId)) selectedId = null;
+    if (openTermOnLoad && selectedId) {
+      if (hashView === 'shell') term.open(selectedId, 'shell');
+      else if (agents.get(selectedId).runtime.running) term.open(selectedId);
     }
-    render();
-  };
-  ws.onclose = () => {
-    $('#conn').textContent = 'daemon offline, retrying…';
-    $('#conn').className = 'conn bad';
-    setTimeout(connectEvents, 2000);
-  };
+    openTermOnLoad = false;
+  } else if (msg.t === 'agent') {
+    agents.set(msg.agent.id, msg.agent);
+  } else if (msg.t === 'removed') {
+    agents.delete(msg.id);
+    if (selectedId === msg.id) select(null);
+  }
+  render();
 }
 
-connectEvents();
+function connectEvents() {
+  openStream(
+    { events: true },
+    {
+      onOpen: () => {
+        $('#conn').textContent = REMOTE ? 'connected (remote)' : 'daemon connected';
+        $('#conn').className = 'conn ok';
+      },
+      onMessage: handleEvent,
+      onClose: async () => {
+        $('#conn').textContent = 'daemon offline, retrying…';
+        $('#conn').className = 'conn bad';
+        if (REMOTE && !(await sessionOk())) return showLogin();
+        setTimeout(connectEvents, 2000);
+      },
+    },
+  );
+}
+
+// ------------------------------------------------------------------ phone keys and reply box
+
+const KEYS = {
+  esc: '\x1b', tab: '\t', stab: '\x1b[Z', up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D',
+  enter: '\r', ctrlc: '\x03', 1: '1', 2: '2', 3: '3', 4: '4',
+};
+$('#keybar').addEventListener('click', (e) => {
+  const key = e.target.closest('[data-key]')?.dataset.key;
+  if (key) term.send({ t: 'i', d: KEYS[key] });
+});
+// Keep the on-screen keyboard from popping up when tapping keybar buttons.
+$('#keybar').addEventListener('mousedown', (e) => e.preventDefault());
+
+$('#compose').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const box = $('#compose-text');
+  const text = box.value;
+  if (!text.trim()) return;
+  term.send({ t: 'i', d: text });
+  // Enter separately, so Claude reads the text as typed input and then submits it.
+  setTimeout(() => term.send({ t: 'i', d: '\r' }), 150);
+  box.value = '';
+  box.style.height = '';
+});
+$('#compose-text').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    $('#compose').requestSubmit();
+  }
+});
+$('#compose-text').addEventListener('input', (e) => {
+  e.target.style.height = '';
+  e.target.style.height = `${Math.min(e.target.scrollHeight, 140)}px`;
+});
+
+// ------------------------------------------------------------------ remote access (from this computer)
+
+async function renderRemote() {
+  const box = $('#remote-content');
+  let st;
+  try {
+    st = await api('GET', '/remote');
+  } catch (err) {
+    box.textContent = err.message;
+    return;
+  }
+  const phoneUrls = st.urls.filter((u) => !u.vpn);
+  const vpnUrls = st.urls.filter((u) => u.vpn);
+  box.innerHTML = `
+    <p class="remote-state">
+      ${st.enabled && st.running ? `<span class="pill working">on</span> HTTPS on port <b>${st.port}</b>` : '<span class="pill">off</span> Not reachable from other devices.'}
+      <button id="remote-toggle" class="${st.enabled ? '' : 'primary'}">${st.enabled ? 'Turn off' : 'Turn on'}</button>
+    </p>
+    ${st.enabled && st.running
+      ? `${phoneUrls.length
+          ? phoneUrls
+              .map(
+                (u) => `<div class="remote-url">
+                  <div class="qr">${u.qr}</div>
+                  <div>
+                    <div><b>Scan with your phone's camera</b> to open and sign in.</div>
+                    <code>${esc(u.url)}</code> <span class="hint">(${esc(u.iface)})</span>
+                    <div><button class="small" data-copy="${esc(u.loginUrl)}">Copy sign-in link</button></div>
+                  </div>
+                </div>`,
+              )
+              .join('')
+          : '<p class="error">This computer has no network address a phone can reach. Join Wi-Fi or your phone\'s Personal Hotspot.</p>'}
+        ${vpnUrls.length ? `<p class="hint">Over the VPN only (a phone usually can't reach these): ${vpnUrls.map((u) => `<code>${esc(u.url)}</code>`).join(' ')}</p>` : ''}
+        <ul class="remote-notes hint">
+          <li>The phone must be on the <b>same network</b> as this computer: the same Wi-Fi, or this computer joined to the phone's <b>Personal Hotspot</b>. Office Wi-Fi often blocks device-to-device traffic.</li>
+          <li>The first visit warns about the certificate (it's self-signed). Check the fingerprint below, then choose <i>Show Details → visit this website</i> (Safari) or <i>Advanced → Proceed</i> (Chrome).</li>
+          <li>If macOS asks whether <b>node</b> may accept incoming connections, choose Allow.</li>
+        </ul>
+        <p class="hint">Certificate SHA-256: <code class="fp">${esc(st.fingerprint ?? '')}</code></p>
+        <h3>Signed-in devices</h3>
+        ${st.devices.length
+          ? `<table class="devices"><tr><th>Device</th><th>Address</th><th>Last seen</th><th></th></tr>${st.devices
+              .map(
+                (d) => `<tr><td title="${esc(d.ua)}">${esc(deviceName(d.ua))}</td><td>${esc(d.ip ?? '')}</td><td>${ago(d.lastSeen)}</td>
+                  <td><button class="small danger" data-revoke="${esc(d.id)}">Sign out</button></td></tr>`,
+              )
+              .join('')}</table>`
+          : '<p class="hint">None yet.</p>'}
+        <p><button id="remote-rotate" class="danger">New access token</button> <span class="hint">Signs out every device; scan the new QR code to sign in again.</span></p>`
+      : ''}`;
+}
+
+function deviceName(ua = '') {
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Mac OS X/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : 'Device';
+  const browser = /CriOS|Chrome/.test(ua) ? 'Chrome' : /FxiOS|Firefox/.test(ua) ? 'Firefox' : /Safari/.test(ua) ? 'Safari' : '';
+  return [os, browser].filter(Boolean).join(' · ');
+}
+
+$('#remote-btn').onclick = () => {
+  $('#remote-dialog').showModal();
+  renderRemote();
+};
+$('#remote-close').onclick = () => $('#remote-dialog').close();
+$('#remote-content').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  if (btn.dataset.copy) {
+    await navigator.clipboard.writeText(btn.dataset.copy).catch(() => {});
+    return toast('Sign-in link copied. It contains the access token; share it only with your own devices.', 4000);
+  }
+  if (btn.id === 'remote-toggle') {
+    const on = btn.textContent === 'Turn on';
+    await act(() => api('POST', on ? '/remote/enable' : '/remote/disable'), on ? 'Remote access on' : 'Remote access off');
+  } else if (btn.id === 'remote-rotate') {
+    if (!confirm('Create a new access token? Every signed-in device is signed out.')) return;
+    await act(() => api('POST', '/remote/rotate'), 'New token created; all devices signed out');
+  } else if (btn.dataset.revoke) {
+    await act(() => api('DELETE', `/remote/devices/${btn.dataset.revoke}`), 'Device signed out');
+  }
+  renderRemote();
+});
+
+// ------------------------------------------------------------------ remote sign-in
+
+async function sessionOk() {
+  try {
+    return (await (await fetch('/api/session', { credentials: 'same-origin' })).json()).authenticated;
+  } catch {
+    return true; // offline, not signed out: keep retrying
+  }
+}
+
+async function login(token) {
+  const res = await post('/api/login', { token });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+}
+
+function showLogin(message) {
+  const dlg = $('#login-dialog');
+  $('#login-error').hidden = !message;
+  $('#login-error').textContent = message ?? '';
+  if (!dlg.open) dlg.showModal();
+}
+
+$('#login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const token = new FormData(e.target).get('token').trim().replace(/^.*#login=/, '');
+  try {
+    await login(token);
+    $('#login-dialog').close();
+    connectEvents();
+  } catch (err) {
+    showLogin(err.message);
+  }
+});
+
+async function boot() {
+  if (REMOTE) {
+    document.body.classList.add('remote');
+    if (loginHash) {
+      history.replaceState(null, '', location.pathname); // drop the token from the address bar
+      try {
+        await login(loginHash);
+      } catch (err) {
+        return showLogin(err.message);
+      }
+    }
+    if (!(await sessionOk())) return showLogin();
+  }
+  connectEvents();
+}
+
+boot();
 setInterval(renderDetail, 30_000); // keep "x ago" labels fresh
