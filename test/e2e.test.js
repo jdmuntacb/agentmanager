@@ -230,6 +230,54 @@ test("ancillary shell runs in the agent's folder", async () => {
   ws.close();
 });
 
+test('an agent can have several shells at once', async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Many shells', start: false })).body;
+  await waitFor(async () => (await agentNow(a.id)).status === 'stopped');
+  const open = async (kind) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/term/${a.id}?kind=${kind}`);
+    ws.out = '';
+    ws.on('message', (m) => {
+      const msg = JSON.parse(m.toString());
+      if (msg.t === 'o') ws.out += msg.d;
+    });
+    await new Promise((r) => ws.on('open', r));
+    return ws;
+  };
+  const one = await open('shell:1');
+  assert.equal((await call('POST', `/agents/${a.id}/shell/new`)).body.n, 2);
+  const two = await open('shell:2');
+  one.send(JSON.stringify({ t: 'i', d: 'echo "pid=$$"\r' }));
+  two.send(JSON.stringify({ t: 'i', d: 'echo "pid=$$"\r' }));
+  const pid = (ws) => ws.out.match(/pid=(\d+)/)?.[1];
+  await waitFor(() => pid(one) && pid(two), 8000, 'both shells');
+  assert.notEqual(pid(one), pid(two), 'each tab is its own shell');
+  assert.deepEqual((await agentNow(a.id)).runtime.shells, [1, 2]);
+
+  await call('POST', `/agents/${a.id}/shell/drop`, { n: 1 });
+  await waitFor(async () => (await agentNow(a.id)).runtime.shells.join() === '2', 8000, 'shell 1 closed');
+  assert.equal((await call('POST', `/agents/${a.id}/shell/new`)).body.n, 1, 'freed numbers are reused');
+  await call('POST', `/agents/${a.id}/shell/close`);
+  await waitFor(async () => (await agentNow(a.id)).runtime.shell === false);
+  one.close();
+  two.close();
+});
+
+test('attached files are saved under the agent and their path returned', async () => {
+  const [a] = (await call('POST', '/agents', { intent: 'Attach files', start: false })).body;
+  const res = await fetch(`${base}/api/agents/${a.id}/upload?name=${encodeURIComponent('../screen shot.png')}`, {
+    method: 'POST',
+    headers: { 'x-agentmgr': '1', 'content-type': 'application/octet-stream' },
+    body: Buffer.from([137, 80, 78, 71]),
+  });
+  const saved = await res.json();
+  assert.equal(res.status, 200);
+  assert.match(path.basename(saved.path), /-screen_shot\.png$/);
+  assert.ok(saved.path.startsWith(path.join(home, 'uploads', a.id) + path.sep), 'stays inside the uploads folder');
+  assert.deepEqual([...fs.readFileSync(saved.path)], [137, 80, 78, 71]);
+  const empty = await fetch(`${base}/api/agents/${a.id}/upload?name=x`, { method: 'POST', headers: { 'x-agentmgr': '1' } });
+  assert.equal(empty.status, 400);
+});
+
 test('daemon restart resumes running agents, not ones the user closed', async () => {
   const { AgentManager } = await import('../src/manager.js');
   const { Store } = await import('../src/store.js');
@@ -537,7 +585,11 @@ test('task agents keep a brief and are told to follow skills and hooks; general 
   assert.match(sys, /## References[\s\S]*PRD and Tech Spec/);
   // Results: the agent's own outcome + blockers, plus tracked facts (its failing check).
   assert.equal(withBrief.results.outcome, 'blocked');
-  assert.deepEqual(withBrief.results.delivered.map((d) => d.text), ['Root cause found in `auth/session.go`']);
+  const delivered = (source) => withBrief.results.delivered.filter((d) => d.source === source);
+  assert.deepEqual(delivered('agent').map((d) => d.text), ['Root cause found in `auth/session.go`']);
+  // The fake session links PR #7; once tracked it is listed as delivered too, never twice.
+  assert.ok(delivered('tracked').every((d) => d.url === 'https://github.com/example/repo/pull/7'));
+  assert.ok(delivered('tracked').length <= 1);
   assert.deepEqual(withBrief.results.blockers.map((b) => [b.text, b.source]), [
     ['staging credentials (needs: platform team)', 'agent'],
     ['Failing check: e2e login suite', 'checks'],

@@ -49,14 +49,18 @@
           <div class="term-bar">
             <div class="term-tabs" role="tablist">
               <button class="term-tab" data-kind="claude" role="tab">Claude</button>
-              <button class="term-tab" data-kind="shell" role="tab" title="A shell in the agent's folder">Shell</button>
+              <span id="shell-tabs" class="term-tabs"></span>
+              <button class="term-tab term-add" id="shell-new" title="Open another shell in the agent's folder">+ Shell</button>
             </div>
             <span id="term-title"></span>
             <span class="spacer"></span>
+            <button id="term-attach" class="ghost small" title="Attach files or images (you can also drop or paste them into the terminal)">📎 Attach</button>
+            <input type="file" id="term-file" multiple hidden>
             <button id="term-fit" class="ghost small" title="Refit the terminal to the panel">Fit</button>
             <button id="term-close" class="ghost small" title="Hide the terminal (the agent keeps running)">Hide terminal</button>
           </div>
           <div id="terminal" class="terminal"></div>
+          <div id="term-drop" class="term-drop" hidden>Drop files to attach</div>
           <div class="keybar" id="keybar" aria-label="Terminal keys">
             <button data-key="esc">Esc</button>
             <button data-key="tab">Tab</button>

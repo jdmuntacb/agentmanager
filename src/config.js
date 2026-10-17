@@ -22,6 +22,8 @@ export const paths = {
   briefs: path.join(HOME, 'briefs'),
   // Saved terminal output, restored into an agent's terminal after a daemon restart.
   scrollback: path.join(HOME, 'scrollback'),
+  // Files attached from the UI (dropped or pasted into a terminal), per agent.
+  uploads: path.join(HOME, 'uploads'),
 };
 
 const DEFAULTS = {

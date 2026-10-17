@@ -279,11 +279,18 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 13px; }
 .term-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #161a22; color: #c9d1d9; font-size: 12.5px; }
 .term-bar button { color: #c9d1d9; border-color: #30363d; }
 .spacer { flex: 1; }
-.term-tabs { display: flex; gap: 2px; }
+.term-tabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; }
+#shell-tabs { display: contents; }
 .term-tab { background: transparent; border: 1px solid transparent; padding: 3px 10px; font-size: 12px; }
 .term-tab.active { background: #262c38; border-color: #30363d; }
+.term-tab .x { margin-left: 6px; opacity: .55; padding: 0 2px; border-radius: 3px; }
+.term-tab .x:hover { opacity: 1; background: #3a4150; }
+.term-add { opacity: .7; }
+.term-drop { position: absolute; inset: 40px 8px 8px; display: flex; align-items: center; justify-content: center; border: 2px dashed #58a6ff; border-radius: 8px; background: rgba(15, 17, 23, .82); color: #c9d1d9; font-size: 15px; pointer-events: none; z-index: 5; }
 #term-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; color: #8b93a7; }
 .terminal { flex: 1; padding: 6px 8px; min-height: 0; }
+/* Swipes scroll the terminal (handled in app.js), not the page. */
+.terminal .xterm { touch-action: none; }
 .term-overlay {
   position: absolute; inset: 36px 0 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 8px; background: rgba(15, 17, 23, .78); color: #e5e8ef;

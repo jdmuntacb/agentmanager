@@ -30,7 +30,8 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Tokens and cost.** Input, output and cache tokens are tracked per session, subagents included, alongside the cost Claude Code reports.
 - **No trust prompt.** Folders agents run in are pre-trusted, so Claude's "trust this folder" prompt doesn't block them.
 - **Survives restarts and reboots.** Agents that were running when the daemon stopped (restart, crash or reboot) are resumed with the same session IDs when it starts again. `agentmgr service install` starts the daemon at login.
-- **Shell next to each agent.** **Open shell** gives a second terminal in the agent's folder for running commands by hand.
+- **Shells next to each agent.** **Open shell** gives a terminal in the agent's folder for running commands by hand. **+ Shell** opens as many more as you need, each in its own tab.
+- **Attach files and screenshots.** Drop files on the terminal, paste a screenshot, or use **📎 Attach**. The file is saved on the daemon's machine and its path is pasted into the terminal, which is how Claude Code picks up images and files.
 - **General sessions.** **Ask Claude** starts a session with no repo, folder or intent, for questions. It is tracked and resumable like any other agent.
 
 ## Install
@@ -60,7 +61,7 @@ agentmgr add @cc "Fix the flaky test"         # use a project shortcut instead o
 agentmgr project ls | add | rename | base | rm  # manage project shortcuts
 agentmgr show <agent>                         # everything tracked for one agent
 agentmgr attach <agent>                       # live terminal here; Ctrl-] detaches (resumes a closed agent)
-agentmgr shell <agent>                        # a shell in the agent's folder; Ctrl-] detaches
+agentmgr shell <agent> [-n 2]                 # a shell in the agent's folder (-n picks another one); Ctrl-] detaches
 agentmgr brief <agent>                        # print the agent's brief (Markdown)
 agentmgr priority <agent> P0                  # P0 urgent, P1 high, P2 normal (default), P3 low
 agentmgr doc <agent> proposal -o p.md         # analysis | design | flow | proposal, for stakeholders
@@ -418,7 +419,7 @@ Usage comes from the session transcripts and is refreshed every few seconds whil
 
 ## Shell and general sessions
 
-- **Open shell** (or `agentmgr shell <agent>`) starts `$SHELL -l` in the agent's working folder. It shows as a **Shell** tab next to the **Claude** tab in the terminal pane. It lives as long as the daemon and doesn't start Claude.
+- **Open shell** (or `agentmgr shell <agent>`) starts `$SHELL -l` in the agent's working folder. It shows as a **Shell 1** tab next to the **Claude** tab in the terminal pane; **+ Shell** (or `agentmgr shell <agent> -n 2`) opens more, and **×** on a tab closes that shell. Shells live as long as the daemon and don't start Claude.
 - **Ask Claude** (or `agentmgr ask`) creates a `general` agent. All general sessions share `~/.agentmanager/general`, so Claude's folder-trust prompt only appears the first time.
 
 ## Configuration

@@ -14,10 +14,16 @@ let showCompleted = false;
 const loginHash = location.hash.match(/(?:^#|&)login=([\w-]+)/)?.[1] ?? null;
 const [hashId, hashView] = loginHash ? [null, null] : location.hash.slice(1).split('/');
 let selectedId = hashId || null;
-let openTermOnLoad = hashView === 'term' || hashView === 'shell';
+let openTermOnLoad = hashView === 'term' || isShell(hashView);
 let filterText = '';
 
 // ------------------------------------------------------------------ helpers
+
+// Terminal kinds: 'claude' (the agent's session) or 'shell:N' (shell N in its folder).
+function isShell(kind) {
+  return /^shell(:\d+)?$/.test(kind ?? '');
+}
+const shellNum = (kind) => Number((kind ?? '').split(':')[1] || 1);
 
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
@@ -851,6 +857,79 @@ function select(id) {
 
 // ------------------------------------------------------------------ terminal
 
+/**
+ * Swipe to scroll on phones and tablets: xterm.js doesn't scroll on touch. In the normal
+ * buffer this moves through the scrollback; in the alternate screen (full-screen apps) it
+ * sends wheel events so the app scrolls itself. A flick keeps scrolling and slows down.
+ */
+function touchScroll(el, xterm) {
+  let lastY = null;
+  let lastT = 0;
+  let carry = 0; // fraction of a line not scrolled yet
+  let velocity = 0; // px per ms
+  let glide = 0;
+  const lineHeight = () => el.querySelector('.xterm-screen')?.clientHeight / xterm.rows || 17;
+  const scrollPx = (dy) => {
+    carry += dy / lineHeight();
+    const lines = Math.trunc(carry);
+    if (!lines) return;
+    carry -= lines;
+    if (xterm.buffer.active.type === 'normal') {
+      xterm.scrollLines(lines);
+    } else {
+      const target = el.querySelector('.xterm-screen');
+      const r = target.getBoundingClientRect();
+      for (let i = 0; i < Math.abs(lines); i++) {
+        target.dispatchEvent(
+          new WheelEvent('wheel', { deltaY: Math.sign(lines) * lineHeight(), deltaMode: 0, clientX: r.left + 10, clientY: r.top + 10, bubbles: true, cancelable: true }),
+        );
+      }
+    }
+  };
+  el.addEventListener(
+    'touchstart',
+    (e) => {
+      cancelAnimationFrame(glide);
+      if (e.touches.length !== 1) return (lastY = null);
+      lastY = e.touches[0].clientY;
+      lastT = e.timeStamp;
+      velocity = 0;
+      carry = 0;
+    },
+    { passive: true },
+  );
+  el.addEventListener(
+    'touchmove',
+    (e) => {
+      if (lastY === null || e.touches.length !== 1) return;
+      const y = e.touches[0].clientY;
+      const dy = lastY - y; // finger up = later content
+      const dt = Math.max(1, e.timeStamp - lastT);
+      velocity = 0.8 * (dy / dt) + 0.2 * velocity;
+      lastY = y;
+      lastT = e.timeStamp;
+      e.preventDefault();
+      scrollPx(dy);
+    },
+    { passive: false },
+  );
+  el.addEventListener('touchend', (e) => {
+    if (lastY === null) return;
+    lastY = null;
+    if (e.timeStamp - lastT > 80 || Math.abs(velocity) < 0.2) return; // finger paused: no flick
+    let prev = performance.now();
+    const step = (now) => {
+      const dt = now - prev;
+      prev = now;
+      velocity *= Math.pow(0.995, dt);
+      if (Math.abs(velocity) < 0.03) return;
+      scrollPx(velocity * dt);
+      glide = requestAnimationFrame(step);
+    };
+    glide = requestAnimationFrame(step);
+  });
+}
+
 const term = {
   agentId: null,
   ws: null,
@@ -873,6 +952,7 @@ const term = {
     this.xterm.onData((d) => this.send({ t: 'i', d }));
     this.xterm.onResize(({ cols, rows }) => this.send({ t: 'r', cols, rows }));
     new ResizeObserver(() => this.refit()).observe($('#terminal'));
+    touchScroll($('#terminal'), this.xterm);
   },
 
   send(msg) {
@@ -886,12 +966,12 @@ const term = {
     } catch {}
   },
 
-  kind: 'claude', // 'claude' = the agent's session, 'shell' = ancillary shell in its folder
+  kind: 'claude', // 'claude' = the agent's session, 'shell:N' = shell N in its folder
   shellExited: false,
 
   open(id, kind = 'claude') {
-    const a = agents.get(id);
-    history.replaceState(null, '', `#${id}/${kind === 'shell' ? 'shell' : 'term'}`);
+    if (isShell(kind)) kind = `shell:${shellNum(kind)}`;
+    history.replaceState(null, '', `#${id}/${isShell(kind) ? kind : 'term'}`);
     $('#term-wrap').hidden = false;
     $('#detail').classList.add('with-term');
     this.ensure();
@@ -937,7 +1017,7 @@ const term = {
       } else if (msg.t === 'o') {
         this.xterm.write(msg.d);
       } else if (msg.t === 'exit') {
-        if (this.kind === 'shell') this.shellExited = true;
+        if (isShell(this.kind)) this.shellExited = true;
         else this.xterm.write(`\r\n\x1b[2m[claude exited with code ${msg.code}; session kept]\x1b[0m\r\n`);
       }
       this.syncOverlay();
@@ -946,15 +1026,56 @@ const term = {
 
   syncOverlay() {
     const a = this.agentId && agents.get(this.agentId);
-    const shell = this.kind === 'shell';
+    const shell = isShell(this.kind);
     const closed = shell ? this.shellExited : a && !a.runtime.running && a.status !== 'preparing';
     $('#term-overlay').hidden = !a || !closed;
     $('#term-overlay-msg').textContent = shell ? 'The shell has exited.' : "This agent's session is closed.";
     $('#term-resume').textContent = shell ? 'Start a new shell' : 'Resume session';
-    for (const tab of document.querySelectorAll('.term-tab')) tab.classList.toggle('active', tab.dataset.kind === this.kind);
+    this.renderTabs();
     if (a) {
-      $('#term-title').textContent = shell ? `shell · ${a.workdir}` : `${a.name} · session ${a.sessionId}`;
+      $('#term-title').textContent = shell ? `shell ${shellNum(this.kind)} · ${a.workdir}` : `${a.name} · session ${a.sessionId}`;
     }
+  },
+
+  /** One tab per running shell, plus the one being viewed even if it has exited. */
+  renderTabs() {
+    const a = this.agentId && agents.get(this.agentId);
+    const nums = new Set(a?.runtime.shells ?? []);
+    if (isShell(this.kind)) nums.add(shellNum(this.kind));
+    $('#shell-tabs').innerHTML = [...nums]
+      .sort((x, y) => x - y)
+      .map((n) => `<button class="term-tab" data-kind="shell:${n}" role="tab" title="Shell ${n} in the agent's folder">Shell ${n}<span class="x" data-close="${n}" title="Close this shell">×</span></button>`)
+      .join('');
+    for (const tab of document.querySelectorAll('.term-tab[data-kind]')) tab.classList.toggle('active', tab.dataset.kind === this.kind);
+    $('#shell-new').disabled = !a?.workdir || a.status === 'preparing';
+  },
+
+  /** Upload files to the daemon and paste their paths, the way a native terminal pastes a dropped file. */
+  async attachFiles(files) {
+    const id = this.agentId;
+    if (!id || !files.length) return;
+    const saved = [];
+    for (const file of files) {
+      const name = file.name || `pasted-${Date.now()}.${(file.type.split('/')[1] || 'bin').replace(/\W/g, '')}`;
+      try {
+        const res = await fetch(`/api/agents/${id}/upload?name=${encodeURIComponent(name)}`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/octet-stream', 'x-agentmgr': '1' },
+          body: file,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        saved.push(data.path);
+      } catch (err) {
+        toast(`Could not attach ${name}: ${err.message}`, 5000);
+      }
+    }
+    if (!saved.length || this.agentId !== id) return;
+    // Backslash-escape like a terminal drop, so Claude Code (and shells) read each as one path.
+    this.xterm.paste(saved.map((p) => p.replace(/([\s'"\\()&;|<>$`!*?[\]{}#~])/g, '\\$1')).join(' ') + ' ');
+    this.xterm.focus();
+    toast(saved.length === 1 ? 'Attached 1 file' : `Attached ${saved.length} files`);
   },
 
   disconnect() {
@@ -975,24 +1096,91 @@ $('#term-close').onclick = () => term.close();
 $('#term-fit').onclick = () => term.refit();
 $('#term-resume').onclick = () => {
   const id = term.agentId;
-  if (term.kind === 'shell') {
+  if (isShell(term.kind)) {
     term.disconnect();
-    return term.open(id, 'shell');
+    return term.open(id, term.kind);
   }
   act(async () => {
     upsert(await api('POST', `/agents/${id}/start`, {}));
     term.xterm.focus();
   });
 };
-for (const tab of document.querySelectorAll('.term-tab')) {
-  tab.onclick = async () => {
-    const id = term.agentId;
-    const a = agents.get(id);
-    if (tab.dataset.kind === 'claude' && a && !a.runtime.running) {
-      await act(async () => upsert(await api('POST', `/agents/${id}/start`, {})));
+$('.term-tabs').addEventListener('click', async (e) => {
+  const id = term.agentId;
+  if (!id) return;
+  const close = e.target.closest('[data-close]');
+  if (close) {
+    e.stopPropagation();
+    const n = Number(close.dataset.close);
+    const viewing = term.kind === `shell:${n}`;
+    await act(async () => {
+      await api('POST', `/agents/${id}/shell/drop`, { n });
+      if (viewing) {
+        const rest = (agents.get(id)?.runtime.shells ?? []).filter((x) => x !== n);
+        term.kind = null; // force a reconnect
+        term.open(id, rest.length ? `shell:${rest[0]}` : 'claude');
+      } else term.renderTabs();
+    });
+    return;
+  }
+  if (e.target.closest('#shell-new')) {
+    return act(async () => term.open(id, `shell:${(await api('POST', `/agents/${id}/shell/new`)).n}`));
+  }
+  const tab = e.target.closest('.term-tab[data-kind]');
+  if (!tab) return;
+  const a = agents.get(id);
+  if (tab.dataset.kind === 'claude' && a && !a.runtime.running) {
+    await act(async () => upsert(await api('POST', `/agents/${id}/start`, {})));
+  }
+  term.open(id, tab.dataset.kind);
+});
+
+// Attachments: the 📎 button, dropping files on the terminal, or pasting a file / screenshot.
+$('#term-attach').onclick = () => $('#term-file').click();
+$('#term-file').onchange = (e) => {
+  term.attachFiles([...e.target.files]);
+  e.target.value = '';
+};
+{
+  const wrap = $('#term-wrap');
+  let depth = 0;
+  const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files');
+  wrap.addEventListener('dragenter', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth++;
+    $('#term-drop').hidden = false;
+  });
+  wrap.addEventListener('dragover', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  wrap.addEventListener('dragleave', () => {
+    if (--depth <= 0) {
+      depth = 0;
+      $('#term-drop').hidden = true;
     }
-    term.open(id, tab.dataset.kind);
-  };
+  });
+  wrap.addEventListener('drop', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    $('#term-drop').hidden = true;
+    term.attachFiles([...e.dataTransfer.files]);
+  });
+  // Capture phase, so it runs before xterm turns the paste into (empty) text.
+  $('#terminal').addEventListener(
+    'paste',
+    (e) => {
+      const files = [...(e.clipboardData?.files ?? [])];
+      if (!files.length) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      term.attachFiles(files);
+    },
+    true,
+  );
 }
 
 // ------------------------------------------------------------------ events
@@ -1000,6 +1188,7 @@ for (const tab of document.querySelectorAll('.term-tab')) {
 function upsert(a) {
   agents.set(a.id, a);
   render();
+  if (a.id === term.agentId) term.renderTabs();
 }
 
 $('#counts').addEventListener('click', (e) => {
@@ -1112,7 +1301,7 @@ $('#detail-body').addEventListener('click', async (e) => {
       act(async () => upsert(await api('POST', `/agents/${a.id}/explain`)));
       break;
     case 'shell':
-      term.open(a.id, 'shell');
+      term.open(a.id, 'shell:1');
       break;
     case 'start':
       act(
@@ -1312,13 +1501,14 @@ function handleEvent(msg) {
     msg.agents.forEach(watchDocs);
     if (selectedId && !agents.has(selectedId)) selectedId = null;
     if (openTermOnLoad && selectedId) {
-      if (hashView === 'shell') term.open(selectedId, 'shell');
+      if (isShell(hashView)) term.open(selectedId, hashView);
       else if (agents.get(selectedId).runtime.running) term.open(selectedId);
     }
     openTermOnLoad = false;
   } else if (msg.t === 'agent') {
     agents.set(msg.agent.id, msg.agent);
     watchDocs(msg.agent);
+    if (msg.agent.id === term.agentId) term.renderTabs();
   } else if (msg.t === 'removed') {
     agents.delete(msg.id);
     if (selectedId === msg.id) select(null);

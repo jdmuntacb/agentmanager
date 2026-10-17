@@ -19,7 +19,7 @@ export const post = (url, body) =>
  */
 export function openStream({ events = false, agentId, kind = 'claude' }, h) {
   if (!REMOTE) {
-    const path = events ? '/ws/events' : `/ws/term/${agentId}${kind === 'shell' ? '?kind=shell' : ''}`;
+    const path = events ? '/ws/events' : `/ws/term/${agentId}${kind === 'claude' ? '' : `?kind=${encodeURIComponent(kind)}`}`;
     const ws = new WebSocket(`ws://${location.host}${path}`);
     ws.onopen = () => h.onOpen?.();
     ws.onmessage = (ev) => h.onMessage(JSON.parse(ev.data));
@@ -30,7 +30,7 @@ export function openStream({ events = false, agentId, kind = 'claude' }, h) {
     };
   }
 
-  const url = events ? '/api/events/stream' : `/api/agents/${agentId}/term/stream?kind=${kind}`;
+  const url = events ? '/api/events/stream' : `/api/agents/${agentId}/term/stream?kind=${encodeURIComponent(kind)}`;
   const es = new EventSource(url);
   let closed = false;
   es.onopen = () => h.onOpen?.();

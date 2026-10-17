@@ -89,6 +89,12 @@ const handoffMessage = (agent) =>
  * (URL or the clone's origin remote, so a URL and a local clone of the same repo
  * group together), else the folder's name.
  */
+/** Shell number for a terminal kind ('shell' -> 1, 'shell:3' -> 3), or 0 for Claude's own terminal. */
+export function shellNumber(kind) {
+  const m = /^shell(?::(\d{1,3}))?$/.exec(kind ?? '');
+  return m ? Math.max(1, Number(m[1] ?? 1)) : 0;
+}
+
 export function projectOf(agent) {
   if (agent.project) return { key: `custom:${agent.project.toLowerCase()}`, name: agent.project, source: 'custom' };
   if (agent.kind === 'general') return { key: 'general', name: 'General', source: 'general' };
@@ -240,7 +246,8 @@ export class AgentManager extends EventEmitter {
         planning: Boolean(rt?.pty && rt.planning),
         attention: (rt?.pty && !rt.busy && rt.attention) || null,
         clients: rt?.clients.size ?? 0,
-        shell: Boolean(this.shells.get(agent.id)?.pty),
+        shell: this.shellNumbers(agent.id).length > 0,
+        shells: this.shellNumbers(agent.id),
         lastOutputAt: rt?.lastOutputAt ? new Date(rt.lastOutputAt).toISOString() : null,
       },
     };
@@ -1024,7 +1031,8 @@ export class AgentManager extends EventEmitter {
     this.closeShell(agent.id);
     fs.rmSync(briefDir(agent.id), { recursive: true, force: true });
     fs.rmSync(scrollbackFile(agent.id), { force: true });
-    for (const client of this.shells.get(agent.id)?.clients ?? []) client.close?.();
+    fs.rmSync(path.join(paths.uploads, agent.id), { recursive: true, force: true });
+    for (const rt of this.shells.get(agent.id)?.values() ?? []) for (const client of rt.clients) client.close?.();
     this.shells.delete(agent.id);
     for (const key of this.cursors.keys()) {
       if (agent.sessions.some((s) => key.startsWith(`${s.id}:`) || key.includes(`/${s.id}/subagents/`))) {
@@ -1086,12 +1094,18 @@ export class AgentManager extends EventEmitter {
     };
   }
 
+  /** The runtime behind a terminal kind: 'claude', or 'shell' / 'shell:N' for shell N (default 1). */
+  termRuntime(id, kind) {
+    const n = shellNumber(kind);
+    return n ? this.shells.get(id)?.get(n) : this.runtimes.get(id);
+  }
+
   write(id, data, kind = 'claude') {
-    (kind === 'shell' ? this.shells : this.runtimes).get(id)?.pty?.write(data);
+    this.termRuntime(id, kind)?.pty?.write(data);
   }
 
   resize(id, cols, rows, kind = 'claude') {
-    const rt = (kind === 'shell' ? this.shells : this.runtimes).get(id);
+    const rt = this.termRuntime(id, kind);
     if (!rt || !(cols > 0 && rows > 0)) return;
     rt.cols = cols;
     rt.rows = rows;
@@ -1100,12 +1114,25 @@ export class AgentManager extends EventEmitter {
     } catch {}
   }
 
-  // ------------------------------------------------------- ancillary shell
+  // ------------------------------------------------------- ancillary shells
 
-  /** Start (if needed) a login shell in the agent's folder, for running commands by hand. */
-  openShell(ref) {
+  /** The agent's shells (number -> runtime), created on first use. */
+  shellsOf(agentId) {
+    let m = this.shells.get(agentId);
+    if (!m) this.shells.set(agentId, (m = new Map()));
+    return m;
+  }
+
+  /** Numbers of the agent's shells that are running, ascending. */
+  shellNumbers(agentId) {
+    return [...(this.shells.get(agentId)?.entries() ?? [])].filter(([, rt]) => rt.pty).map(([n]) => n).sort((a, b) => a - b);
+  }
+
+  /** Start (if needed) login shell number `n` in the agent's folder, for running commands by hand. */
+  openShell(ref, n = 1) {
     const agent = this.mustGet(ref);
-    const prev = this.shells.get(agent.id);
+    const shells = this.shellsOf(agent.id);
+    const prev = shells.get(n);
     if (prev?.pty) return prev;
     if (!agent.workdir || !fs.existsSync(agent.workdir)) {
       throw Object.assign(new Error('The working folder is not ready yet'), { status: 409 });
@@ -1127,7 +1154,7 @@ export class AgentManager extends EventEmitter {
       env: this.childEnv(agent),
     });
     rt.pty = proc;
-    this.shells.set(agent.id, rt);
+    shells.set(n, rt);
     proc.onData((data) => {
       this.appendOutput(rt, data);
       this.broadcast(rt, { t: 'o', d: data });
@@ -1142,9 +1169,17 @@ export class AgentManager extends EventEmitter {
     return rt;
   }
 
-  attachShell(ref, client) {
+  /** Lowest shell number the agent isn't using. */
+  nextShellNumber(agentId) {
+    const used = new Set(this.shellNumbers(agentId));
+    let n = 1;
+    while (used.has(n)) n++;
+    return n;
+  }
+
+  attachShell(ref, client, n = 1) {
     const agent = this.mustGet(ref);
-    const rt = this.openShell(agent.id);
+    const rt = this.openShell(agent.id, n);
     rt.clients.add(client);
     return {
       backlog: rt.chunks.join(''),
@@ -1153,10 +1188,36 @@ export class AgentManager extends EventEmitter {
     };
   }
 
-  closeShell(ref) {
-    const rt = this.shells.get(this.store.resolve(ref)?.id ?? ref);
-    rt?.pty?.kill('SIGHUP');
+  /** Close one shell, or all of the agent's shells when `n` is omitted. */
+  closeShell(ref, n) {
+    const id = this.store.resolve(ref)?.id ?? ref;
+    for (const [num, rt] of this.shells.get(id) ?? []) {
+      if (n === undefined || num === n) rt.pty?.kill('SIGHUP');
+    }
     return { ok: true };
+  }
+
+  /** Forget a closed shell's scrollback so its tab goes away. */
+  dropShell(ref, n) {
+    const id = this.store.resolve(ref)?.id ?? ref;
+    const rt = this.shells.get(id)?.get(n);
+    if (rt?.pty) rt.pty.kill('SIGHUP');
+    for (const client of rt?.clients ?? []) client.close?.();
+    this.shells.get(id)?.delete(n);
+    const a = this.store.get(id);
+    if (a) this.changed(a);
+    return { ok: true };
+  }
+
+  /** Save a file the user attached in the UI, so its path can be handed to Claude. */
+  saveUpload(ref, name, data) {
+    const agent = this.mustGet(ref);
+    const safe = path.basename(String(name || 'file')).replace(/[^\w.@+-]+/g, '_').slice(-120) || 'file';
+    const dir = path.join(paths.uploads, agent.id);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${safe}`);
+    fs.writeFileSync(file, data);
+    return { path: file, size: data.length };
   }
 
   // --------------------------------------------------------------- tracking

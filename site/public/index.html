@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Manager</title>
+<meta name="description" content="Run one background Claude Code agent per intent, and keep track of them from a web UI or the agentmgr CLI.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23d97757'/><path d='M9 11l6 5-6 5M17 22h7' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #faf9f6; --surface: #ffffff; --ink: #1c1b19; --muted: #6b6860; --line: #e7e4dc;
+    --accent: #d97757; --accent-ink: #ffffff; --term: #1c1b19; --term-ink: #e9e6de; --term-dim: #8f8b80;
+    --ok: #3f9b5c; --warn: #c9962b; --bad: #c4513f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141412; --surface: #1d1c1a; --ink: #edeae2; --muted: #a29e93; --line: #2f2d29; --term: #0e0e0d; }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 Inter, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: inherit; }
+  code, pre, .mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; text-decoration: none; }
+  .brand svg { width: 28px; height: 28px; }
+  nav .links { display: flex; gap: 22px; font-size: 14px; color: var(--muted); }
+  nav .links a { text-decoration: none; } nav .links a:hover { color: var(--ink); }
+
+  .hero { display: grid; grid-template-columns: 1fr 1.05fr; gap: 48px; align-items: center; padding: 56px 0 72px; }
+  .eyebrow { display: inline-block; font-size: 13px; color: var(--accent); font-weight: 600; letter-spacing: .02em; margin-bottom: 14px; }
+  h1 { font-size: clamp(36px, 5vw, 56px); line-height: 1.05; letter-spacing: -0.03em; margin: 0 0 18px; }
+  .lede { font-size: 18px; color: var(--muted); margin: 0 0 28px; max-width: 34em; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 18px; border-radius: 10px; font-weight: 600; font-size: 15px; text-decoration: none; border: 1px solid var(--line); background: var(--surface); }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .btn:hover { filter: brightness(1.05); }
+
+  .term { background: var(--term); color: var(--term-ink); border-radius: 14px; overflow: hidden; box-shadow: 0 30px 60px -30px rgba(0,0,0,.45); font-size: 13px; }
+  .term .bar { display: flex; gap: 7px; padding: 12px 14px; border-bottom: 1px solid #2a2926; }
+  .term .bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a3833; }
+  .term pre { margin: 0; padding: 18px 20px 22px; line-height: 1.7; overflow-x: auto; }
+  .d { color: var(--term-dim); } .a { color: var(--accent); } .g { color: #7cc792; } .y { color: #e5c06b; } .r { color: #e88a7a; }
+
+  section { padding: 64px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 30px; letter-spacing: -0.02em; margin: 0 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 36px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+  .card h3 { margin: 0 0 6px; font-size: 16px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+  .card .ic { font-size: 20px; margin-bottom: 10px; display: block; }
+
+  .dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 28px; }
+  .dl a { text-decoration: none; }
+  .dl .card { transition: border-color .15s; height: 100%; }
+  .dl .card:hover { border-color: var(--accent); }
+  .dl .card.rec { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+  .dl .plat { font-weight: 600; font-size: 17px; }
+  .dl .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .tag { display: inline-block; font-size: 11px; font-weight: 600; color: var(--accent); margin-left: 6px; text-transform: uppercase; letter-spacing: .05em; }
+
+  .copy { display: flex; align-items: center; gap: 10px; background: var(--term); color: var(--term-ink); border-radius: 10px; padding: 14px 16px; font-size: 14px; }
+  .copy code { flex: 1; overflow-x: auto; white-space: nowrap; }
+  .copy button { background: #2e2c28; color: var(--term-ink); border: 0; border-radius: 7px; padding: 6px 12px; font: 600 12px Inter, sans-serif; cursor: pointer; }
+  .steps { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; margin-top: 28px; }
+  .steps h3 { font-size: 15px; margin: 0 0 8px; }
+  .steps pre { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 0; font-size: 13px; overflow-x: auto; }
+  .note { color: var(--muted); font-size: 14px; margin-top: 22px; }
+  .note code { font-size: 12.5px; background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 5px; }
+
+  footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--muted); font-size: 14px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+
+  @media (max-width: 860px) {
+    .hero, .steps { grid-template-columns: 1fr; gap: 32px; }
+    .grid, .dl { grid-template-columns: 1fr; }
+    nav .links { display: none; }
+    .hero { padding-top: 24px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="#">
+      <svg viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#d97757"/><path d="M9 11l6 5-6 5M17 22h7" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Agent Manager
+    </a>
+    <div class="links"><a href="#features">Features</a><a href="#download">Download</a><a href="#start">Get started</a></div>
+  </nav>
+
+  <header class="hero">
+    <div>
+      <span class="eyebrow">For Claude Code</span>
+      <h1>One intent in.<br>One agent out.</h1>
+      <p class="lede">Run a background Claude Code agent per task, each in its own worktree and branch, and keep track of all of them from a web UI, your phone, or the <code>agentmgr</code> CLI.</p>
+      <div class="cta">
+        <a class="btn primary" href="#download" id="hero-dl">Download</a>
+        <a class="btn" href="#start">Get started</a>
+      </div>
+    </div>
+    <div class="term" aria-label="Example agentmgr session">
+      <div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="d">$</span> agentmgr add @cc "Fix flaky login test" "Add CSV export"
+<span class="g">✓</span> spawned <span class="a">cc-1</span>  worktree cc-1  branch am/fix-flaky-login
+<span class="g">✓</span> spawned <span class="a">cc-2</span>  worktree cc-2  branch am/add-csv-export
+
+<span class="d">$</span> agentmgr ls
+<span class="d">couchbase-cloud (cc) · 3 agents</span>
+  <span class="r">P0</span> cc-1  ✅ done         PR #412  checks <span class="g">4/4</span>
+  <span class="y">P1</span> cc-2  🔄 in progress  +184 −22  checks <span class="y">2/5</span>
+  <span class="d">P2</span> cc-3  ⛔ blocked      needs input
+
+<span class="d">$</span> agentmgr attach cc-3   <span class="d"># Ctrl-] detaches</span></pre>
+    </div>
+  </header>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <h2>Keep many agents in flight</h2>
+    <p class="sub">Agent Manager handles setup, tracking and state, so you only step in where you're needed.</p>
+    <div class="grid">
+      <div class="card"><span class="ic">🌿</span><h3>Worktree per agent</h3><p>Give a git URL or a folder. Each agent gets its own worktree and branch. Partial clones keep big repos fast.</p></div>
+      <div class="card"><span class="ic">🖥️</span><h3>Background terminals</h3><p>Agents run in the daemon's PTYs. Open a live terminal in the browser or attach from your shell, then walk away.</p></div>
+      <div class="card"><span class="ic">🔁</span><h3>Sessions that resume</h3><p>Every agent keeps its session IDs. Close it, reboot, come back: <code>claude --resume</code> picks up where it left off.</p></div>
+      <div class="card"><span class="ic">📋</span><h3>A brief for each agent</h3><p>Problem, solution, a Mermaid flow diagram and checks, plus PRs, bugs, diff stats, tokens and cost.</p></div>
+      <div class="card"><span class="ic">📥</span><h3>Backlog</h3><p>Queue work orders. Agents pick them up one at a time, up to N in parallel per project. You accept or reopen each one.</p></div>
+      <div class="card"><span class="ic">📱</span><h3>From your phone</h3><p>HTTPS on your local network with QR sign-in. Answer Claude's prompts from anywhere in the house. Slack alerts too.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <div class="wrap">
+    <h2>Download</h2>
+    <p class="sub">Self-contained bundles: Node.js and all dependencies included. <span id="ver"></span></p>
+    <div class="dl">
+      <a href="/downloads/agentmanager-darwin-arm64.tar.gz" data-t="darwin-arm64"><div class="card"><div class="plat">macOS <span class="mono">arm64</span></div><div class="meta">Apple silicon (M1 and later)</div></div></a>
+      <a href="/downloads/agentmanager-darwin-x64.tar.gz" data-t="darwin-x64"><div class="card"><div class="plat">macOS <span class="mono">x64</span></div><div class="meta">Intel Macs</div></div></a>
+      <a href="/downloads/agentmanager-linux-x64.tar.gz" data-t="linux-x64"><div class="card"><div class="plat">Linux <span class="mono">x64</span></div><div class="meta">glibc 2.28+ (Debian 10, Ubuntu 20.04, RHEL 8)</div></div></a>
+    </div>
+    <p>Or install with one command (macOS and Linux):</p>
+    <div class="copy"><code id="install-cmd">curl -fsSL https://…/install.sh | sh</code><button type="button" id="copy-btn">Copy</button></div>
+    <p class="note">Checksums: <a href="/downloads/SHA256SUMS">SHA256SUMS</a>. The bundles aren't code-signed yet. If you download with a browser on macOS, clear the quarantine flag after unpacking: <code>xattr -dr com.apple.quarantine agentmanager-*</code>. The install script doesn't need this.</p>
+  </div>
+</section>
+
+<section id="start">
+  <div class="wrap">
+    <h2>Get started</h2>
+    <p class="sub">You need the <a href="https://claude.com/claude-code">Claude Code CLI</a> and <code>git</code>. <code>gh</code> is optional and enables PR tracking.</p>
+    <div class="steps">
+      <div>
+        <h3>1. Install from a download</h3>
+<pre>tar -xzf agentmanager-darwin-arm64.tar.gz
+mkdir -p ~/.local/bin
+ln -s "$PWD"/agentmanager-*/bin/agentmgr ~/.local/bin/agentmgr</pre>
+      </div>
+      <div>
+        <h3>2. Open the UI</h3>
+<pre>agentmgr ui               # http://127.0.0.1:4717
+agentmgr service install  # start at login</pre>
+      </div>
+      <div>
+        <h3>3. Spawn agents</h3>
+<pre>agentmgr add -r https://github.com/org/repo.git \
+  "Fix the flaky login test" \
+  "Add CSV export to reports"</pre>
+      </div>
+      <div>
+        <h3>4. Check in</h3>
+<pre>agentmgr ls               # status, PRs, checks
+agentmgr attach &lt;agent&gt;   # live terminal
+agentmgr brief &lt;agent&gt;    # problem / solution / checks</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="wrap">
+  <footer><span>Agent Manager</span><span>MIT licensed</span></footer>
+</div>
+
+<script>
+  const cmd = `curl -fsSL ${location.origin}/install.sh | sh`;
+  document.getElementById('install-cmd').textContent = cmd;
+  document.getElementById('copy-btn').onclick = async (e) => {
+    try { await navigator.clipboard.writeText(cmd); e.target.textContent = 'Copied'; } catch { e.target.textContent = 'Select & copy'; }
+    setTimeout(() => (e.target.textContent = 'Copy'), 1500);
+  };
+  fetch('/version').then(r => r.ok ? r.text() : '').then(v => { if (v) document.getElementById('ver').textContent = `Version ${v}.`; }).catch(() => {});
+  // Highlight the build that matches this visitor.
+  const ua = navigator.userAgent;
+  let t = /Linux/.test(ua) && !/Android/.test(ua) ? 'linux-x64' : /Mac/.test(ua) ? 'darwin-arm64' : null;
+  const mark = (t) => {
+    const a = document.querySelector(`.dl a[data-t="${t}"]`);
+    if (!a) return;
+    a.querySelector('.card').classList.add('rec');
+    a.querySelector('.plat').insertAdjacentHTML('beforeend', '<span class="tag">your system</span>');
+  };
+  if (navigator.userAgentData?.getHighEntropyValues && t === 'darwin-arm64') {
+    navigator.userAgentData.getHighEntropyValues(['architecture']).then(v => mark(v.architecture === 'x86' ? 'darwin-x64' : t)).catch(() => mark(t));
+  } else if (t) mark(t);
+</script>
+</body>
+</html>

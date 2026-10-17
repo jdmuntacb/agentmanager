@@ -126,14 +126,14 @@ function printAgent(a) {
 /** Interactive attach: pipes this terminal to the agent's PTY (or its shell). Ctrl-] detaches. */
 async function attach(ref, { resume = true, kind = 'claude' } = {}) {
   let agent = await resolveAgent(ref);
-  const shell = kind === 'shell';
+  const shell = kind.startsWith('shell');
   if (!shell && !agent.runtime.running && resume) {
     process.stderr.write(dim(`Resuming ${agent.name} (session ${agent.sessionId})…\n`));
     agent = await api('POST', `/agents/${agent.id}/start`, {});
   }
   if (!process.stdin.isTTY) throw new Error('attach needs an interactive terminal');
 
-  const ws = new WebSocket(`ws://${HOST}:${PORT}/ws/term/${agent.id}${shell ? '?kind=shell' : ''}`);
+  const ws = new WebSocket(`ws://${HOST}:${PORT}/ws/term/${agent.id}${shell ? `?kind=${kind}` : ''}`);
   const what = shell ? `shell for ${agent.name}` : agent.name;
   const send = (msg) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(msg));
   const sendSize = () => send({ t: 'r', cols: process.stdout.columns, rows: process.stdout.rows });
@@ -414,9 +414,12 @@ export async function main(argv) {
     .command('shell')
     .description("Open a shell in the agent's folder, for running commands by hand. Ctrl-] detaches.")
     .argument('<agent>')
-    .action(async (ref) => {
+    .option('-n, --number <n>', 'which of the agent\'s shells (each number is a separate shell)', '1')
+    .action(async (ref, opts) => {
+      const n = Number(opts.number);
+      if (!Number.isInteger(n) || n < 1 || n > 999) throw new Error('--number must be a whole number from 1 to 999');
       await daemon();
-      await attach(ref, { kind: 'shell' });
+      await attach(ref, { kind: `shell:${n}` });
     });
 
   const projCmd = program.command('project').description('Project shortcuts: short names like "cc" for repos you work on');

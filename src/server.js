@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { ensureHome, HOST, loadConfig, paths, PORT } from './config.js';
-import { AgentManager } from './manager.js';
+import { AgentManager, shellNumber } from './manager.js';
 import { Backlog } from './backlog.js';
 import { Notifier, isWorkflowUrl, loadNotify, publicNotify, saveNotify, sendSlack } from './notify.js';
 import * as remote from './remote.js';
@@ -145,7 +145,18 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   );
   api.post('/agents/:id/plan', wrap((req) => manager.startPlanning(req.params.id)));
   api.post('/agents/:id/handoff', wrap((req) => manager.maybeHandoff(manager.mustGet(req.params.id).id, { force: true })));
-  api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id)));
+  api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id, req.body?.n ? Number(req.body.n) : undefined)));
+  api.post('/agents/:id/shell/new', wrap((req) => ({ n: manager.nextShellNumber(manager.mustGet(req.params.id).id) })));
+  api.post('/agents/:id/shell/drop', wrap((req) => manager.dropShell(req.params.id, Number(req.body?.n) || 1)));
+  // Raw file body; the name comes in the query. Returns the saved path to paste into a terminal.
+  api.post(
+    '/agents/:id/upload',
+    express.raw({ type: () => true, limit: '50mb' }),
+    wrap((req) => {
+      if (!Buffer.isBuffer(req.body) || !req.body.length) throw fail(400, 'Empty file');
+      return manager.saveUpload(req.params.id, req.query.name, req.body);
+    }),
+  );
   api.get(
     '/agents/:id',
     wrap((req) => {
@@ -335,7 +346,9 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     req.on('close', () => eventSinks.delete(send));
   });
 
-  const termKind = (q) => (q === 'shell' ? 'shell' : 'claude');
+  const termKind = (q) => (shellNumber(q) ? `shell:${shellNumber(q)}` : 'claude');
+  const attachTerm = (id, kind, client) =>
+    shellNumber(kind) ? manager.attachShell(id, client, shellNumber(kind)) : manager.attach(id, client);
   api.get('/agents/:id/term/stream', (req, res) => {
     let agent;
     try {
@@ -367,7 +380,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     };
     let session;
     try {
-      session = kind === 'shell' ? manager.attachShell(agent.id, client) : manager.attach(agent.id, client);
+      session = attachTerm(agent.id, kind, client);
     } catch (err) {
       send({ t: 'error', error: err.message });
       return res.end();
@@ -442,7 +455,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
         close: () => ws.close(1000, 'agent removed'),
       };
       const kind = termKind(url.searchParams.get('kind'));
-      session = kind === 'shell' ? manager.attachShell(agent.id, client) : manager.attach(agent.id, client);
+      session = attachTerm(agent.id, kind, client);
       client.send({ t: 'hello', id: agent.id, kind, running: session.running, backlog: session.backlog });
       ws.on('message', (raw) => {
         let msg;

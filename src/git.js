@@ -55,7 +55,16 @@ export function parseProgress(line) {
 /** Run git, reporting `--progress` output as it streams (git writes it to stderr, split by \r). */
 function gitProgress(args, { cwd, signal, onProgress } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd, signal, env: ENV, stdio: ['ignore', 'ignore', 'pipe'] });
+    // Own process group, so cancelling also kills git's helpers (git-remote-http etc.).
+    // Killing only git leaves them holding stderr open, and 'close' would never come.
+    const child = spawn('git', args, { cwd, env: ENV, stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+    const kill = () => {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {}
+    };
+    if (signal?.aborted) kill();
+    else signal?.addEventListener('abort', kill, { once: true });
     let pending = '';
     let tail = '';
     child.stderr.on('data', (buf) => {
@@ -70,6 +79,7 @@ function gitProgress(args, { cwd, signal, onProgress } = {}) {
     });
     child.on('error', () => {}); // reported through 'close'
     child.on('close', (code) => {
+      signal?.removeEventListener('abort', kill);
       if (code === 0) return resolve();
       if (signal?.aborted) return reject(cancelled());
       const msg = tail
