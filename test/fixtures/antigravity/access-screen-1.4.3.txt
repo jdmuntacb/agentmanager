@@ -1,0 +1,31 @@
+
+[6D[?25h[?25l[3A⣯  [90mR[94munnin[m
+
+
+[7D[?25h[?25l[3A⣟  [90mRu[94mnning[m
+
+
+[8D[?25h[?25l[3A[3C[90mn[94mning [m
+
+
+[9D[?25h[?25l[3A⡿  [90mRunn[94ming c[m
+
+
+[10D[?25h[?25l[0 q[4A[94C[37m6c2-9c6a-6b799cfb6f...[m
+[33m●[m [33;1mUsed[m ReadFile [37m(ctrl+o to expand)[m
+[K
+[33;1mFile access[m[K
+[90m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[m
+[K
+[37mRead:[m[K
+[37m/tmp/agy-probe[m
+[37m/smoke.log[m
+[37mReason: outside workspace[93X[m
+
+[1mAllow access to this file?[m
+[94m> 1. Yes, allow access[K[m
+  2. Yes, and always allow non-workspace access
+  3. No, deny access
+
+  [94;1m↑/↓[90;22m Navigate[m
+[90mesc to cancel[m[84X[84C[2mGemini 3.8 Flash · high[m

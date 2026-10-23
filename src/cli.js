@@ -199,6 +199,65 @@ function readIntentsFile(file) {
     .filter((l) => l && !l.startsWith('#'));
 }
 
+// ---------------------------------------------------------------- hub helpers
+
+async function localHubToken() {
+  const { hubStateFile } = await import('./hub.js');
+  try {
+    return JSON.parse(fs.readFileSync(hubStateFile(), 'utf8')).token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Calls the hub's API as its admin: token from $AGENTMGR_HUB_TOKEN or the hub on this machine. */
+async function hubApi(opts, method, route, body) {
+  let joined = null;
+  try {
+    joined = JSON.parse(fs.readFileSync(`${(await import('./config.js')).paths.home}/hub-link.json`, 'utf8')).url;
+  } catch {}
+  const url = (opts.url || process.env.AGENTMGR_HUB_URL || joined || 'http://127.0.0.1:4720').replace(/\/$/, '');
+  const token = process.env.AGENTMGR_HUB_TOKEN || (await localHubToken());
+  if (!token) throw new Error('Set AGENTMGR_HUB_TOKEN to the hub\'s token (shown by "agentmgr hub token" where the hub runs)');
+  const res = await fetch(`${url}/api${route}`, {
+    method,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }).catch((e) => {
+    throw new Error(`Cannot reach the hub at ${url} (${e.cause?.code ?? e.message}). Start one with "agentmgr hub serve" or pass --url`);
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) throw new Error(`The hub at ${url} did not accept the token`);
+  if (!res.ok) throw new Error(data.error || `${method} ${route} failed with HTTP ${res.status}`);
+  return data;
+}
+
+/** "machine/agent", or an agent id / id prefix / name that is unique across the fleet. */
+function resolveFleetAgent(f, ref) {
+  const [m, a] = ref.includes('/') ? ref.split('/', 2) : [null, ref];
+  const runners = m ? f.runners.filter((r) => r.name === m || r.id === m) : f.runners;
+  if (m && !runners.length) throw new Error(`No machine "${m}" (agentmgr hub machines)`);
+  const ids = new Set(runners.map((r) => r.id));
+  const pool = f.agents.filter((x) => ids.has(x.runnerId));
+  const exact = pool.filter((x) => x.id === a || x.name === a);
+  const hits = exact.length ? exact : pool.filter((x) => x.id.startsWith(a));
+  if (!hits.length) throw new Error(`No agent "${ref}" on the hub`);
+  if (hits.length > 1) throw new Error(`"${ref}" matches ${hits.map((x) => `${x.runnerName}/${x.id}`).join(', ')}; use machine/agent`);
+  return { agent: hits[0], runner: f.runners.find((r) => r.id === hits[0].runnerId) };
+}
+
+function printHubLink(st) {
+  const allow = st.policy?.allow?.length ? st.policy.allow.join(', ') : 'nothing';
+  if (!st.joined) {
+    console.log(`hub ${dim('not joined')}  (join one: agentmgr join <hub-url> <code>)`);
+  } else {
+    const state = st.connected ? green('connected') : yellow(`not connected${st.lastError ? `: ${st.lastError}` : ', retrying'}`);
+    console.log(`hub ${bold(st.url)}  ${state}`);
+    console.log(dim(`  this machine: ${st.name} (${st.runnerId}) · joined ${new Date(st.joinedAt).toLocaleString()}`));
+  }
+  console.log(dim(`  the hub may: ${allow}${st.policy?.projects?.includes('*') ? '' : ` · projects: ${st.policy?.projects?.join(', ')}`}  (set "hub" in config.json)`));
+}
+
 export async function main(argv) {
   const program = new Command();
   program
@@ -253,7 +312,8 @@ export async function main(argv) {
         'bypassPermissions',
       ]),
     )
-    .option('-m, --model <model>', 'claude model')
+    .option('-m, --model <model>', 'model (for the chosen engine)')
+    .option('-e, --engine <engine>', 'agent engine: claude (default) or codex')
     .option('--plan', 'while a repo URL clones, plan the task with Claude (moves into the repo when ready)')
     .option('--no-start', 'create without launching')
     .option('-a, --attach', 'attach to the agent after launch (single intent only)')
@@ -275,6 +335,7 @@ export async function main(argv) {
         priority: opts.priority,
         permissionMode: opts.permissionMode,
         model: opts.model,
+        engine: opts.engine,
         start: opts.start,
         plan: opts.plan,
       });
@@ -335,18 +396,18 @@ export async function main(argv) {
 
   program
     .command('doc')
-    .description('Write a stakeholder document from the agent work: analysis, design, flow or proposal')
+    .description('Write a stakeholder document from the agent work: analysis, design, flow, proposal or humanai (Human vs AI)')
     .argument('<agent>')
-    .argument('<kind>', 'analysis, design, flow, proposal, or all (background)')
+    .argument('<kind>', 'analysis, design, flow, proposal, humanai, or all (background)')
     .option('-o, --output <file>', 'also save the Markdown to this file')
     .option('--cached', 'print the last version instead of writing a new one')
-    .option('-b, --background', 'start writing and return at once (kind "all" writes all four)')
+    .option('-b, --background', 'start writing and return at once (kind "all" writes all five)')
     .action(async (ref, kind, opts) => {
       await daemon();
       const a = await resolveAgent(ref);
       if (opts.background || kind === 'all') {
         const res = await api('POST', `/agents/${a.id}/docs/${encodeURIComponent(kind)}?background=1`);
-        const kinds = kind === 'all' ? ['analysis', 'design', 'flow', 'proposal'] : [kind];
+        const kinds = kind === 'all' ? ['analysis', 'design', 'flow', 'proposal', 'humanai'] : [kind];
         console.log(`${green('…')} writing ${kinds.join(', ')} for ${res.name} in the background`);
         console.log(dim(`  read it when ready: agentmgr doc ${a.id} ${kinds[0]} --cached  (or open the agent in the UI)`));
         return;
@@ -420,6 +481,145 @@ export async function main(argv) {
       if (!Number.isInteger(n) || n < 1 || n > 999) throw new Error('--number must be a whole number from 1 to 999');
       await daemon();
       await attach(ref, { kind: `shell:${n}` });
+    });
+
+  program
+    .command('inbox')
+    .description('Everything waiting on you: prompts, questions, stuck agents, overlapping changes')
+    .action(async () => {
+      await daemon();
+      const items = await api('GET', '/inbox');
+      if (!items.length) return console.log(dim('Nothing needs you right now.'));
+      const label = { prompt: red('needs input'), question: cyan('question'), stuck: yellow('stuck?'), conflict: yellow('overlap') };
+      for (const it of items) {
+        console.log(`${label[it.kind]}  ${bold(it.agentName)} ${dim(it.agentId)}  ${it.title}`);
+        if (it.kind === 'prompt') console.log(dim(`    ${(it.prompt?.choices ?? []).map((c) => `${c.key}. ${c.label}`).join('   ')}  → agentmgr attach ${it.agentId}`));
+        if (it.kind === 'question') {
+          if (it.question.options.length) console.log(dim(`    options: ${it.question.options.join(' | ')}`));
+          console.log(dim(`    answer: agentmgr answer ${it.agentId} ${it.question.id} "…"`));
+        }
+        if (it.kind === 'stuck') console.log(dim(`    ${it.finding.detail}\n    nudge: agentmgr tell ${it.agentId} "…"`));
+        if (it.kind === 'conflict') console.log(dim(`    ${it.conflict.files.map((f) => f.file).join(', ')}`));
+      }
+    });
+
+  program
+    .command('answer')
+    .description('Answer a question an agent asked in the inbox')
+    .argument('<agent>')
+    .argument('<question>', 'question id (from agentmgr inbox)')
+    .argument('<text...>')
+    .action(async (ref, qid, text) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      await api('POST', `/agents/${a.id}/answer`, { question: qid, text: text.join(' ') });
+      console.log(`${green('✓')} answer queued for ${a.name}; it is typed into the session when the agent is idle`);
+    });
+
+  program
+    .command('tell')
+    .description("Send a message into an agent's session (typed in when it is idle; resumes it if closed)")
+    .argument('<agent>')
+    .argument('<text...>')
+    .action(async (ref, text) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      await api('POST', `/agents/${a.id}/tell`, { text: text.join(' ') });
+      console.log(`${green('✓')} queued for ${a.name}`);
+    });
+
+  program
+    .command('fork')
+    .description("A new agent with this one's code and conversation, in its own worktree")
+    .argument('<agent>')
+    .option('-c, --checkpoint <n>', 'start from checkpoint n instead of now (see agentmgr checkpoints)')
+    .option('-m, --message <text>', 'what the fork should do differently (its first message)')
+    .action(async (ref, opts) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      const f = await api('POST', `/agents/${a.id}/fork`, { checkpoint: opts.checkpoint ? Number(opts.checkpoint) : undefined, instructions: opts.message });
+      console.log(`${green('+')} ${bold(f.name)} ${f.id}  forked from ${a.name}${opts.checkpoint ? ` at checkpoint ${opts.checkpoint}` : ''}  session ${cyan(f.sessionId)}`);
+    });
+
+  program
+    .command('checkpoints')
+    .description('Checkpoints saved at the end of each turn (fork from one with agentmgr fork -c)')
+    .argument('<agent>')
+    .action(async (ref) => {
+      await daemon();
+      const a = await resolveAgent(ref);
+      const cps = a.checkpoints ?? [];
+      if (!cps.length) return console.log(dim('No checkpoints yet: one is saved when the agent finishes a turn.'));
+      table(cps.map((c) => [`#${c.n}`, c.at.replace('T', ' ').slice(0, 19), c.sha.slice(0, 9), (c.prompt ?? '').slice(0, 60)]), ['N', 'AT', 'SNAPSHOT', 'PROMPT']);
+    });
+
+  const raceCmd = program.command('race').description('Several agents try the same intent; compare and keep the best');
+  raceCmd
+    .command('start')
+    .description('Start a race: one agent per variant ("model", "model|approach" or "|approach")')
+    .argument('<intent>')
+    .requiredOption('-v, --variant <spec...>', 'at least two, e.g. -v opus -v "sonnet|keep it minimal"')
+    .option('-r, --repo <url>', 'git repository URL')
+    .option('-d, --dir <path>', 'git folder (each attempt gets a worktree)')
+    .option('--project <name>', 'project shortcut or name')
+    .option('-t, --test <command>', 'test command to compare the attempts with')
+    .option('-b, --base <ref>', 'branch each attempt starts from')
+    .action(async (intent, opts) => {
+      await daemon();
+      const variants = opts.variant.map((v) => {
+        const [model, ...rest] = v.split('|');
+        return { model: model.trim() || undefined, instructions: rest.join('|').trim() || undefined };
+      });
+      const r = await api('POST', '/races', { intent, variants, repo: opts.repo, dir: opts.dir, project: opts.project, testCommand: opts.test, base: opts.base });
+      console.log(`${green('🏁')} race ${bold(r.id)}: ${r.rows.map((x) => `${x.variant?.label} (${x.id})`).join(', ')}`);
+      console.log(dim(`  compare: agentmgr race show ${r.id}`));
+    });
+  raceCmd
+    .command('show')
+    .description('Scoreboard for a race (or list races)')
+    .argument('[race]')
+    .action(async (id) => {
+      await daemon();
+      if (!id) {
+        const list = await api('GET', '/races');
+        if (!list.length) return console.log(dim('No races yet: agentmgr race start "<intent>" -v opus -v sonnet -r <repo>'));
+        return table(list.map((r) => [r.id, r.intent.split('\n')[0].slice(0, 50), String(r.rows.length), r.winner ? r.rows.find((x) => x.id === r.winner)?.variant?.label ?? r.winner : '']), ['RACE', 'INTENT', 'ATTEMPTS', 'WINNER']);
+      }
+      const r = await api('GET', `/races/${id}`);
+      console.log(bold(r.intent.split('\n')[0]));
+      table(
+        r.rows.map((x) => [
+          `${x.variant?.label ?? x.name}${r.winner === x.id ? ' 🏆' : ''}`,
+          x.id,
+          x.outcome ?? x.status,
+          x.checks.total ? `${x.checks.passed}/${x.checks.total}` : '',
+          x.files ? `${x.files}f +${x.added} -${x.removed}` : '',
+          x.tests ? x.tests.status : '',
+          x.costUsd ? `$${x.costUsd.toFixed(2)}` : '',
+        ]),
+        ['ATTEMPT', 'AGENT', 'OUTCOME', 'CHECKS', 'CHANGE', 'TESTS', 'COST'],
+      );
+    });
+  raceCmd
+    .command('test')
+    .description("Run the race's test command in every attempt's worktree")
+    .argument('<race>')
+    .option('-t, --test <command>', 'set or change the test command')
+    .action(async (id, opts) => {
+      await daemon();
+      await api('POST', `/races/${id}/tests`, opts.test ? { command: opts.test } : {});
+      console.log(`${green('…')} running; see agentmgr race show ${id}`);
+    });
+  raceCmd
+    .command('pick')
+    .description('Pick the winner (optionally delete the other attempts and their worktrees)')
+    .argument('<race>')
+    .argument('<agent>')
+    .option('--cleanup', 'close and delete the other attempts')
+    .action(async (id, agent, opts) => {
+      await daemon();
+      const r = await api('POST', `/races/${id}/pick`, { agent, cleanup: Boolean(opts.cleanup) });
+      console.log(`${green('🏆')} winner: ${r.rows.find((x) => x.id === r.winner)?.variant?.label ?? r.winner}`);
     });
 
   const projCmd = program.command('project').description('Project shortcuts: short names like "cc" for repos you work on');
@@ -631,11 +831,12 @@ export async function main(argv) {
   }
   notifyCmd
     .command('event')
-    .description('Turn one alert on or off: needsInput, review, error, waiting, blocked')
+    .description('Turn one alert on or off: needsInput, review, error, waiting, blocked, stuck, conflict, question')
     .argument('<event>')
     .argument('<onoff>')
     .action(async (event, onoff) => {
-      if (!['needsInput', 'review', 'error', 'waiting', 'blocked'].includes(event)) throw new Error('event must be needsInput, review, error, waiting or blocked');
+      const EVENTS = ['needsInput', 'review', 'error', 'waiting', 'blocked', 'stuck', 'conflict', 'question'];
+      if (!EVENTS.includes(event)) throw new Error(`event must be one of: ${EVENTS.join(', ')}`);
       await daemon();
       printNotify(await api('POST', '/notify', { events: { [event]: onoff === 'on' } }));
     });
@@ -703,6 +904,273 @@ export async function main(argv) {
       await api('DELETE', `/remote/devices/${encodeURIComponent(id)}`);
       console.log(`signed out ${id}`);
     });
+
+  // ---------------------------------------------------------- hub: agents on several machines
+  const hubCmd = program.command('hub').description('One place for agents on several machines: run a hub, invite machines, see the fleet');
+  hubCmd
+    .command('serve')
+    .description('Run a hub in the foreground (machines join it with "agentmgr join")')
+    .option('-p, --port <port>', 'port (default: $PORT or 4720)')
+    .option('--host <host>', 'address to listen on, e.g. this Mac\'s Tailscale IP (default: 127.0.0.1, or 0.0.0.0 when $PORT is set)')
+    .action(async (opts) => {
+      const { startHub, hubStateFile } = await import('./hub.js');
+      const port = Number(opts.port || process.env.PORT || 4720);
+      const host = opts.host || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
+      const hub = await startHub({ port, host });
+      console.log(`[hub] listening on ${hub.url}`);
+      if (hub.createdToken) console.log(`[hub] sign in: ${hub.url}/#login=${hub.token}`);
+      else if (!process.env.AGENTMGR_HUB_TOKEN) console.log(`[hub] sign-in token: agentmgr hub token  (kept in ${hubStateFile()})`);
+      console.log('[hub] add a machine: agentmgr hub invite');
+      const stop = async () => {
+        await hub.close();
+        process.exit(0);
+      };
+      process.on('SIGINT', stop);
+      process.on('SIGTERM', stop);
+    });
+  hubCmd
+    .command('token')
+    .description("Print the sign-in token and link of the hub running on this machine")
+    .option('--url <url>', 'hub address', 'http://127.0.0.1:4720')
+    .action(async (opts) => {
+      const token = await localHubToken();
+      if (!token) throw new Error('No hub on this machine yet (start one: agentmgr hub serve)');
+      console.log(token);
+      console.log(dim(`sign in: ${opts.url.replace(/\/$/, '')}/#login=${token}`));
+    });
+  hubCmd
+    .command('invite')
+    .description('One-time code (10 minutes) for a machine to join the hub')
+    .option('--url <url>', 'hub address (default: $AGENTMGR_HUB_URL, the hub this machine joined, or http://127.0.0.1:4720)')
+    .action(async (opts) => {
+      const inv = await hubApi(opts, 'POST', '/invites');
+      console.log(`On the machine to add, run:\n\n  ${bold(inv.command)}\n`);
+      console.log(dim(`The code works once, until ${new Date(inv.expiresAt).toLocaleTimeString()}. New machines share "view" only unless their config.json says otherwise.`));
+    });
+  hubCmd
+    .command('machines')
+    .alias('ls')
+    .description('Machines enrolled with the hub')
+    .option('--url <url>', 'hub address')
+    .action(async (opts) => {
+      const f = await hubApi(opts, 'GET', '/fleet');
+      if (!f.runners.length) return console.log(dim('No machines yet. Add one: agentmgr hub invite'));
+      table(
+        f.runners.map((r) => [
+          bold(r.name),
+          r.online ? green('online') : dim(`offline${r.lastSeen ? ` since ${new Date(r.lastSeen).toLocaleString()}` : ''}`),
+          r.version ?? '',
+          String(r.agents),
+          r.working ? green(String(r.working)) : '0',
+          r.needs ? red(String(r.needs)) : '0',
+          (r.policy?.allow ?? []).join(',') || dim('—'),
+        ]),
+        ['MACHINE', 'STATUS', 'VERSION', 'AGENTS', 'WORKING', 'NEEDS YOU', 'ALLOWS'],
+      );
+    });
+  hubCmd
+    .command('remove')
+    .description('Remove a machine from the hub (it must join again to come back)')
+    .argument('<machine>', 'machine name or id')
+    .option('--url <url>', 'hub address')
+    .action(async (machine, opts) => {
+      await hubApi(opts, 'DELETE', `/runners/${encodeURIComponent(machine)}`);
+      console.log(`${green('✓')} removed ${machine}`);
+    });
+  hubCmd
+    .command('status')
+    .description("This machine's link to a hub")
+    .action(async () => {
+      await daemon();
+      printHubLink(await api('GET', '/hub'));
+    });
+
+  program
+    .command('join')
+    .description('Join a hub with an invite code from "agentmgr hub invite"')
+    .argument('<url>', 'hub address, e.g. https://hub.example.com')
+    .argument('<code>', 'invite code')
+    .option('-n, --name <name>', 'name for this machine on the hub (default: its hostname)')
+    .action(async (url, code, opts) => {
+      await daemon();
+      const st = await api('POST', '/hub/join', { url, code, name: opts.name });
+      for (let i = 0; i < 30 && !st.connected; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        Object.assign(st, await api('GET', '/hub'));
+      }
+      printHubLink(st);
+    });
+  program
+    .command('leave')
+    .description('Leave the hub this machine joined (the hub forgets it; its key is deleted)')
+    .action(async () => {
+      await daemon();
+      printHubLink(await api('POST', '/hub/leave'));
+    });
+  const fleetCmd = program.command('fleet').description('Agents on every machine in the hub: list them, answer, message, start, stop, create');
+  fleetCmd
+    .command('ls', { isDefault: true })
+    .description('Agents on every machine in the hub, and what needs you')
+    .option('--url <url>', 'hub address')
+    .action(async (opts) => {
+      const f = await hubApi(opts, 'GET', '/fleet');
+      const machines = f.runners.map((r) => `${r.online ? green('●') : dim('○')} ${r.name}`).join('  ');
+      console.log(`${bold(f.hub.name)}  ${machines || dim('no machines yet (agentmgr hub invite)')}\n`);
+      if (f.agents.length) {
+        table(
+          f.agents.map((a) => [
+            `${dim(`${a.runnerName}/`)}${a.id}`,
+            a.priority <= 1 ? red(`P${a.priority}`) : dim(`P${a.priority}`),
+            truncate(a.name, 28),
+            !a.online ? dim('offline') : a.attention ? red('needs input') : statusLabel({ status: a.status, runtime: { busy: a.working, planning: a.planning } }),
+            truncate(a.project ?? '', 12),
+            a.prs.slice(-3).map((p) => `#${p.number ?? '?'}`).join(' ') + (a.prs.length > 3 ? dim(` +${a.prs.length - 3}`) : ''),
+            truncate(a.intent, 50),
+          ]),
+          ['AGENT', 'P', 'NAME', 'STATUS', 'PROJECT', 'PRS', 'INTENT'],
+        );
+      }
+      if (f.inbox.length) {
+        console.log(`\n${bold('Needs you')}`);
+        const label = { prompt: red('needs input'), question: cyan('question'), stuck: yellow('stuck?'), conflict: yellow('overlap') };
+        for (const it of f.inbox) {
+          console.log(`  ${label[it.kind]}  ${dim(`${it.runnerName}/`)}${bold(it.agentName)}  ${truncate(it.title, 80)}${it.question?.id ? dim(`  [${it.question.id}]`) : ''}`);
+        }
+        console.log(dim('\n  Answer with: agentmgr fleet answer <machine>/<agent> <question-id> "…"  (where the machine allows "inbox")'));
+      }
+      const open = f.backlog?.items.filter((x) => !['done', 'cancelled'].includes(x.status)) ?? [];
+      if (open.length) {
+        const n = (st) => open.filter((x) => x.status === st && !x.stalled).length;
+        const stalled = open.filter((x) => x.stalled).length;
+        console.log(`\n${bold('Backlog')}  ${[n('queued') && `${n('queued')} queued`, n('active') && `${n('active')} active`, n('review') && cyan(`${n('review')} to review`), n('blocked') && red(`${n('blocked')} blocked`), stalled && red(`${stalled} stalled`)].filter(Boolean).join(' · ')}  ${dim('(agentmgr fleet backlog)')}`);
+      }
+    });
+  const fleetAct = async (opts, ref, action, args, done) => {
+    const f = await hubApi(opts, 'GET', '/fleet');
+    const { runner, agent } = resolveFleetAgent(f, ref);
+    await hubApi(opts, 'POST', `/runners/${runner.id}/actions`, { action, args: { agent: agent.id, ...args } });
+    console.log(`${green('✓')} ${done(agent, runner)}`);
+  };
+  fleetCmd
+    .command('tell')
+    .description("Type a message into an agent's session on another machine (needs \"control\")")
+    .argument('<agent>', 'machine/agent (or a unique agent id or name)')
+    .argument('<text...>')
+    .option('--url <url>', 'hub address')
+    .action((ref, text, opts) => fleetAct(opts, ref, 'tell', { text: text.join(' ') }, (a, r) => `queued for ${r.name}/${a.name}; typed in when it is idle`));
+  fleetCmd
+    .command('answer')
+    .description('Answer a question from the fleet inbox (needs "inbox")')
+    .argument('<agent>', 'machine/agent')
+    .argument('<question>', 'question id (agentmgr fleet shows it)')
+    .argument('<text...>')
+    .option('--url <url>', 'hub address')
+    .action((ref, q, text, opts) => fleetAct(opts, ref, 'answer', { question: q, text: text.join(' ') }, (a, r) => `answer queued for ${r.name}/${a.name}`));
+  for (const action of ['start', 'stop']) {
+    fleetCmd
+      .command(action)
+      .description(`${action === 'start' ? 'Start (resume)' : 'Stop'} an agent on another machine (needs "control")`)
+      .argument('<agent>', 'machine/agent')
+      .option('--url <url>', 'hub address')
+      .action((ref, opts) => fleetAct(opts, ref, action, {}, (a, r) => `${action === 'start' ? 'starting' : 'stopping'} ${r.name}/${a.name}`));
+  }
+  fleetCmd
+    .command('new')
+    .description('Start a new agent on another machine, in one of its projects (needs "create")')
+    .argument('<machine>')
+    .argument('<project>', 'project shortcut on that machine')
+    .argument('<intent...>')
+    .addOption(new Option('--priority <p>', 'P0-P3').default('P2'))
+    .option('--url <url>', 'hub address')
+    .action(async (machine, project, intent, opts) => {
+      const f = await hubApi(opts, 'GET', '/fleet');
+      const runner = f.runners.find((r) => r.name === machine || r.id === machine);
+      if (!runner) throw new Error(`No machine "${machine}" (agentmgr hub machines)`);
+      const out = await hubApi(opts, 'POST', `/runners/${runner.id}/actions`, {
+        action: 'create',
+        args: { project: project.replace(/^@/, ''), intent: intent.join(' '), priority: Number(String(opts.priority).replace(/^p/i, '')) },
+      });
+      console.log(`${green('✓')} started on ${runner.name}: ${out.agents.map((a) => `${a.name} (${a.id})`).join(', ')}`);
+    });
+
+  const queueCmd = fleetCmd.command('backlog').description('The hub\'s shared backlog: work that starts on whichever machine has room');
+  queueCmd
+    .command('ls', { isDefault: true })
+    .description('Items in the shared backlog, and where each runs')
+    .option('-a, --all', 'include done and cancelled items')
+    .option('--url <url>', 'hub address')
+    .action(async (opts) => {
+      const { backlog: bl } = await hubApi(opts, 'GET', '/fleet');
+      const items = bl.items.filter((x) => opts.all || !['done', 'cancelled'].includes(x.status));
+      console.log(`${bold('Shared backlog')}  ${bl.autoRun ? green('auto-start on') : yellow('auto-start off')}  ${dim(`projects: ${bl.projects.map((p) => p.name).join(', ') || 'none (a machine must allow "create")'}`)}\n`);
+      if (!items.length) return console.log(dim('  Nothing queued. Add work: agentmgr fleet backlog add <project> "…"'));
+      const status = (it) => (it.stalled ? red(`stalled on ${it.runnerName}`) : it.status === 'review' ? cyan('review') : it.status === 'blocked' ? red('blocked') : it.status === 'active' ? green('active') : dim(it.status));
+      table(
+        items.map((it) => [
+          it.id,
+          it.priority <= 1 ? red(`P${it.priority}`) : dim(`P${it.priority}`),
+          status(it),
+          truncate(it.projectName, 14),
+          it.agentId ? `${dim(`${it.runnerName}/`)}${it.agentId}` : dim(truncate(it.waiting ?? it.labels.join(','), 30)),
+          truncate(it.title, 60),
+        ]),
+        ['ITEM', 'P', 'STATUS', 'PROJECT', 'WHERE', 'TITLE'],
+      );
+    });
+  queueCmd
+    .command('add')
+    .description('Queue work; each title becomes one agent on a machine with room')
+    .argument('<project>', 'project name or shortcut (any machine)')
+    .argument('<titles...>', 'one or more items (quote each)')
+    .option('-l, --label <label...>', 'labels the machine must have (os:mac, machine:mini, or its own hub.labels)')
+    .addOption(new Option('--priority <p>', 'P0-P3').default('P2'))
+    .addOption(new Option('--mode <mode>', 'permission mode').choices(['default', 'acceptEdits', 'plan']))
+    .option('--url <url>', 'hub address')
+    .action(async (project, titles, opts) => {
+      const added = await hubApi(opts, 'POST', '/backlog', { items: titles, project, labels: opts.label ?? [], priority: opts.priority, permissionMode: opts.mode });
+      console.log(`${green('✓')} queued ${added.map((x) => `${x.id} ${truncate(x.title, 40)}`).join(', ')} in ${added[0].projectName}`);
+    });
+  const OPS = { start: 'started', accept: 'accepted', cancel: 'cancelled (its agent is left as it is)', requeue: 'back in the queue' };
+  for (const [op, done] of Object.entries(OPS)) {
+    queueCmd
+      .command(op)
+      .description({ start: 'Start an item now, past the limits', accept: 'Accept the work: the item is done', cancel: 'Cancel an item', requeue: 'Put a stalled or blocked item back in the queue (its old machine is skipped)' }[op])
+      .argument('<item>')
+      .option('--url <url>', 'hub address')
+      .action(async (id, opts) => {
+        await hubApi(opts, 'POST', `/backlog/${encodeURIComponent(id)}/${op}`, {});
+        console.log(`${green('✓')} ${id} ${done}`);
+      });
+  }
+  queueCmd
+    .command('reopen')
+    .description('Send an item back to its agent with a note (needs "control" on its machine)')
+    .argument('<item>')
+    .argument('[note...]')
+    .option('--url <url>', 'hub address')
+    .action(async (id, note, opts) => {
+      await hubApi(opts, 'POST', `/backlog/${encodeURIComponent(id)}/reopen`, { note: note.join(' ') });
+      console.log(`${green('✓')} ${id} sent back to its agent`);
+    });
+  queueCmd
+    .command('rm')
+    .description('Remove an item')
+    .argument('<item>')
+    .option('--url <url>', 'hub address')
+    .action(async (id, opts) => {
+      await hubApi(opts, 'DELETE', `/backlog/${encodeURIComponent(id)}`);
+      console.log(`${green('✓')} removed ${id}`);
+    });
+  queueCmd
+    .command('pause')
+    .description('Stop starting queued items automatically')
+    .option('--url <url>', 'hub address')
+    .action(async (opts) => (await hubApi(opts, 'POST', '/backlog/settings', { autoRun: false }), console.log(`${green('✓')} auto-start off`)));
+  queueCmd
+    .command('resume')
+    .description('Start queued items automatically again')
+    .option('--url <url>', 'hub address')
+    .action(async (opts) => (await hubApi(opts, 'POST', '/backlog/settings', { autoRun: true }), console.log(`${green('✓')} auto-start on`)));
 
   const service = program.command('service').description('Start the daemon at login so agents come back after a reboot');
   service

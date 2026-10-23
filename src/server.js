@@ -9,7 +9,11 @@ import { WebSocketServer } from 'ws';
 import { ensureHome, HOST, loadConfig, paths, PORT } from './config.js';
 import { AgentManager, shellNumber } from './manager.js';
 import { Backlog } from './backlog.js';
+import { Races } from './races.js';
+import { listEngines } from './engines/index.js';
+import { HubLink, linkUrls } from './hublink.js';
 import { Notifier, isWorkflowUrl, loadNotify, publicNotify, saveNotify, sendSlack } from './notify.js';
+import { Previews, parseUrl } from './preview.js';
 import * as remote from './remote.js';
 import { Store } from './store.js';
 
@@ -37,7 +41,7 @@ function isAllowedOrigin(origin, port) {
 }
 
 const PUBLIC_REMOTE_API = new Set(['POST /api/login', 'GET /api/session']);
-const LOCAL_ONLY_API = /^\/api\/(remote(\/|$)|notify(\/|$)|shutdown$)/;
+const LOCAL_ONLY_API = /^\/api\/(remote(\/|$)|notify(\/|$)|hub(\/|$)|shutdown$)/;
 
 export async function startServer({ port = PORT, host = HOST } = {}) {
   ensureHome();
@@ -45,6 +49,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   const store = new Store(paths.state);
   const manager = new AgentManager({ store, config });
   const backlog = new Backlog({ manager, store, config });
+  const races = new Races({ manager, store });
   // Alerts link to the phone address when remote access is on, else the local UI.
   const notifier = new Notifier({
     manager,
@@ -56,6 +61,22 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   });
   let remoteServer = null;
   let remotePort = null;
+  const previews = new Previews({
+    tls: () => {
+      const { key, cert } = remote.certificatePaths();
+      return { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
+    },
+    allowedHosts: (p) => remote.allowedRemoteHosts(p),
+    signedIn: (cookies) => Boolean(remote.checkSession(remote.parseCookies(cookies)[remote.SESSION_COOKIE])),
+    cookieName: remote.SESSION_COOKIE,
+    reserved: () => [port, remotePort].filter(Boolean),
+    savedPorts: () => remote.loadSettings().relayPorts,
+    savePorts: (relayPorts) => remote.saveSettings({ relayPorts }),
+    ownHosts: () => new Set([...remote.lanAddresses().map((a) => a.address), remote.localHostname(), ...remote.loadSettings().extraHosts].map((h) => h.toLowerCase())),
+  });
+  const pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
+  // "Open on this machine" links from the hub point at remote access, when it's on.
+  const hubLink = new HubLink({ manager, config, backlog, version: pkgVersion, urls: () => (remoteServer ? linkUrls(remote.remoteUrls(remotePort)) : []) });
 
   /** Returns an error string if the request may not proceed, else null. Sets req.device for remote sessions. */
   function denied(req) {
@@ -121,6 +142,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
 
   api.get('/health', wrap(() => ({ ok: true, pid: process.pid, home: paths.home, claudeBin: config.claudeBin })));
   api.get('/agents', wrap(() => manager.list()));
+  api.get('/engines', wrap(() => listEngines(config)));
   api.post(
     '/agents',
     wrap((req) => {
@@ -134,7 +156,8 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   const bg = (req) => req.query.background === '1' || req.body?.background === true;
   api.post('/agents/:id/explain', wrap((req) => (bg(req) ? manager.summarizeInBackground(req.params.id, ['explain']) : manager.explain(req.params.id))));
   api.post('/agents/:id/insights', wrap((req) => (bg(req) ? manager.summarizeInBackground(req.params.id, ['insights']) : manager.insights(req.params.id))));
-  const DOC_LIST = ['analysis', 'design', 'flow', 'proposal'];
+  const DOC_LIST = ['analysis', 'design', 'flow', 'proposal', 'humanai'];
+  api.post('/agents/:id/humanai/answers', wrap((req) => manager.humanAiAnswers(req.params.id, req.body?.answers, { send: req.body?.send === true })));
   api.post(
     '/agents/:id/docs/:kind',
     wrap((req) => {
@@ -144,6 +167,9 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     }),
   );
   api.post('/agents/:id/plan', wrap((req) => manager.startPlanning(req.params.id)));
+  api.post('/agents/:id/plan/approve', wrap((req) => manager.approvePlan(req.params.id, req.body?.note)));
+  api.post('/agents/:id/plan/changes', wrap((req) => manager.requestPlanChanges(req.params.id, req.body?.note)));
+  api.post('/agents/:id/plan/review', wrap((req) => manager.setPlanReview(req.params.id, req.body?.on === true)));
   api.post('/agents/:id/handoff', wrap((req) => manager.maybeHandoff(manager.mustGet(req.params.id).id, { force: true })));
   api.post('/agents/:id/shell/close', wrap((req) => manager.closeShell(req.params.id, req.body?.n ? Number(req.body.n) : undefined)));
   api.post('/agents/:id/shell/new', wrap((req) => ({ n: manager.nextShellNumber(manager.mustGet(req.params.id).id) })));
@@ -166,6 +192,19 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     }),
   );
   api.patch('/agents/:id', wrap((req) => manager.update(req.params.id, req.body ?? {})));
+  api.post('/agents/:id/browsers', wrap((req) => manager.addBrowser(req.params.id, req.body?.url)));
+  api.patch('/agents/:id/browsers/:n', wrap((req) => manager.setBrowser(req.params.id, Number(req.params.n), req.body?.url)));
+  api.delete('/agents/:id/browsers/:n', wrap((req) => manager.dropBrowser(req.params.id, Number(req.params.n))));
+  api.get('/agents/:id/local-urls', wrap((req) => manager.localUrls(req.params.id)));
+  // Where a browser tab loads an address: directly on this computer, through a relay from another device.
+  api.post(
+    '/preview',
+    wrap(async (req) => {
+      if (!req.remote) return { src: parseUrl(req.body?.url).href };
+      return { src: await previews.frameUrl(req.body?.url, req.headers.host) };
+    }),
+  );
+
   api.delete(
     '/agents/:id',
     wrap((req) => manager.remove(req.params.id, { deleteWorkspace: req.query.deleteWorkspace === '1' })),
@@ -224,6 +263,30 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
       return backlog.add(Array.isArray(items) ? items : [item], opts);
     }),
   );
+  // Everything waiting on the user: live prompts, agents' questions, stuck agents, overlaps.
+  api.get('/inbox', wrap(() => manager.inbox()));
+  api.post('/agents/:id/tell', wrap((req) => manager.tell(req.params.id, req.body?.text)));
+  api.post('/agents/:id/answer', wrap((req) => manager.answerQuestion(req.params.id, req.body?.question, req.body?.text)));
+  api.post('/agents/:id/prompt-key', wrap((req) => manager.answerPrompt(req.params.id, String(req.body?.key ?? ''))));
+  api.post('/agents/:id/stuck/dismiss', wrap((req) => manager.dismissStuck(req.params.id, req.body?.key)));
+  api.post('/agents/:id/stuck/nudge', wrap((req) => manager.nudge(req.params.id, req.body?.key, req.body?.text)));
+  api.post('/agents/:id/conflicts/warn', wrap((req) => manager.warnConflict(req.params.id, req.body?.with)));
+  api.post('/agents/:id/checkpoint', wrap(async (req) => {
+    const id = manager.mustGet(req.params.id).id;
+    manager.lastCheckpointTry?.delete(id); // on demand: skip the throttle
+    await manager.checkpoint(id);
+    return manager.get(id);
+  }));
+  api.post('/agents/:id/fork', wrap((req) => manager.fork(req.params.id, req.body ?? {})));
+
+  api.get('/races', wrap(() => races.list()));
+  api.post('/races', wrap((req) => races.create(req.body ?? {})));
+  api.get('/races/:id', wrap((req) => races.view(req.params.id)));
+  api.post('/races/:id/tests', wrap((req) => races.runTests(req.params.id, req.body ?? {})));
+  api.get('/races/:id/diff/:agent', wrap((req) => races.diff(req.params.id, req.params.agent)));
+  api.post('/races/:id/pick', wrap((req) => races.pick(req.params.id, req.body?.agent, { cleanup: Boolean(req.body?.cleanup) })));
+  api.delete('/races/:id', wrap((req) => races.remove(req.params.id)));
+
   api.post('/backlog/settings', wrap((req) => backlog.settings(req.body ?? {})));
   api.patch('/backlog/:id', wrap((req) => backlog.update(req.params.id, req.body ?? {})));
   api.delete('/backlog/:id', wrap((req) => backlog.remove(req.params.id)));
@@ -240,6 +303,11 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     }),
   );
 
+  // ---------------------------------------------------------- hub link (local only)
+  api.get('/hub', wrap(() => hubLink.status()));
+  api.post('/hub/join', wrap((req) => hubLink.join(req.body?.url, req.body?.code, req.body?.name)));
+  api.post('/hub/leave', wrap(() => hubLink.leave()));
+
   // ---------------------------------------------------------- sessions (remote sign-in)
 
   api.get('/session', wrap((req) => ({ remote: Boolean(req.remote), authenticated: !req.remote || Boolean(
@@ -251,11 +319,12 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
       if (!req.remote) return { ok: true };
       const ip = req.socket.remoteAddress;
       if (!remote.loginAllowed(ip)) throw fail(429, 'Too many attempts; try again in 15 minutes');
-      if (!remote.checkToken(req.body?.token)) {
+      const ticket = req.body?.ticket !== undefined;
+      if (ticket ? !remote.useTicket(req.body.ticket) : !remote.checkToken(req.body?.token)) {
         remote.loginFailed(ip);
-        throw fail(401, 'Wrong or expired access token');
+        throw fail(401, ticket ? 'That sign-in link was used or has expired; open it from the hub again' : 'Wrong or expired access token');
       }
-      const { secret, maxAgeSec } = remote.createSession({ ua: req.headers['user-agent'], ip });
+      const { secret, maxAgeSec } = remote.createSession({ ua: req.headers['user-agent'], ip, via: ticket ? 'hub' : undefined });
       res.setHeader(
         'Set-Cookie',
         `${remote.SESSION_COOKIE}=${secret}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; Secure; SameSite=Strict`,
@@ -341,7 +410,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   const eventSinks = new Set();
   api.get('/events/stream', (req, res) => {
     const send = sse(req, res);
-    send({ t: 'snapshot', agents: manager.list(), backlog: backlog.view(), projects: manager.listProjects() });
+    send({ t: 'snapshot', agents: manager.list(), backlog: backlog.view(), projects: manager.listProjects(), races: races.list() });
     eventSinks.add(send);
     req.on('close', () => eventSinks.delete(send));
   });
@@ -431,6 +500,17 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
   manager.on('change', (agent) => broadcast({ t: 'agent', agent }));
   manager.on('removed', (id) => broadcast({ t: 'removed', id }));
   backlog.on('change', (view) => broadcast({ t: 'backlog', backlog: view }));
+  const raceTimers = new Map();
+  races.on('change', (id) => {
+    if (raceTimers.has(id)) return;
+    raceTimers.set(id, setTimeout(() => {
+      raceTimers.delete(id);
+      try {
+        broadcast({ t: 'race', race: races.view(id) });
+      } catch {}
+    }, 300));
+  });
+  races.on('removed', (id) => broadcast({ t: 'race-removed', id }));
   manager.on('projects', (projects) => {
     broadcast({ t: 'projects', projects });
     broadcast({ t: 'backlog', backlog: backlog.view() });
@@ -440,7 +520,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     const url = new URL(req.url, 'http://x');
     if (url.pathname === '/ws/events') {
       eventClients.add(ws);
-      ws.send(JSON.stringify({ t: 'snapshot', agents: manager.list(), backlog: backlog.view(), projects: manager.listProjects() }));
+      ws.send(JSON.stringify({ t: 'snapshot', agents: manager.list(), backlog: backlog.view(), projects: manager.listProjects(), races: races.list() }));
       ws.on('close', () => eventClients.delete(ws));
       return;
     }
@@ -509,6 +589,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     const srv = remoteServer;
     remoteServer = null;
     remotePort = null;
+    await previews.stopAll();
     srv.closeAllConnections?.();
     await new Promise((r) => srv.close(() => r()));
   }
@@ -524,6 +605,7 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
       if (fs.readFileSync(paths.pid, 'utf8').trim() === String(process.pid)) fs.unlinkSync(paths.pid);
     } catch {}
     await stopRemote();
+    hubLink.stop();
     server.close();
     process.exit(0);
   }
@@ -544,7 +626,9 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
     });
   }
   manager.refreshAll().catch(() => {});
+  hubLink.start();
   return {
+    hubLink,
     server,
     manager,
     backlog,

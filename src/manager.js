@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import pty from 'node-pty';
 import { expandHome, paths } from './config.js';
-import { trustFolder } from './trust.js';
+import { DEFAULT_ENGINE, ENGINES, engineOf, installed } from './engines/index.js';
 import {
   DOC_KINDS,
   briefDir,
@@ -15,6 +15,15 @@ import {
   explainPrompt,
   insightsPrompt,
   loadBrief,
+  critiquePrompt,
+  humanAiMarkdown,
+  humanAiMessage,
+  humanAiPrompt,
+  parseJsonReply,
+  loadPlanFile,
+  planApprovedPrompt,
+  planPath,
+  planReviewPrompt,
 } from './brief.js';
 
 // One-off summaries / documents built from an agent's live context.
@@ -22,6 +31,7 @@ const SUMMARIES = {
   explain: { field: 'explanation', prompt: explainPrompt },
   insights: { field: 'insights', prompt: insightsPrompt },
   ...Object.fromEntries(Object.keys(DOC_KINDS).map((k) => [k, { doc: k, prompt: (ctx) => docPrompt(k, ctx) }])),
+  humanai: { doc: 'humanai', run: 'runHumanAi' },
 };
 /** Read / write where a summary of `kind` is kept on the agent record. */
 const getSummary = (agent, kind) => (SUMMARIES[kind].doc ? agent.docs?.[kind] : agent[SUMMARIES[kind].field]);
@@ -29,18 +39,17 @@ const summaryPatch = (agent, kind, value) =>
   SUMMARIES[kind].doc ? { docs: { ...agent.docs, [kind]: value } } : { [SUMMARIES[kind].field]: value };
 import { spawn } from 'node:child_process';
 import * as git from './git.js';
+import { conflictMessage, findConflicts, summarize as summarizeConflicts } from './conflicts.js';
+import { answerMessage, loadQuestions, questionsPath, questionsPrompt } from './inbox.js';
+import { STUCK_DEFAULTS, detectStuck } from './stuck.js';
+import { findLocalUrls, parseUrl } from './preview.js';
 import {
   bugFromRef,
   extractRefs,
   prDetails,
   prFromUrl,
   prsForBranch,
-  recentSessionFiles,
-  scanTranscript,
-  sessionDigest,
-  subagentTranscripts,
   sumUsage,
-  transcriptPath,
 } from './tracker.js';
 
 // Per-session markers a parent Claude Code session sets. Inherited, they make the
@@ -63,10 +72,6 @@ const STRIP_ENV = [
 // Prompts that block a background agent until someone answers in its terminal.
 // Matched against output with ANSI codes and all whitespace removed, because
 // Claude's TUI positions words with cursor moves instead of spaces.
-const ATTENTION = [
-  [/trustthisfolder/i, 'Folder trust prompt'],
-  [/Doyouwantto(proceed|make|create|allow|run|overwrite)/i, 'Permission prompt'],
-];
 const ANSI = /\x1b(\[[0-9;?<>=]*[ -\/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|[()][0-9A-B]|[=>78c])/g;
 // When a link is found from several sources, the higher-ranked source is kept.
 const SOURCE_RANK = { manual: 5, intent: 4, session: 3, branch: 2, mentioned: 1 };
@@ -93,6 +98,12 @@ const handoffMessage = (agent) =>
 export function shellNumber(kind) {
   const m = /^shell(?::(\d{1,3}))?$/.exec(kind ?? '');
   return m ? Math.max(1, Number(m[1] ?? 1)) : 0;
+}
+
+/** Where the shared clone of a repo URL lives. */
+export function repoCacheDir(repo) {
+  const hash = crypto.createHash('sha1').update(repo).digest('hex').slice(0, 6);
+  return path.join(paths.repos, `${git.repoNameFromUrl(repo)}-${hash}`);
 }
 
 export function projectOf(agent) {
@@ -173,6 +184,11 @@ export class AgentManager extends EventEmitter {
     this.locks = new Map();
     this.refreshing = new Set();
     this.lastPrCheck = new Map();
+    this.changeSets = new Map(); // agent id -> { files, baseSha, at }: what its branch changed (conflict radar)
+    this.conflicts = new Map(); // agent id -> [conflict]
+    this.activity = new Map(); // session id -> transcript activity window (stuck detection)
+    this.stuck = new Map(); // agent id -> [finding]
+    this.outbox = new Map(); // agent id -> [message] waiting to be typed into its session
 
     // Processes do not survive a daemon restart, but their session IDs do.
     // `desired` records whether the user wants the agent running; a restart,
@@ -240,6 +256,10 @@ export class AgentManager extends EventEmitter {
       costUsd: costs.length ? costs.reduce((a, b) => a + b, 0) : null,
       prs: Object.values(agent.prs ?? {}),
       bugs: Object.values(agent.bugs ?? {}),
+      conflicts: summarizeConflicts(this.conflicts.get(agent.id)),
+      stuck: this.activeStuck(agent),
+      questions: this.questionsView(agent),
+      outbox: this.outbox.get(agent.id)?.length ?? 0,
       runtime: {
         running: Boolean(rt?.pty),
         busy: Boolean(rt?.pty && rt.busy),
@@ -249,6 +269,7 @@ export class AgentManager extends EventEmitter {
         shell: this.shellNumbers(agent.id).length > 0,
         shells: this.shellNumbers(agent.id),
         lastOutputAt: rt?.lastOutputAt ? new Date(rt.lastOutputAt).toISOString() : null,
+        prompt: rt?.pty && !rt.busy && rt.attention ? engineOf(agent).promptChoices(rt.tail) : null,
       },
     };
   }
@@ -346,6 +367,13 @@ export class AgentManager extends EventEmitter {
       .sort((a, b) => a.shortcut.localeCompare(b.shortcut));
   }
 
+  /** Whether new agents in this project start without a clone: its folder or repo is already here. */
+  projectWarm(entry) {
+    if (entry.dir) return fs.existsSync(entry.dir);
+    if (entry.repo && git.isRemoteUrl(entry.repo)) return fs.existsSync(repoCacheDir(entry.repo));
+    return true;
+  }
+
   /** Register a project ahead of time: `{ shortcut, name?, repo? | dir?, base? }`. */
   addProject({ shortcut, name, repo, dir, base }) {
     const sc = String(shortcut ?? '').trim().toLowerCase();
@@ -437,10 +465,21 @@ export class AgentManager extends EventEmitter {
     model,
     start = true,
     plan = false,
+    planReview,
     project,
     priority,
+    workspace,
+    race,
+    engine,
   }) {
     intent = (intent ?? '').trim();
+    const engineDef = engineOf(engine || this.config.engine || DEFAULT_ENGINE);
+    const engineId = engineDef.id;
+    if (permissionMode && !engineDef.permissionModes.includes(permissionMode)) {
+      throw Object.assign(new Error(`${engineDef.label} has no "${permissionMode}" mode (use ${engineDef.permissionModes.join(', ')})`), { status: 400 });
+    }
+    // Planning while cloning moves the session between folders, which needs the engine's support.
+    if (!engineDef.supports.planHandoff) plan = false;
     const general = kind === 'general';
     // A project shortcut (or name) fills in the repo / folder / base branch.
     const entry = !general && project ? this.resolveProject(project) : null;
@@ -463,6 +502,7 @@ export class AgentManager extends EventEmitter {
     const agent = {
       id,
       kind: general ? 'general' : 'task',
+      engine: engineId,
       project: project?.trim() || null,
       priority: parsePriority(priority),
       name: name?.trim() || slug,
@@ -479,6 +519,8 @@ export class AgentManager extends EventEmitter {
       baseRef: null,
       permissionMode: permissionMode || this.config.permissionMode,
       model: model || null,
+      // Review the implementation plan before the agent implements it: null = no review.
+      planReview: !general && (planReview ?? this.config.planReview ?? false) ? { status: 'writing' } : null,
       status: 'preparing',
       desired: start ? 'running' : 'stopped',
       error: null,
@@ -495,6 +537,7 @@ export class AgentManager extends EventEmitter {
       updatedAt: now(),
       lastStartedAt: null,
       stoppedAt: null,
+      ...(race ? { raceId: race.id, variant: race.variant } : {}),
     };
     for (const pr of refs.prs) agent.prs[pr.url] = { ...pr, source: 'intent' };
     for (const bug of refs.bugs) agent.bugs[bug.key] = { ...bug, source: 'intent' };
@@ -502,7 +545,7 @@ export class AgentManager extends EventEmitter {
     this.registerProject(agent);
     this.changed(agent);
 
-    this.prepare(agent, { start }).catch(() => {});
+    this.prepare(agent, { start, workspace }).catch(() => {});
     // Planning only makes sense while there is a clone to wait for.
     if (plan && agent.repo && git.isRemoteUrl(agent.repo)) {
       try {
@@ -512,7 +555,7 @@ export class AgentManager extends EventEmitter {
     return this.view(agent);
   }
 
-  prepare(agent, { start }) {
+  prepare(agent, { start, workspace }) {
     const controller = new AbortController();
     const { signal } = controller;
     // Progress is transient: broadcast it, but don't rewrite state.json for every tick.
@@ -528,7 +571,7 @@ export class AgentManager extends EventEmitter {
     };
     const done = (async () => {
       try {
-        const ws = await this.prepareWorkspace(agent, { signal, progress });
+        const ws = await (workspace ?? ((a, o) => this.prepareWorkspace(a, o)))(agent, { signal, progress });
         progress({ phase: 'Reading git info' });
         const info = await git.gitInfo(ws.workdir);
         if (!this.store.get(agent.id)) return;
@@ -606,8 +649,7 @@ export class AgentManager extends EventEmitter {
     if (repo && !dir) {
       // One shared clone per repo; each agent gets its own worktree + branch off it.
       const name = git.repoNameFromUrl(repo);
-      const hash = crypto.createHash('sha1').update(repo).digest('hex').slice(0, 6);
-      const base = path.join(paths.repos, `${name}-${hash}`);
+      const base = repoCacheDir(repo);
       if (this.locks.has(base)) progress({ phase: 'Waiting for another agent to finish cloning' });
       await this.withLock(base, async () => {
         signal?.throwIfAborted();
@@ -708,21 +750,31 @@ export class AgentManager extends EventEmitter {
       agent.sessions.push({ id: agent.sessionId, createdAt: now(), starts: 0 });
     }
 
-    const sid = agent.sessionId;
+    let sid = agent.sessionId;
     // A planning session ran in the holding folder: move its transcript into the
     // workspace so the same session (same ID, full history) continues there.
     const handoff = Boolean(agent.planning && !agent.planning.handedOffAt);
-    if (handoff) this.moveTranscript(agent, sid);
-    const resuming = fs.existsSync(transcriptPath(agent.workdir, sid));
-    const args = this.baseArgs(agent);
-    if (resuming) {
-      args.push('--resume', sid);
-      if (handoff) args.push('--', handoffMessage(agent));
-    } else {
-      args.push('--session-id', sid, '--name', agent.name);
-      if (agent.intent) args.push('--', agent.intent);
+    const engine = engineOf(agent);
+    if (handoff) engine.copySession({ fromCwd: agent.planning.dir, toCwd: agent.workdir, fromId: sid });
+    let resume = engine.hasSession(agent.workdir, sid);
+    if (!resume && !engine.supports.chooseSessionId && agent.lastStartedAt) {
+      // The engine picks its own IDs and we stopped before adopting one: find it rather than start over.
+      const known = new Set(this.store.list().flatMap((a) => a.sessions.map((s) => s.id)));
+      const prior = engine.recentSessions(agent.workdir, Date.parse(agent.lastStartedAt) - 1000).filter((f) => !known.has(f.sessionId));
+      if (prior.length === 1) {
+        sid = prior[0].sessionId;
+        agent.sessions.push({ id: sid, createdAt: now(), starts: 0, adopted: true });
+        resume = true;
+      }
     }
-    const proc = this.spawnClaude(agent, agent.workdir, args);
+    const args = engine.launchArgs({
+      ...this.launchOptions(agent),
+      sessionId: sid,
+      resume,
+      name: agent.name,
+      prompt: resume ? (handoff ? handoffMessage(agent) : null) : agent.intent,
+    });
+    const proc = this.spawnAgent(agent, agent.workdir, args);
 
     const session = agent.sessions.find((s) => s.id === sid);
     if (session) {
@@ -743,29 +795,36 @@ export class AgentManager extends EventEmitter {
     return this.view(this.store.get(agent.id));
   }
 
-  baseArgs(agent, { planning = false } = {}) {
-    const args = [...(this.config.claudeArgs ?? [])];
-    if (agent.permissionMode && agent.permissionMode !== 'default') args.push('--permission-mode', agent.permissionMode);
-    if (agent.model) args.push('--model', agent.model);
+  /** What every launch of this agent passes its engine: options, its brief folder, instructions. */
+  launchOptions(agent, { planning = false } = {}) {
+    const engine = engineOf(agent);
+    let writableDir = null;
     const prompts = [];
     const task = agent.kind !== 'general';
     const withBrief = Boolean(this.config.brief && task);
-    if (this.config.reviewConventions && task) prompts.push(conventionsPrompt({ withBrief }));
+    if (this.config.reviewConventions && task) prompts.push(conventionsPrompt({ withBrief, rulesFiles: engine.rulesFiles ?? null }));
     if (withBrief) {
-      // Let Claude write its brief without a permission prompt: that one folder only.
+      // Let the agent write its brief without a permission prompt: that one folder only.
       fs.mkdirSync(briefDir(agent.id), { recursive: true });
       const dir = fs.realpathSync(briefDir(agent.id));
-      args.push('--add-dir', dir, '--allowedTools', `Write(/${dir}/**)`, `Edit(/${dir}/**)`);
+      writableDir = dir;
       prompts.push(briefPrompt(path.join(dir, path.basename(briefPath(agent.id)))));
+      if (this.config.inbox !== false) prompts.push(questionsPrompt(path.join(dir, path.basename(questionsPath(agent.id)))));
+    }
+    if (agent.planReview && task) {
+      fs.mkdirSync(briefDir(agent.id), { recursive: true });
+      const file = path.join(fs.realpathSync(briefDir(agent.id)), path.basename(planPath(agent.id)));
+      writableDir ??= path.dirname(file);
+      prompts.push(agent.planReview.status === 'approved' ? planApprovedPrompt(file) : planReviewPrompt(file));
     }
     if (planning) prompts.push(planningPrompt(agent));
     // Appended system prompts last only for the process they're passed to, so they go on every launch.
-    if (prompts.length) args.push('--append-system-prompt', prompts.join('\n\n'));
-    return args;
+    return { extra: engine.extraArgs(this.config), permissionMode: agent.permissionMode, model: agent.model, writableDir, instructions: prompts.join('\n\n') || null };
   }
 
-  /** Spawn claude in a PTY for this agent, reusing its terminal clients and scrollback. */
-  spawnClaude(agent, cwd, args, { planning = false } = {}) {
+  /** Spawn the agent's engine in a PTY, reusing its terminal clients and scrollback. */
+  spawnAgent(agent, cwd, args, { planning = false } = {}) {
+    const engine = engineOf(agent);
     const prev = this.runtimes.get(agent.id) ?? { pty: null, ...loadScrollback(agent.id), restored: true };
     const rt = {
       pty: null,
@@ -794,7 +853,7 @@ export class AgentManager extends EventEmitter {
 
     if (this.config.trustAgentFolders) {
       try {
-        trustFolder(cwd);
+        engine.trust(cwd);
       } catch (err) {
         console.error(`[agentmgr] could not pre-trust ${cwd}: ${err.message}`);
       }
@@ -802,7 +861,7 @@ export class AgentManager extends EventEmitter {
 
     let proc;
     try {
-      proc = pty.spawn(this.config.claudeBin, args, {
+      proc = pty.spawn(engine.bin(this.config), args, {
         name: 'xterm-256color',
         cols: rt.cols,
         rows: rt.rows,
@@ -810,7 +869,7 @@ export class AgentManager extends EventEmitter {
         env: this.childEnv(agent),
       });
     } catch (err) {
-      this.patch(agent.id, { status: 'error', error: `Failed to launch ${this.config.claudeBin}: ${err.message}` });
+      this.patch(agent.id, { status: 'error', error: `Failed to launch ${engine.bin(this.config)}: ${err.message}` });
       throw err;
     }
     rt.pty = proc;
@@ -864,33 +923,24 @@ export class AgentManager extends EventEmitter {
     if (this.runtimes.get(agent.id)?.pty) return this.view(agent);
     const waiting = agent.status === 'preparing' || (agent.status === 'error' && !agent.workdir);
     if (!waiting) return this.start(agent.id); // workspace is ready: just run the agent there
+    if (!engineOf(agent).supports.planHandoff) {
+      throw Object.assign(new Error(`Planning while the repo clones isn't available for ${engineOf(agent).label} agents; it starts once the clone is ready`), { status: 409 });
+    }
     if (agent.planning?.handedOffAt) {
       throw Object.assign(new Error('This agent already moved into its workspace'), { status: 409 });
     }
     fs.mkdirSync(paths.planning, { recursive: true });
     const sid = agent.sessionId;
-    const args = this.baseArgs(agent, { planning: true });
-    if (fs.existsSync(transcriptPath(paths.planning, sid))) {
-      args.push('--resume', sid);
-    } else {
-      args.push('--session-id', sid, '--name', agent.name);
-      if (agent.intent) args.push('--', agent.intent);
-    }
-    const proc = this.spawnClaude(agent, paths.planning, args, { planning: true });
+    const engine = engineOf(agent);
+    const resume = engine.hasSession(paths.planning, sid);
+    const args = engine.launchArgs({ ...this.launchOptions(agent, { planning: true }), sessionId: sid, resume, name: agent.name, prompt: resume ? null : agent.intent });
+    const proc = this.spawnAgent(agent, paths.planning, args, { planning: true });
     this.patch(agent.id, {
       desired: 'running',
       pid: proc.pid,
       planning: { dir: paths.planning, startedAt: agent.planning?.startedAt ?? now(), ready: false },
     });
     return this.view(this.store.get(agent.id));
-  }
-
-  moveTranscript(agent, sid) {
-    const src = transcriptPath(agent.planning.dir, sid);
-    const dst = transcriptPath(agent.workdir, sid);
-    if (!fs.existsSync(src) || fs.existsSync(dst)) return;
-    fs.mkdirSync(path.dirname(dst), { recursive: true });
-    fs.copyFileSync(src, dst);
   }
 
   /**
@@ -1029,6 +1079,12 @@ export class AgentManager extends EventEmitter {
       }
     }
     this.closeShell(agent.id);
+    if (agent.workdir && fs.existsSync(agent.workdir)) await git.deleteRefs(agent.workdir, `refs/agentmgr/${agent.id}/`).catch(() => {});
+    else if (agent.sourceDir && fs.existsSync(agent.sourceDir)) await git.deleteRefs(agent.sourceDir, `refs/agentmgr/${agent.id}/`).catch(() => {});
+    this.changeSets.delete(agent.id);
+    this.stuck.delete(agent.id);
+    this.outbox.delete(agent.id);
+    this.recomputeConflicts();
     fs.rmSync(briefDir(agent.id), { recursive: true, force: true });
     fs.rmSync(scrollbackFile(agent.id), { force: true });
     fs.rmSync(path.join(paths.uploads, agent.id), { recursive: true, force: true });
@@ -1209,6 +1265,41 @@ export class AgentManager extends EventEmitter {
     return { ok: true };
   }
 
+  // --------------------------------------------------------------- browser tabs
+
+  /** Open a browser tab on an address (kept with the agent, so other devices see it too). */
+  addBrowser(ref, input) {
+    const agent = this.mustGet(ref);
+    const url = parseUrl(input).href;
+    const tabs = agent.browsers ?? [];
+    let n = 1;
+    while (tabs.some((t) => t.n === n)) n++;
+    this.patch(agent.id, { browsers: [...tabs, { n, url }] });
+    return { n, url };
+  }
+
+  setBrowser(ref, n, input) {
+    const agent = this.mustGet(ref);
+    const url = parseUrl(input).href;
+    if (!(agent.browsers ?? []).some((t) => t.n === n)) throw Object.assign(new Error(`No browser tab ${n}`), { status: 404 });
+    this.patch(agent.id, { browsers: agent.browsers.map((t) => (t.n === n ? { n, url } : t)) });
+    return { n, url };
+  }
+
+  dropBrowser(ref, n) {
+    const agent = this.mustGet(ref);
+    this.patch(agent.id, { browsers: (agent.browsers ?? []).filter((t) => t.n !== n) });
+    return { ok: true };
+  }
+
+  /** Local addresses the agent's session or shells printed recently, as suggestions. */
+  localUrls(ref) {
+    const agent = this.mustGet(ref);
+    const tail = (rt) => (rt?.chunks ?? []).join('').slice(-200_000);
+    const text = [...(this.shells.get(agent.id)?.values() ?? [])].map(tail).join('\n') + '\n' + tail(this.runtimes.get(agent.id));
+    return findLocalUrls(text);
+  }
+
   /** Save a file the user attached in the UI, so its path can be handed to Claude. */
   saveUpload(ref, name, data) {
     const agent = this.mustGet(ref);
@@ -1288,12 +1379,13 @@ export class AgentManager extends EventEmitter {
     const rt = this.runtimes.get(agent.id);
     if (!rt?.pty) return false;
     const known = new Set(this.store.list().flatMap((a) => a.sessions.map((s) => s.id)));
-    const candidates = recentSessionFiles(agent.workdir, rt.startedAt - 1000).filter((f) => !known.has(f.sessionId));
+    const engine = engineOf(agent);
+    const candidates = engine.recentSessions(agent.workdir, rt.startedAt - 1000).filter((f) => !known.has(f.sessionId));
     if (candidates.length !== 1) return false;
     const [cand] = candidates;
     let currentMtime = 0;
     try {
-      currentMtime = fs.statSync(transcriptPath(agent.workdir, agent.sessionId)).mtimeMs;
+      currentMtime = fs.statSync(engine.sessionFile(agent.workdir, agent.sessionId)).mtimeMs;
     } catch {}
     if (currentMtime > cand.mtimeMs) return false;
     agent.sessions.push({ id: cand.sessionId, createdAt: now(), starts: 1, lastStartedAt: now(), adopted: true });
@@ -1307,6 +1399,44 @@ export class AgentManager extends EventEmitter {
     if (!agent) return;
     const brief = loadBrief(id, agent.brief);
     if (brief) this.patch(id, { brief });
+    if (agent.planReview) {
+      const file = loadPlanFile(id, agent.planReview);
+      // A new or revised plan waits for review again, unless it was already approved (then it's a progress update).
+      if (file) this.patch(id, { planReview: { ...agent.planReview, ...file, status: agent.planReview.status === 'approved' ? 'approved' : 'review' } });
+    }
+  }
+
+  // -------------------------------------------------------------- plan review
+
+  /** Approve the plan (optionally with notes); the agent starts implementing. */
+  approvePlan(ref, note, { force = false } = {}) {
+    const agent = this.mustGet(ref);
+    if (!agent.planReview || agent.planReview.status === 'approved' || (!force && agent.planReview.status !== 'review')) throw Object.assign(new Error('There is no plan waiting for review'), { status: 409 });
+    this.patch(agent.id, { planReview: { ...agent.planReview, status: 'approved', decidedAt: now(), note: note?.trim() || null } });
+    return this.tell(agent.id, `Plan approved. Go ahead and implement it.${note?.trim() ? `\n\nNotes from the review:\n${note.trim()}` : ''}`);
+  }
+
+  /** Send the plan back with what to change; the agent revises PLAN.md and waits again. */
+  requestPlanChanges(ref, note) {
+    const agent = this.mustGet(ref);
+    if (!agent.planReview || agent.planReview.status === 'approved') throw Object.assign(new Error('There is no plan waiting for review'), { status: 409 });
+    if (!note?.trim()) throw Object.assign(new Error('Say what should change'), { status: 400 });
+    this.patch(agent.id, { planReview: { ...agent.planReview, status: 'changes', decidedAt: now(), note: note.trim() } });
+    return this.tell(agent.id, `Plan changes requested. Revise the plan file and wait for approval again:\n${note.trim()}`);
+  }
+
+  /** Turn plan review on (before the agent has implemented anything) or off (no longer waits). */
+  setPlanReview(ref, on) {
+    const agent = this.mustGet(ref);
+    if (on && !agent.planReview) {
+      this.patch(agent.id, { planReview: { status: 'writing' } });
+      const file = path.join(briefDir(agent.id), path.basename(planPath(agent.id)));
+      fs.mkdirSync(briefDir(agent.id), { recursive: true });
+      // A running session got its instructions at launch; tell it now.
+      if (this.runtimes.get(agent.id)?.pty) return this.tell(agent.id, `Change of process: ${planReviewPrompt(file)} If you already changed files, list them in the plan.`);
+    }
+    if (!on && agent.planReview && agent.planReview.status !== 'approved') return this.approvePlan(agent.id, null, { force: true });
+    return this.view(this.store.get(agent.id));
   }
 
   /**
@@ -1359,7 +1489,7 @@ export class AgentManager extends EventEmitter {
 
   /** A stakeholder document: analysis, design, flow or proposal. */
   document(ref, kind) {
-    if (!DOC_KINDS[kind]) throw Object.assign(new Error(`Unknown document "${kind}"`), { status: 400 });
+    if (!SUMMARIES[kind]?.doc) throw Object.assign(new Error(`Unknown document "${kind}"`), { status: 400 });
     return this.summarize(ref, kind);
   }
 
@@ -1372,7 +1502,7 @@ export class AgentManager extends EventEmitter {
     const run = this.summarySlot()
       .then((release) =>
         this.explainContext(agent)
-          .then((ctx) => this.runExplain(agent, { ...ctx, agentName: agent.name }, kind))
+          .then((ctx) => (SUMMARIES[kind].run ? this[SUMMARIES[kind].run](agent, ctx) : this.runExplain(agent, { ...ctx, agentName: agent.name }, kind)))
           .finally(release),
       )
       .catch((e) => {
@@ -1392,7 +1522,8 @@ export class AgentManager extends EventEmitter {
     const briefMarkdown = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
     const planningOnly = agent.planning && !agent.planning.handedOffAt && !agent.workdir;
     const sessionDir = planningOnly ? agent.planning.dir : agent.workdir;
-    const { digest } = sessionDir ? sessionDigest(transcriptPath(sessionDir, agent.sessionId)) : { digest: '' };
+    const engine = engineOf(agent);
+    const { digest } = sessionDir ? engine.digest(engine.sessionFile(sessionDir, agent.sessionId)) : { digest: '' };
     const phase = v.runtime.planning ? 'planning while the workspace is prepared' : agent.status;
     const status = [
       `status: ${phase}${v.runtime.running ? (v.runtime.busy ? ' (working right now)' : ' (idle, waiting for the next instruction)') : ''}`,
@@ -1424,26 +1555,30 @@ export class AgentManager extends EventEmitter {
     return { intent: agent.intent, status, digest, repo, briefMarkdown };
   }
 
+  /** The engine (and model) that writes an agent's summaries: its own when it can make a one-shot call, else Claude Code. */
+  writerFor(agent) {
+    const engine = engineOf(agent).supports.oneShot ? engineOf(agent) : engineOf(DEFAULT_ENGINE);
+    return { engine, model: engine.id === DEFAULT_ENGINE ? this.config.explainModel : this.config.engines?.[engine.id]?.explainModel };
+  }
+
+  /**
+   * Who double-checks the writer: `critique: { engine, model }` from config.json if set, else
+   * another installed engine (a different provider sees different things), else the same
+   * engine with another model.
+   */
+  criticFor(writer) {
+    const pick = this.config.critique ?? {};
+    const usable = (e) => e?.supports.oneShot && installed(e, this.config);
+    if (pick.engine && usable(ENGINES[pick.engine])) return { engine: ENGINES[pick.engine], model: pick.model ?? this.config.engines?.[pick.engine]?.explainModel };
+    const other = Object.values(ENGINES).find((e) => e.id !== writer.engine.id && usable(e));
+    if (other) return { engine: other, model: other.id === DEFAULT_ENGINE ? this.config.explainModel : this.config.engines?.[other.id]?.explainModel };
+    if (writer.engine.id === DEFAULT_ENGINE) return { engine: writer.engine, model: pick.model ?? (/opus/i.test(writer.model ?? '') ? 'sonnet' : 'opus') };
+    return { engine: writer.engine, model: pick.model ?? writer.model };
+  }
+
   runExplain(agent, ctx, kind = 'explain') {
     const { prompt } = SUMMARIES[kind];
-    const args = [...(this.config.claudeArgs ?? []), '-p', '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
-    args.push('--output-format', 'text');
-    if (this.config.explainModel) args.push('--model', this.config.explainModel);
-    return new Promise((resolve, reject) => {
-      const child = spawn(this.config.claudeBin, args, { cwd: paths.home, env: this.childEnv(agent), stdio: ['pipe', 'pipe', 'pipe'] });
-      let out = '';
-      let err = '';
-      const timer = setTimeout(() => child.kill('SIGTERM'), 300_000);
-      child.stdout.on('data', (d) => (out += d));
-      child.stderr.on('data', (d) => (err += d));
-      child.on('error', reject);
-      child.on('close', (code) => {
-        clearTimeout(timer);
-        if (code === 0 && out.trim()) resolve(out.trim());
-        else reject(new Error(`claude -p failed (exit ${code}): ${(err || out).trim().slice(-300)}`));
-      });
-      child.stdin.end(prompt(ctx));
-    }).then((markdown) => {
+    return this.oneShot(agent, prompt(ctx), this.writerFor(agent)).then((markdown) => {
       const cur = this.store.get(agent.id);
       if (!cur) return null;
       return this.view(
@@ -1453,6 +1588,70 @@ export class AgentManager extends EventEmitter {
         ),
       );
     });
+  }
+
+  /** One tool-less, read-only call to an engine; resolves to its text output. */
+  oneShot(agent, text, { engine, model }) {
+    // Some engines take the prompt as an argument instead of on stdin.
+    const args = [...engine.extraArgs(this.config), ...engine.oneShotArgs(this.config, { model, prompt: text })];
+    return new Promise((resolve, reject) => {
+      const child = spawn(engine.bin(this.config), args, { cwd: paths.home, env: this.childEnv(agent), stdio: ['pipe', 'pipe', 'pipe'] });
+      let out = '';
+      let err = '';
+      const timer = setTimeout(() => child.kill('SIGTERM'), 300_000);
+      child.stdout.on('data', (d) => (out += d));
+      child.stderr.on('data', (d) => (err += d));
+      child.on('error', reject);
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0 && out.trim()) resolve(out.trim());
+        else reject(new Error(`${engine.label} one-shot call failed (exit ${code}): ${(err || out).trim().slice(-300)}`));
+      });
+      child.stdin.end(engine.oneShotStdin === false ? '' : text);
+    });
+  }
+
+  /** Human vs AI: the writer splits and answers the open questions, then another model double-checks it. */
+  async runHumanAi(agent, ctx) {
+    const writer = this.writerFor(agent);
+    const data = parseJsonReply(await this.oneShot(agent, humanAiPrompt(ctx), writer));
+    if (!Array.isArray(data.human) || !Array.isArray(data.ai)) throw new Error('The reply was missing the "human" or "ai" list');
+    data.human = data.human.slice(0, 5);
+    data.ai = data.ai.slice(0, 5);
+    const critic = this.criticFor(writer);
+    const label = `${critic.engine.label}${critic.model ? ` (${critic.model})` : ''}`;
+    let critique;
+    try {
+      critique = { label, data: parseJsonReply(await this.oneShot(agent, critiquePrompt(ctx, data), critic)) };
+    } catch (err) {
+      critique = { label, error: err.message.slice(0, 300) };
+    }
+    const cur = this.store.get(agent.id);
+    if (!cur) return null;
+    const doc = { data, critique, answers: {}, writer: `${writer.engine.label}${writer.model ? ` (${writer.model})` : ''}` };
+    return this.view(
+      this.patch(
+        agent.id,
+        summaryPatch(cur, 'humanai', { ...doc, markdown: humanAiMarkdown(doc), at: now(), briefUpdatedAt: cur.brief?.updatedAt ?? null, pending: false, error: null }),
+      ),
+    );
+  }
+
+  /** Keep the person's answers to the Human vs AI questions; with `send`, also tell the agent. */
+  humanAiAnswers(ref, answers, { send = false } = {}) {
+    const agent = this.mustGet(ref);
+    const doc = agent.docs?.humanai;
+    if (!doc?.data) throw Object.assign(new Error('Write the Human vs AI review first'), { status: 409 });
+    const clean = {};
+    for (const [i, v] of Object.entries(answers ?? {})) if (doc.data.human[Number(i)] && typeof v === 'string') clean[i] = v.slice(0, 4000);
+    const next = { ...doc, answers: clean };
+    next.markdown = humanAiMarkdown(next);
+    this.patch(agent.id, summaryPatch(agent, 'humanai', next));
+    if (send) {
+      if (!Object.values(clean).some((v) => v.trim())) throw Object.assign(new Error('Answer at least one question first'), { status: 400 });
+      return this.tell(agent.id, humanAiMessage(next));
+    }
+    return this.view(this.store.get(agent.id));
   }
 
   briefFile(ref) {
@@ -1481,16 +1680,17 @@ export class AgentManager extends EventEmitter {
         changed = true;
       }
 
+      const engine = engineOf(agent);
       for (const session of agent.sessions) {
-        const file = transcriptPath(sessionDir, session.id);
+        const file = engine.sessionFile(sessionDir, session.id);
         const key = `${session.id}:${file}`; // the transcript moves at handoff; rescan the new copy
         const cursor = this.cursors.get(key) ?? { offset: 0 };
         this.cursors.set(key, cursor);
-        const res = scanTranscript(file, cursor, this.config.bugPatterns);
-        const subMaps = subagentTranscripts(sessionDir, session.id).map((sub) => {
+        const res = engine.scan(file, cursor, this.config.bugPatterns);
+        const subMaps = engine.subagentFiles(sessionDir, session.id).map((sub) => {
           const c = this.cursors.get(sub) ?? { offset: 0 };
           this.cursors.set(sub, c);
-          scanTranscript(sub, c);
+          engine.scan(sub, c);
           return c.usage;
         });
         const usage = sumUsage(cursor.usage, ...subMaps);
@@ -1523,6 +1723,9 @@ export class AgentManager extends EventEmitter {
         }
       }
 
+      await this.updateChanges(agent);
+      this.updateStuck(agent, sessionDir);
+
       if (changed && this.store.get(id)) {
         agent.updatedAt = now();
         this.store.save();
@@ -1534,6 +1737,263 @@ export class AgentManager extends EventEmitter {
     }
   }
 
+  // ------------------------------------------------------ telling an agent
+
+  /**
+   * Type a message into an agent's session as if the user sent it: queued until the agent
+   * is idle (not mid-turn, no prompt open), resuming a closed agent first.
+   */
+  tell(ref, text, { source = 'user' } = {}) {
+    const agent = this.mustGet(ref);
+    text = String(text ?? '').trim();
+    if (!text) throw Object.assign(new Error('Message is empty'), { status: 400 });
+    if (!this.outbox.has(agent.id)) this.outbox.set(agent.id, []);
+    this.outbox.get(agent.id).push({ text, source, at: now() });
+    if (!this.runtimes.get(agent.id)?.pty && agent.workdir && agent.status !== 'preparing') this.start(agent.id);
+    this.changed(agent);
+    return this.view(this.store.get(agent.id));
+  }
+
+  deliverOutbox(t = Date.now()) {
+    for (const [id, queue] of this.outbox) {
+      const rt = this.runtimes.get(id);
+      if (!queue.length) {
+        this.outbox.delete(id);
+        continue;
+      }
+      // Idle, no prompt open, and not right after our last message (give it time to react).
+      if (!rt?.pty || rt.busy || rt.attention || rt.planning || t - (rt.startedAt ?? 0) < 2500 || t - (rt.toldAt ?? 0) < 8000) continue;
+      const { text } = queue.shift();
+      rt.toldAt = t;
+      // Bracketed paste keeps a multi-line message as one message instead of submitting each line.
+      rt.pty.write(text.includes('\n') ? `\x1b[200~${text}\x1b[201~` : text);
+      setTimeout(() => rt.pty?.write('\r'), 250);
+      const a = this.store.get(id);
+      if (a) this.changed(a);
+    }
+  }
+
+  // ------------------------------------------------------- conflict radar
+
+  /** Recompute what an agent's branch changed since it branched (needs a base commit). */
+  async updateChanges(agent) {
+    const baseSha = agent.baseRef?.split(' @ ')[1];
+    if (!agent.workdir || !baseSha || agent.kind === 'general' || !fs.existsSync(agent.workdir)) return;
+    // A full diff against the base is heavier than git status; once a minute is enough for overlaps.
+    const prev0 = this.changeSets.get(agent.id);
+    if (prev0 && Date.now() - Date.parse(prev0.at) < (this.config.conflictRefreshSec ?? 60) * 1000) return;
+    const res = await git.changes(agent.workdir, baseSha).catch(() => null);
+    if (!res || !this.store.get(agent.id)) return;
+    const prev = this.changeSets.get(agent.id);
+    this.changeSets.set(agent.id, { ...res, baseSha, at: now() });
+    if (JSON.stringify(prev?.files) !== JSON.stringify(res.files)) this.recomputeConflicts();
+  }
+
+  recomputeConflicts() {
+    const entries = [...this.changeSets.entries()]
+      .map(([id, c]) => ({ agent: this.store.get(id), changes: c, baseSha: c.baseSha }))
+      .filter((e) => e.agent);
+    const next = findConflicts(entries);
+    const ids = new Set([...this.conflicts.keys(), ...next.keys()]);
+    const before = this.conflicts;
+    this.conflicts = next;
+    for (const id of ids) {
+      if (JSON.stringify(before.get(id) ?? []) === JSON.stringify(next.get(id) ?? [])) continue;
+      const a = this.store.get(id);
+      if (a) this.changed(a);
+    }
+  }
+
+  /** Tell an agent (or both) about an overlap with another agent. */
+  warnConflict(ref, otherId) {
+    const agent = this.mustGet(ref);
+    const group = summarizeConflicts(this.conflicts.get(agent.id)).find((g) => g.agent.id === otherId);
+    if (!group) throw Object.assign(new Error('No overlap with that agent right now'), { status: 404 });
+    return this.tell(agent.id, conflictMessage(agent, group), { source: 'conflict' });
+  }
+
+  // ------------------------------------------------------- stuck detection
+
+  updateStuck(agent, sessionDir) {
+    if (!sessionDir) return;
+    const key = `${agent.sessionId}:${sessionDir}`;
+    const state = this.activity.get(key) ?? {};
+    const engine = engineOf(agent);
+    this.activity.set(key, engine.activity(engine.sessionFile(sessionDir, agent.sessionId), state));
+    const running = Boolean(this.runtimes.get(agent.id)?.pty);
+    const found = running ? detectStuck(state.events, { opts: { ...STUCK_DEFAULTS, ...this.config.stuck } }) : [];
+    const before = JSON.stringify(this.stuck.get(agent.id) ?? []);
+    this.stuck.set(agent.id, found);
+    if (before !== JSON.stringify(found)) this.changed(agent);
+  }
+
+  /** Findings the user hasn't dismissed. A dismissal holds until that finding clears. */
+  activeStuck(agent) {
+    const found = this.stuck.get(agent.id) ?? [];
+    const dismissed = agent.stuckDismissed ?? {};
+    return found.filter((f) => dismissed[f.key] !== f.since);
+  }
+
+  dismissStuck(ref, key) {
+    const agent = this.mustGet(ref);
+    const f = (this.stuck.get(agent.id) ?? []).find((x) => x.key === key);
+    if (!f) return this.view(agent);
+    return this.view(this.patch(agent.id, { stuckDismissed: { ...agent.stuckDismissed, [key]: f.since } }));
+  }
+
+  nudge(ref, key, text) {
+    const agent = this.mustGet(ref);
+    const f = (this.stuck.get(agent.id) ?? []).find((x) => x.key === key);
+    const message = text?.trim() || f?.nudge;
+    if (!message) throw Object.assign(new Error('Nothing to send'), { status: 400 });
+    this.tell(agent.id, message, { source: 'nudge' });
+    return f ? this.dismissStuck(agent.id, key) : this.view(agent);
+  }
+
+  // ------------------------------------------------------- decision inbox
+
+  questionsView(agent) {
+    if (agent.kind === 'general') return [];
+    const answers = agent.answers ?? {};
+    return loadQuestions(agent.id).map((q) => ({ ...q, answer: answers[q.id] ?? null }));
+  }
+
+  answerQuestion(ref, qid, text) {
+    const agent = this.mustGet(ref);
+    const q = loadQuestions(agent.id).find((x) => x.id === qid);
+    if (!q) throw Object.assign(new Error('No such question'), { status: 404 });
+    text = String(text ?? '').trim();
+    if (!text) throw Object.assign(new Error('Answer is empty'), { status: 400 });
+    this.patch(agent.id, { answers: { ...agent.answers, [qid]: { text, at: now() } } });
+    return this.tell(agent.id, answerMessage(q, text), { source: 'answer' });
+  }
+
+  /** Everything waiting on the user, across agents: prompts, questions, stuck agents, overlaps. */
+  inbox() {
+    const items = [];
+    for (const agent of this.store.list()) {
+      const v = this.view(agent);
+      const base = { agentId: agent.id, agentName: agent.name, project: v.projectInfo?.name ?? null, priority: v.priority };
+      if (v.runtime.attention) {
+        items.push({ ...base, kind: 'prompt', key: `prompt:${agent.id}`, title: v.runtime.attention, prompt: v.runtime.prompt, at: v.runtime.lastOutputAt });
+      }
+      for (const q of v.questions) if (!q.answer) items.push({ ...base, kind: 'question', key: `q:${agent.id}:${q.id}`, title: q.question, question: q });
+      for (const f of v.stuck) items.push({ ...base, kind: 'stuck', key: `stuck:${agent.id}:${f.key}`, title: f.title, finding: f, at: f.since });
+      for (const g of v.conflicts) {
+        // One entry per pair, on the agent that should rebase.
+        if (g.mergeFirst === agent.id) continue;
+        items.push({ ...base, kind: 'conflict', key: `conflict:${agent.id}:${g.agent.id}`, title: `Overlaps with ${g.agent.name}`, conflict: g });
+      }
+    }
+    const order = { prompt: 0, question: 1, stuck: 2, conflict: 3 };
+    return items.sort((a, b) => order[a.kind] - order[b.kind] || a.priority - b.priority);
+  }
+
+  /** Send keys to a live prompt (e.g. "1" to pick the first option). */
+  answerPrompt(ref, key) {
+    const agent = this.mustGet(ref);
+    const keys = { esc: '\x1b', enter: '\r', up: '\x1b[A', down: '\x1b[B' };
+    const data = keys[key] ?? (/^\d$/.test(key) ? key : null);
+    if (!data) throw Object.assign(new Error('Unsupported key'), { status: 400 });
+    this.write(agent.id, data);
+    return { ok: true };
+  }
+
+  // ------------------------------------------------------- checkpoints and forks
+
+  /**
+   * At the end of a turn, snapshot the working tree (as a commit under refs/agentmgr/<id>/)
+   * together with how far the transcript had got, so the agent can be forked from here later.
+   */
+  async checkpoint(id) {
+    const agent = this.store.get(id);
+    if (!agent?.workdir || agent.kind === 'general' || !agent.branch || this.checkpointing?.has(id)) return null;
+    // Output pauses mid-turn too (a slow command); one snapshot per half minute is plenty.
+    this.lastCheckpointTry ??= new Map();
+    if (Date.now() - (this.lastCheckpointTry.get(id) ?? 0) < 30_000) return null;
+    this.lastCheckpointTry.set(id, Date.now());
+    (this.checkpointing ??= new Set()).add(id);
+    try {
+      const snap = await git.snapshot(agent.workdir).catch(() => null);
+      const cur = this.store.get(id);
+      if (!snap || !cur) return null;
+      const list = cur.checkpoints ?? [];
+      let bytes = 0;
+      try {
+        bytes = fs.statSync(engineOf(cur).sessionFile(cur.workdir, cur.sessionId)).size;
+      } catch {}
+      const last = list.at(-1);
+      if (last && last.tree === snap.tree && last.sessionId === cur.sessionId && last.bytes === bytes) return null;
+      const n = (last?.n ?? 0) + 1;
+      await git.setRef(cur.workdir, `refs/agentmgr/${id}/${n}`, snap.sha);
+      const session = cur.sessions.find((s) => s.id === cur.sessionId);
+      list.push({ n, at: now(), sha: snap.sha, tree: snap.tree, head: snap.head, sessionId: cur.sessionId, bytes, prompt: session?.lastPrompt?.slice(0, 200) ?? null });
+      const max = this.config.maxCheckpoints ?? 40;
+      while (list.length > max) {
+        const old = list.shift();
+        await git.run('git', ['update-ref', '-d', `refs/agentmgr/${id}/${old.n}`], { cwd: cur.workdir }).catch(() => {});
+      }
+      this.patch(id, { checkpoints: list });
+      return list.at(-1);
+    } finally {
+      this.checkpointing.delete(id);
+    }
+  }
+
+  /**
+   * A new agent that starts where this one is now (or at checkpoint `n`): its own worktree
+   * holding the same code (commits and uncommitted work), and a copy of the conversation
+   * under a new session ID. The original keeps running untouched.
+   */
+  async fork(ref, { checkpoint: n, name, instructions } = {}) {
+    const src = this.mustGet(ref);
+    if (!engineOf(src).supports.fork) throw Object.assign(new Error(`Forking isn't available for ${engineOf(src).label} agents yet`), { status: 409 });
+    if (!src.workdir || !src.branch || !(await git.isGitRepo(src.workdir))) {
+      throw Object.assign(new Error('Only agents with their own git worktree can be forked'), { status: 409 });
+    }
+    let point;
+    if (n) {
+      point = (src.checkpoints ?? []).find((c) => c.n === Number(n));
+      if (!point) throw Object.assign(new Error(`No checkpoint ${n}`), { status: 404 });
+    } else {
+      const snap = await git.snapshot(src.workdir, 'agentmgr fork');
+      if (!snap) throw Object.assign(new Error('Nothing to fork yet (no commits)'), { status: 409 });
+      let bytes = 0;
+      try {
+        bytes = fs.statSync(engineOf(src).sessionFile(src.workdir, src.sessionId)).size;
+      } catch {}
+      point = { sha: snap.sha, head: snap.head, sessionId: src.sessionId, bytes };
+    }
+    const forks = this.store.list().filter((a) => a.forkOf?.agentId === src.id).length;
+    const agent = this.create({
+      intent: src.intent,
+      name: name || `${src.name}-fork${forks + 1}`,
+      repo: src.repo ?? undefined,
+      permissionMode: src.permissionMode,
+      model: src.model ?? undefined,
+      project: src.project ?? undefined,
+      priority: src.priority,
+      start: true,
+      workspace: (a, opts) => this.forkWorkspace(a, src, point, opts),
+    });
+    this.patch(agent.id, { forkOf: { agentId: src.id, name: src.name, checkpoint: n ? Number(n) : null, at: now() }, baseRef: src.baseRef });
+    if (instructions?.trim()) this.tell(agent.id, instructions.trim(), { source: 'fork' });
+    return this.view(this.store.get(agent.id));
+  }
+
+  async forkWorkspace(agent, src, point, { signal, progress }) {
+    const root = src.sourceDir || (await git.run('git', ['rev-parse', '--show-toplevel'], { cwd: src.workdir }));
+    const workdir = path.join(paths.workspaces, `${path.basename(src.workdir).replace(/-[0-9a-f]{6}$/, '')}-fork-${agent.id}`);
+    const branch = `agent/${agent.slug}-${agent.id}`;
+    progress({ phase: 'Checking out' });
+    await this.withLock(root, () => git.addWorktree(root, workdir, branch, point.head, { signal, onProgress: (p) => progress({ phase: 'Checking out', ...p }) }));
+    // Same uncommitted work as the source had at that point.
+    await git.restoreSnapshot(workdir, point.sha);
+    // Same conversation, under the fork's own session ID.
+    engineOf(src).copySession({ fromCwd: src.workdir, toCwd: workdir, fromId: point.sessionId, toId: agent.sessionId, bytes: point.bytes });
+    return { workdir, sourceDir: root, branch, worktree: true, repo: src.repo, baseRef: src.baseRef };
+  }
+
   tick() {
     this.tickCount++;
     const t = Date.now();
@@ -1541,11 +2001,15 @@ export class AgentManager extends EventEmitter {
       if (rt.busy && t - rt.lastOutputAt > BUSY_IDLE_MS) {
         rt.busy = false;
         const screen = rt.tail.slice(-1500).replace(ANSI, '').replace(/\s+/g, '');
-        rt.attention = ATTENTION.find(([re]) => re.test(screen))?.[1] ?? null;
+        const a0 = this.store.get(id);
+        rt.attention = (a0 ? engineOf(a0).attention : []).find(([re]) => re.test(screen))?.[1] ?? null;
         const a = this.store.get(id);
         if (a) this.changed(a);
+        // A turn just ended: remember the code and conversation at this point.
+        if (a && !rt.planning && !rt.attention) this.checkpoint(id).catch(() => {});
       }
     }
+    this.deliverOutbox(t);
     for (const [id, rt] of this.runtimes) {
       if (rt.pty) this.reloadBrief(id);
     }

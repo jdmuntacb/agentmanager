@@ -12,6 +12,9 @@ export const EVENT_DEFAULTS = {
   error: true, // workspace setup or launch failed
   blocked: true, // the agent reports it is blocked (brief status / results outcome)
   waiting: false, // finished its turn and idle (can be noisy)
+  stuck: true, // going in circles: same failure, undoing its edits, or long stretches without changes
+  conflict: true, // changing the same files as another agent in the same repo
+  question: true, // asked a question in the decision inbox
 };
 
 export function loadNotify() {
@@ -139,6 +142,36 @@ export class Notifier {
         this.send('blocked', a, `is blocked${why ? `: ${why}` : ''}`);
       }
     } else s.sent.delete('blocked');
+    for (const f of a.stuck ?? []) {
+      const k = `stuck:${f.key}:${f.since}`;
+      if (!s.sent.has(k)) {
+        s.sent.add(k);
+        this.send('stuck', a, `may be stuck: ${f.title}`);
+      }
+    }
+    for (const g of a.conflicts ?? []) {
+      const k = `conflict:${g.agent.id}:${g.files.map((f) => f.file).join(',')}`;
+      // Announce each pair once, from the agent that should rebase.
+      if (g.mergeFirst !== a.id && !s.sent.has(k)) {
+        s.sent.add(k);
+        this.send('conflict', a, `changes the same files as *${g.agent.name}*: ${g.files.slice(0, 3).map((f) => f.file).join(', ')}${g.files.length > 3 ? '…' : ''}`);
+      }
+    }
+    for (const q of a.questions ?? []) {
+      const k = `question:${q.id}`;
+      if (!q.answer && !s.sent.has(k)) {
+        s.sent.add(k);
+        this.send('question', a, `asks: ${q.question}`);
+      }
+    }
+    // A plan waiting for review is an inbox decision too (same switch as questions).
+    if (a.planReview?.status === 'review') {
+      const k = `plan:${a.planReview.updatedAt}`;
+      if (!s.sent.has(k)) {
+        s.sent.add(k);
+        this.send('question', a, 'wrote its implementation plan; review it before it starts');
+      }
+    }
     if (a.status === 'error') {
       if (!s.sent.has('error')) {
         s.sent.add('error');
@@ -180,7 +213,7 @@ export class Notifier {
   send(kind, agent, what) {
     const n = loadNotify();
     if (!n.enabled || !n.events[kind]) return;
-    const icon = { needsInput: ':raised_hand:', review: ':white_check_mark:', error: ':x:', waiting: ':hourglass_flowing_sand:', blocked: ':no_entry:' }[kind];
+    const icon = { needsInput: ':raised_hand:', review: ':white_check_mark:', error: ':x:', waiting: ':hourglass_flowing_sand:', blocked: ':no_entry:', stuck: ':repeat:', conflict: ':crossed_swords:', question: ':question:' }[kind];
     const project = agent.projectInfo?.name ? ` (${agent.projectInfo.name})` : '';
     const link = this.linkFor(agent.id);
     const intent = n.includeIntent && agent.intent ? `\n> ${agent.intent.replace(/\s+/g, ' ').slice(0, 200)}` : '';

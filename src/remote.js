@@ -86,6 +86,8 @@ function certificateUsable() {
   }
 }
 
+export const certificatePaths = () => ({ key: KEY, cert: CERT });
+
 export async function ensureCertificate() {
   if (fs.existsSync(KEY) && fs.existsSync(CERT) && certificateUsable()) return { key: KEY, cert: CERT };
   fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
@@ -130,6 +132,7 @@ export function loadSettings() {
     enabled: s.enabled ?? envDefault ?? true,
     port: s.port ?? PORT + 1,
     extraHosts: s.extraHosts ?? [],
+    relayPorts: s.relayPorts ?? {},
   };
 }
 
@@ -169,12 +172,12 @@ export function checkToken(candidate) {
   return crypto.timingSafeEqual(a, b);
 }
 
-export function createSession({ ua, ip }) {
+export function createSession({ ua, ip, via }) {
   const s = load();
   const secret = newSecret();
   const id = crypto.randomBytes(4).toString('hex');
   s.sessions ??= {};
-  s.sessions[sha256(secret)] = { id, ua: String(ua ?? '').slice(0, 200), ip, createdAt: new Date().toISOString(), lastSeen: new Date().toISOString() };
+  s.sessions[sha256(secret)] = { id, ua: String(ua ?? '').slice(0, 200), ip, ...(via ? { via } : {}), createdAt: new Date().toISOString(), lastSeen: new Date().toISOString() };
   save(s);
   return { secret, maxAgeSec: SESSION_DAYS * 86400 };
 }
@@ -215,6 +218,29 @@ export function revokeSession(id) {
   const s = load();
   for (const [k, v] of Object.entries(s.sessions ?? {})) if (v.id === id) delete s.sessions[k];
   save(s);
+}
+
+// ------------------------------------------------------------- one-time tickets
+
+// A hub that this machine allows "signin" can ask for a ticket: one use, a minute, kept in
+// memory only. It signs a browser in like the access token, so the hub page can open this
+// machine's own page without the token being at hand.
+const TICKET_MS = 60_000;
+const tickets = new Map(); // sha256(ticket) -> expiry
+
+export function createTicket() {
+  const t = newSecret();
+  for (const [k, exp] of tickets) if (exp < Date.now()) tickets.delete(k);
+  tickets.set(sha256(t), Date.now() + TICKET_MS);
+  return t;
+}
+
+export function useTicket(candidate) {
+  if (typeof candidate !== 'string' || !candidate) return false;
+  const key = sha256(candidate);
+  const exp = tickets.get(key);
+  tickets.delete(key);
+  return Boolean(exp && exp >= Date.now());
 }
 
 // ------------------------------------------------------------- login throttling

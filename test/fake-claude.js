@@ -14,6 +14,16 @@ if (args.includes('-p')) {
     const ok = args[args.indexOf('--tools') + 1] === '' && args.includes('--strict-mcp-config');
     const section = (tag) => input.match(new RegExp(`<${tag}>\\n([\\s\\S]*?)\\n</${tag}>`))?.[1] ?? '';
     const conv = section('conversation');
+    if (input.startsWith('You help a person supervise')) {
+      // Human vs AI, first pass: JSON (wrapped in a fence, as models sometimes do).
+      const reply = {
+        title: section('intent'),
+        human: [1, 2, 3, 4, 5, 6].map((i) => ({ question: `Human question ${i}?`, why_human: 'Needs intent', stakes: 'Wrong product', options: ['A', 'B'], lean: i === 1 ? 'A' : null })),
+        ai: [{ question: 'Do the tests pass?', answer: ok ? 'Safe call: yes.' : 'UNSAFE', confidence: 'high', evidence: ['npm test'], check: 'Run npm test' }],
+      };
+      process.stdout.write('```json\n' + JSON.stringify(reply) + '\n```\n', () => process.exit(0));
+      return;
+    }
     const doc = input.match(/^Write a (\w+) document/)?.[1];
     if (doc) {
       process.stdout.write(
@@ -88,6 +98,23 @@ if (briefDir) {
       '- [ ] manual SSO login',
       '',
     ].join('\n'),
+  );
+}
+const prompt = args.includes('--') ? args[args.indexOf('--') + 1] ?? '' : '';
+// "#stuck": the same command failing the same way three times.
+if (prompt.includes('#stuck')) {
+  for (let i = 0; i < 3; i++) {
+    const id = `toolu_${sid.slice(0, 8)}_${i}`;
+    const timestamp = new Date().toISOString();
+    write({ type: 'assistant', timestamp, message: { id: `msg_stuck_${i}`, content: [{ type: 'tool_use', id, name: 'Bash', input: { command: 'npm test' } }] } });
+    write({ type: 'user', timestamp, message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: true, content: 'Exit code 1\nFAIL auth.test.js: expected 200, got 401' }] } });
+  }
+}
+// "#question": a question for the decision inbox, next to the brief.
+if (prompt.includes('#question') && briefDir) {
+  fs.writeFileSync(
+    path.join(briefDir, 'QUESTIONS.md'),
+    '## Postgres or SQLite for the cache?\nOptions: Postgres | SQLite\nDefault: SQLite\nThe data set is small.\n',
   );
 }
 if (args.includes('--') && args[args.indexOf('--') + 1]?.includes('#ask')) {

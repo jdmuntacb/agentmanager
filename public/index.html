@@ -29,6 +29,7 @@
       <aside class="sidebar">
         <div class="side-tabs" role="tablist">
           <button class="side-tab active" data-tab="agents" role="tab">Agents</button>
+          <button class="side-tab" data-tab="inbox" role="tab" title="Everything waiting on you: prompts, questions, stuck agents, overlaps">Inbox <span id="inbox-count" class="badge"></span></button>
           <button class="side-tab" data-tab="backlog" role="tab">Backlog <span id="backlog-count" class="badge"></span></button>
         </div>
         <div id="agents-view">
@@ -36,6 +37,7 @@
           <ul id="agent-list" class="agent-list" aria-label="Agents"></ul>
         </div>
         <div id="backlog-view" hidden></div>
+        <div id="inbox-view" hidden></div>
         <div id="empty" class="empty" hidden>
           <p>No agents yet.</p>
           <p>Add one or more intents and a repo or folder to get started.</p>
@@ -51,6 +53,8 @@
               <button class="term-tab" data-kind="claude" role="tab">Claude</button>
               <span id="shell-tabs" class="term-tabs"></span>
               <button class="term-tab term-add" id="shell-new" title="Open another shell in the agent's folder">+ Shell</button>
+              <span id="browser-tabs" class="term-tabs"></span>
+              <button class="term-tab term-add" id="browser-new" title="View a page as this machine sees it (a dev server on localhost, or any address), from any device">+ Browser</button>
             </div>
             <span id="term-title"></span>
             <span class="spacer"></span>
@@ -60,6 +64,25 @@
             <button id="term-close" class="ghost small" title="Hide the terminal (the agent keeps running)">Hide terminal</button>
           </div>
           <div id="terminal" class="terminal"></div>
+          <div id="browser" class="browser">
+            <form id="browser-bar" class="browser-bar" autocomplete="off">
+              <button type="button" id="browser-reload" class="ghost small" title="Reload the page">⟳</button>
+              <input id="browser-url" placeholder="localhost:5173, a port, or any address" spellcheck="false" autocapitalize="off" autocorrect="off" enterkeyhint="go">
+              <button class="small">Go</button>
+              <a id="browser-pop" class="ghost small button" target="_blank" rel="noopener" title="Open in a new browser tab" hidden>↗</a>
+            </form>
+            <div id="browser-hint" class="browser-hint" hidden>Blank? Many sites refuse to show inside another page. Open it with ↗ instead.</div>
+            <div id="browser-cert" class="browser-start" hidden>
+              <p><b>One more step on this device.</b> Each browser tab goes through its own port, and this device hasn't accepted Agent Manager's certificate for this one yet.</p>
+              <p>Open it, accept the warning the same way you did for Agent Manager (Safari: Show Details → visit this website), then come back here. You only do this once per site; it keeps its port.</p>
+              <div><a id="browser-cert-open" class="button primary small" target="_blank" rel="noopener">Open and accept</a> <button type="button" id="browser-cert-retry" class="small">Done, load it</button></div>
+            </div>
+            <div id="browser-start" class="browser-start" hidden>
+              <p>Open a page as this machine sees it: the agent's dev server, a site on its network or VPN, or any address. It works from your phone or laptop too: Agent Manager relays it over its own secure connection, for signed-in devices only.</p>
+              <div id="browser-suggest"></div>
+            </div>
+            <div id="browser-frames" class="browser-frames"></div>
+          </div>
           <div id="term-drop" class="term-drop" hidden>Drop files to attach</div>
           <div class="keybar" id="keybar" aria-label="Terminal keys">
             <button data-key="esc">Esc</button>
@@ -93,7 +116,7 @@
         <h2>New agents</h2>
         <label>
           Intents <span class="hint">one per line; each gets its own agent</span>
-          <textarea name="intents" rows="6" required placeholder="Fix the flaky test in auth/login_test.go&#10;Add pagination to the /users API&#10;Investigate MB-12345 and open a PR with a fix"></textarea>
+          <textarea name="intents" rows="6" required placeholder="Add a dark mode toggle that remembers the user's choice&#10;Make search results show up as you type&#10;Find out why the dashboard takes 5 seconds to load and speed it up&#10;Add a one-click CSV export to the reports page"></textarea>
         </label>
         <div class="row">
           <label>
@@ -120,6 +143,10 @@
             Model <span class="hint">optional</span>
             <input name="model" placeholder="e.g. opus" />
           </label>
+          <label id="engine-field" hidden>
+            Engine
+            <select name="engine"><option value="">Claude Code</option></select>
+          </label>
         </div>
         <label>
           Project <span class="hint">optional; a shortcut like <code>cc</code> fills in its repo, or name a new project</span>
@@ -138,9 +165,14 @@
           <input type="checkbox" name="plan" checked />
           Plan with Claude while the repo clones <span class="hint">(repo URLs only; the session moves into the repo when it's ready)</span>
         </label>
+        <label class="check">
+          <input type="checkbox" name="planReview" />
+          Review the implementation plan first <span class="hint">(the agent writes a plan and waits for your approval before changing anything)</span>
+        </label>
         <div class="row when">
           <label class="check"><input type="radio" name="when" value="now" checked /> Start now</label>
           <label class="check"><input type="radio" name="when" value="backlog" /> Queue in backlog</label>
+          <label class="check" title="Several agents try the same intent; compare and keep the best"><input type="radio" name="when" value="race" /> Race variants</label>
           <label class="check">Priority
             <select name="priority" aria-label="Priority">
               <option value="0">P0 urgent</option>
@@ -148,6 +180,16 @@
               <option value="2" selected>P2 normal</option>
               <option value="3">P3 low</option>
             </select>
+          </label>
+        </div>
+        <div class="race-only" hidden>
+          <label>
+            Variants <span class="hint">one per line: <code>model</code>, <code>model | approach</code>, or <code>| approach</code>. At least two.</span>
+            <textarea name="variants" rows="3" placeholder="opus&#10;sonnet&#10;| Keep the change as small as possible"></textarea>
+          </label>
+          <label>
+            Test command <span class="hint">optional; run in each attempt's worktree to compare</span>
+            <input name="testCommand" placeholder="npm test" />
           </label>
         </div>
         <label class="check now-only">
@@ -205,6 +247,17 @@
       </div>
       <p id="doc-meta" class="hint"></p>
       <article id="doc-body" class="md doc-body"></article>
+      <div id="doc-foot" class="doc-foot" hidden></div>
+    </dialog>
+
+    <dialog id="race-dialog" class="doc-dialog">
+      <div class="doc-head">
+        <h2 id="race-title">Race</h2>
+        <span class="spacer"></span>
+        <button type="button" id="race-delete" class="small ghost" title="Forget this race (its agents stay)">Forget race</button>
+        <button type="button" id="race-close" class="small ghost">Close</button>
+      </div>
+      <div id="race-body" class="race-body"></div>
     </dialog>
 
     <dialog id="alerts-dialog">
@@ -223,6 +276,9 @@
           <label class="check"><input type="checkbox" name="ev_review" /> finishes a backlog item (ready for review)</label>
           <label class="check"><input type="checkbox" name="ev_error" /> fails (setup or launch error)</label>
           <label class="check"><input type="checkbox" name="ev_blocked" /> reports it is blocked</label>
+          <label class="check"><input type="checkbox" name="ev_stuck" /> seems stuck (same failure, undoing its edits, no progress)</label>
+          <label class="check"><input type="checkbox" name="ev_conflict" /> changes the same files as another agent</label>
+          <label class="check"><input type="checkbox" name="ev_question" /> asks a question in the inbox</label>
           <label class="check"><input type="checkbox" name="ev_waiting" /> finished its turn and is idle after <input name="waitingDelaySec" type="number" min="0" class="num" />s</label>
           <label class="check"><input type="checkbox" name="skipWhenWatching" /> not while I have its terminal open</label>
           <label class="check"><input type="checkbox" name="includeIntent" /> include the intent text in the message</label>

@@ -137,8 +137,22 @@ export function loadBrief(agentId, prev) {
   return { ...parseBrief(markdown), mtimeMs: st.mtimeMs, updatedAt: st.mtime.toISOString() };
 }
 
-/** Ask the agent to learn and follow the project's and user's own rules before working. */
-export const conventionsPrompt = ({ withBrief }) =>
+/**
+ * Ask the agent to learn and follow the project's and user's own rules before working.
+ * Claude Code gets the full list of its own files; other engines get their rules files
+ * (`rulesFiles` on the adapter) and a plain warning against turning this into research,
+ * which a smaller model otherwise did (it searched the whole disk for Claude's settings).
+ */
+export const conventionsPrompt = ({ withBrief, rulesFiles = null }) =>
+  (rulesFiles
+    ? 'Before you change anything, take a quick look at the rules this project has set up, and follow them throughout:\n' +
+      `- Read ${rulesFiles.join(', ')} and any CONTRIBUTING guide in the repository root and the folders you work in, if they exist.\n` +
+      '- If the repository has SKILL.md files under .claude/skills/, read the ones relevant to this task.\n' +
+      "This is a quick check, not an investigation: don't search outside the repository, and if there's nothing, go straight to the task." +
+      (withBrief ? '\nRecord what applies as the first item under Checks in the brief, for example: "- [x] Reviewed conventions: AGENTS.md".' : '')
+    : conventionsClaude({ withBrief }));
+
+const conventionsClaude = ({ withBrief }) =>
   'Before you change anything, learn the rules this project and user have set up, and follow them throughout:\n' +
   '- Read the CLAUDE.md and AGENTS.md files (repository root, the folders you work in, and ~/.claude/CLAUDE.md) ' +
   'and any CONTRIBUTING guide.\n' +
@@ -326,4 +340,173 @@ export function docPrompt(kind, { intent, status, digest, repo, briefMarkdown, a
     briefMarkdown || '(no brief yet)',
     '</brief>',
   ].join('\n');
+}
+
+// ------------------------------------------------------------------ Human vs AI
+
+const contextBlock = ({ intent, status, digest, repo, briefMarkdown }) => [
+  '<agent_status>',
+  status,
+  '</agent_status>',
+  '<intent>',
+  intent || '(none)',
+  '</intent>',
+  '<conversation>',
+  digest || '(no conversation recorded yet)',
+  '</conversation>',
+  '<repository>',
+  repo || '(no repository changes recorded)',
+  '</repository>',
+  '<brief>',
+  briefMarkdown || '(no brief yet)',
+  '</brief>',
+];
+
+/**
+ * Human vs AI: split the open questions about an agent's work into the few that need a
+ * person's judgment and the ones a model can answer by reasoning over the evidence, and
+ * answer those. JSON, so the page can lay it out and collect the person's answers.
+ */
+export function humanAiPrompt(ctx) {
+  return [
+    "You help a person supervise an AI coding agent. From the context below, work out the open questions about this work and split them by who should answer them.",
+    '',
+    '1. "human": the 5 most important questions only a person should answer, most important first. They need judgment the',
+    '   context cannot supply: intent and priorities, product or user knowledge, risk appetite, trade-offs between goods,',
+    '   ethics, policy or accountability. For each give:',
+    '   - "question": one sentence.',
+    '   - "why_human": why a model should not decide this, in one short sentence.',
+    '   - "stakes": what goes wrong if it is answered badly or not at all, in one short sentence.',
+    '   - "options": 2 or 3 short, concrete options.',
+    '   - "lean": what the context already suggests, in one short sentence, or null. Never decide for them.',
+    '2. "ai": up to 5 questions a model can answer by reasoning over the context and evaluating the work: correctness,',
+    '   edge cases, consistency with the ask, test coverage, risks in the changes, what is left to do. Answer each:',
+    '   - "question": one sentence.',
+    '   - "answer": 1 to 3 sentences.',
+    '   - "confidence": "high", "medium" or "low".',
+    '   - "evidence": the files, commits, commands, test results or quotes from the context it rests on.',
+    '   - "check": how a person could verify it in a minute or two.',
+    '',
+    'Rules:',
+    '- Specific to this work: name the real files, tickets and decisions. No generic questions that fit any project.',
+    '- Use only the context. Where it does not say, answer that and use low confidence; do not guess.',
+    '- Do not put a question in "ai" if answering it means choosing what the person wants.',
+    '- Output only one JSON object, no code fence and no other text:',
+    '  {"title": "<short name of the work>", "human": [...], "ai": [...]}',
+    '',
+    ...contextBlock(ctx),
+  ].join('\n');
+}
+
+/** A second model double-checks the split and every AI answer, against the same context. */
+export function critiquePrompt(ctx, draft) {
+  return [
+    'You are an independent reviewer double-checking another model. It looked at an AI coding agent\'s work (context below)',
+    'and split the open questions into ones only a person should answer ("human") and ones it answered itself ("ai").',
+    'Check its work against the context, sceptically. Do not trust its evidence without finding it in the context.',
+    '',
+    'Return:',
+    '- "ai": one entry per AI answer, in the same order: {"verdict": "agree" | "partly" | "disagree", "note": "..."}.',
+    '  The note says why in one or two sentences; when you disagree or partly agree, give the corrected answer.',
+    '- "human": one entry per human question, in the same order: {"verdict": "keep" | "ai" | "reword", "note": "..."}.',
+    '  "ai" means a model could answer it from the context (say what the answer is); "reword" means it is unclear,',
+    '  leading or not the real decision (give a better wording).',
+    '- "missing": up to 3 important questions both lists missed: {"question": "...", "for": "human" | "ai", "why": "..."}.',
+    '- "summary": one or two sentences on how far the person can rely on the AI answers.',
+    '',
+    'Output only one JSON object with those four keys, no code fence and no other text.',
+    '',
+    '<review>',
+    JSON.stringify(draft, null, 2),
+    '</review>',
+    ...contextBlock(ctx),
+  ].join('\n');
+}
+
+/** The first JSON object in a model's reply (tolerates a code fence or a sentence around it). */
+export function parseJsonReply(text) {
+  const s = String(text ?? '');
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error('The reply had no JSON in it');
+  return JSON.parse(s.slice(start, end + 1));
+}
+
+/** Markdown version, for Copy / Download / Print and the CLI. */
+export function humanAiMarkdown({ data, critique, answers = {} }) {
+  const out = [`# Human vs AI: ${data.title ?? 'review'}`, ''];
+  const c = critique?.data;
+  out.push('## For you to decide', '');
+  (data.human ?? []).forEach((q, i) => {
+    out.push(`### ${i + 1}. ${q.question}`, '');
+    if (q.why_human) out.push(`- **Why you:** ${q.why_human}`);
+    if (q.stakes) out.push(`- **Stakes:** ${q.stakes}`);
+    if (q.options?.length) out.push(`- **Options:** ${q.options.join(' · ')}`);
+    if (q.lean) out.push(`- **The work so far suggests:** ${q.lean}`);
+    if (c?.human?.[i]) out.push(`- **Second opinion (${critique.label}):** ${c.human[i].verdict} — ${c.human[i].note}`);
+    out.push(`- **Your answer:** ${answers[i]?.trim() || '_not answered yet_'}`, '');
+  });
+  out.push('## Answered by AI', '');
+  (data.ai ?? []).forEach((q, i) => {
+    out.push(`### ${i + 1}. ${q.question}`, '', q.answer, '');
+    out.push(`- **Confidence:** ${q.confidence}`);
+    if (q.evidence) out.push(`- **Evidence:** ${Array.isArray(q.evidence) ? q.evidence.join('; ') : q.evidence}`);
+    if (q.check) out.push(`- **How to check:** ${q.check}`);
+    if (c?.ai?.[i]) out.push(`- **Second opinion (${critique.label}):** ${c.ai[i].verdict} — ${c.ai[i].note}`);
+    out.push('');
+  });
+  if (c) {
+    out.push(`## Second opinion: ${critique.label}`, '', c.summary ?? '', '');
+    for (const m of c.missing ?? []) out.push(`- **Missed (${m.for}):** ${m.question} — ${m.why}`);
+  } else if (critique?.error) {
+    out.push('## Second opinion', '', `Not available: ${critique.error}`);
+  }
+  return out.join('\n').trim();
+}
+
+/** What "Send my answers" tells the agent. */
+export function humanAiMessage({ data, critique, answers = {} }) {
+  const lines = ['Answers to the open questions from my Human vs AI review:'];
+  (data.human ?? []).forEach((q, i) => {
+    const a = answers[i]?.trim();
+    if (a) lines.push(`${i + 1}. ${q.question}`, `   My answer: ${a}`);
+  });
+  const doubts = (data.ai ?? []).map((q, i) => [q, critique?.data?.ai?.[i]]).filter(([, v]) => v && v.verdict !== 'agree');
+  if (doubts.length) {
+    lines.push('', 'A second model doubted these conclusions about the work. Check them before relying on them:');
+    for (const [q, v] of doubts) lines.push(`- ${q.question} (${v.verdict}: ${v.note})`);
+  }
+  lines.push('', 'Take these into account and continue. If an answer changes the plan, say how before going further.');
+  return lines.join('\n');
+}
+
+// ------------------------------------------------------------------ plan review
+
+export const PLAN_FILE = 'PLAN.md';
+export const planPath = (agentId) => path.join(briefDir(agentId), PLAN_FILE);
+
+/** For agents whose plan the user reviews first: plan, write it down, then wait. */
+export const planReviewPrompt = (file) =>
+  'The user reviews your implementation plan before you implement anything. First investigate as much as you need ' +
+  `(reading code, docs and running read-only commands is fine), then write the plan to ${file} (Markdown) with these sections:\n` +
+  '# Plan: <short name>\n## Goal\n## Approach\n## Steps\nNumbered, each small enough to check.\n## Files to change\n' +
+  '## Tests and verification\n## Risks and open questions\n' +
+  'Then stop and wait. Until a message starting with "Plan approved" arrives, do not edit, create or delete files in ' +
+  'the repository, commit, or run commands that change anything. If a message starting with "Plan changes requested" ' +
+  `arrives, revise ${file} the same way and wait again. Once approved, implement the plan; if you have to depart from ` +
+  `it, update ${file} and say why.`;
+
+export const planApprovedPrompt = (file) =>
+  `Your implementation plan in ${file} has been approved by the user. Implement it; if you have to depart from it, update the file and say why.`;
+
+/** PLAN.md if it changed since `prev` (same shape as the brief: markdown + times). */
+export function loadPlanFile(agentId, prev) {
+  let st;
+  try {
+    st = fs.statSync(planPath(agentId));
+  } catch {
+    return null;
+  }
+  if (prev && prev.mtimeMs === st.mtimeMs) return null;
+  return { markdown: fs.readFileSync(planPath(agentId), 'utf8').slice(0, 200_000), mtimeMs: st.mtimeMs, updatedAt: st.mtime.toISOString() };
 }

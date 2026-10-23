@@ -2,6 +2,7 @@ import { Terminal } from '/vendor/xterm/lib/xterm.mjs';
 import { FitAddon } from '/vendor/xterm-addon-fit/lib/addon-fit.mjs';
 import { marked } from '/vendor/marked/marked.esm.js';
 import DOMPurify from '/vendor/dompurify/purify.es.mjs';
+import { touchScroll } from '/touchscroll.js';
 import { openStream, post, REMOTE } from '/transport.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -10,11 +11,17 @@ let backlogState = { items: [], projects: [], autoRun: true, defaultLimit: 2 };
 let projectsState = [];
 let sideTab = 'agents';
 let showCompleted = false;
+const races = new Map(); // race id -> scoreboard
+let openRaceId = null;
+let raceDiff = null; // { agentId, text }
 // #<id> selects an agent; #<id>/term also opens its terminal.
 const loginHash = location.hash.match(/(?:^#|&)login=([\w-]+)/)?.[1] ?? null;
-const [hashId, hashView] = loginHash ? [null, null] : location.hash.slice(1).split('/');
+// From the hub: #ticket=<one-time ticket>&go=<agent>/term
+const ticketHash = location.hash.match(/(?:^#|&)ticket=([\w-]+)/)?.[1] ?? null;
+const goHash = ticketHash ? decodeURIComponent(location.hash.match(/(?:^#|&)go=([^&]*)/)?.[1] ?? '') : '';
+const [hashId, hashView] = loginHash ? [null, null] : (ticketHash ? goHash : location.hash.slice(1)).split('/');
 let selectedId = hashId || null;
-let openTermOnLoad = hashView === 'term' || isShell(hashView);
+let openTermOnLoad = hashView === 'term' || isShell(hashView) || isBrowser(hashView);
 let filterText = '';
 
 // ------------------------------------------------------------------ helpers
@@ -24,6 +31,10 @@ function isShell(kind) {
   return /^shell(:\d+)?$/.test(kind ?? '');
 }
 const shellNum = (kind) => Number((kind ?? '').split(':')[1] || 1);
+// 'browser:N' is browser tab N (a page this machine serves); 'browser:new' is the address prompt.
+function isBrowser(kind) {
+  return /^browser:(\d+|new)$/.test(kind ?? '');
+}
 
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
@@ -173,7 +184,57 @@ const INSIGHT_ICONS = { why: '🎯', what: '📦', how: '🛠', now: '📍' };
 
 // ------------------------------------------------------------------ stakeholder documents
 
-const DOCS = { analysis: 'Analysis', design: 'Design', flow: 'Flow', proposal: 'Proposal' };
+const DOCS = { analysis: 'Analysis', design: 'Design', flow: 'Flow', proposal: 'Proposal', humanai: 'Human vs AI' };
+const DOC_TITLES = { ...DOCS, plan: 'Implementation plan' };
+/** What the document dialog shows: a stakeholder document, or the agent's plan under review. */
+const docOf = (a, kind) => (kind === 'plan' ? a?.planReview && { markdown: a.planReview.markdown, at: a.planReview.updatedAt } : a?.docs?.[kind]);
+
+const VERDICT = { agree: '✓ Agrees', partly: '≈ Partly agrees', disagree: '✗ Disagrees', keep: '✓ Keep', ai: '🤖 AI could answer', reword: '✎ Reword' };
+const CONFIDENCE = { high: 'High confidence', medium: 'Medium confidence', low: 'Low confidence' };
+
+/** Human vs AI: your questions with answer boxes, the AI's answers, and the second model's checks. */
+function humanAiHtml(d) {
+  const c = d.critique?.data;
+  const second = (v) =>
+    v ? `<p class="second ${esc(v.verdict)}"><span class="verdict">${VERDICT[v.verdict] ?? esc(v.verdict)}</span> <span class="hint">${esc(d.critique.label)}:</span> ${esc(v.note)}</p>` : '';
+  const evidence = (e) => (Array.isArray(e) ? e.join('; ') : e ?? '');
+  const human = (d.data.human ?? [])
+    .map(
+      (q, i) => `<section class="ha-card human">
+      <h4>${i + 1}. ${esc(q.question)}</h4>
+      ${q.why_human ? `<p><b>Why you:</b> ${esc(q.why_human)}</p>` : ''}
+      ${q.stakes ? `<p><b>Stakes:</b> ${esc(q.stakes)}</p>` : ''}
+      ${q.options?.length ? `<p class="ha-options">${q.options.map((o) => `<button type="button" class="small" data-ha-pick="${i}" data-text="${esc(o)}">${esc(o)}</button>`).join(' ')}</p>` : ''}
+      ${q.lean ? `<p class="hint">The work so far suggests: ${esc(q.lean)}</p>` : ''}
+      ${second(c?.human?.[i])}
+      <textarea data-ha="${i}" rows="2" placeholder="Your answer…">${esc(d.answers?.[i] ?? '')}</textarea>
+    </section>`,
+    )
+    .join('');
+  const ai = (d.data.ai ?? [])
+    .map(
+      (q, i) => `<section class="ha-card ai">
+      <h4>${i + 1}. ${esc(q.question)} <span class="tag conf-${esc(q.confidence)}">${CONFIDENCE[q.confidence] ?? esc(q.confidence)}</span></h4>
+      <div class="md">${md(q.answer ?? '')}</div>
+      ${q.evidence ? `<p class="hint"><b>Evidence:</b> ${esc(evidence(q.evidence))}</p>` : ''}
+      ${q.check ? `<p class="hint"><b>How to check:</b> ${esc(q.check)}</p>` : ''}
+      ${second(c?.ai?.[i])}
+    </section>`,
+    )
+    .join('');
+  const missing = c?.missing?.length
+    ? `<ul>${c.missing.map((m) => `<li><b>${m.for === 'human' ? 'For you' : 'For AI'}:</b> ${esc(m.question)} <span class="hint">${esc(m.why)}</span></li>`).join('')}</ul>`
+    : '';
+  const review = c
+    ? `<section class="ha-second"><h3>Second opinion · ${esc(d.critique.label)}</h3><p>${esc(c.summary ?? '')}</p>${missing ? `<p class="hint">Questions both lists missed:</p>${missing}` : ''}</section>`
+    : d.critique?.error
+      ? `<p class="error">Second opinion not available (${esc(d.critique.label)}): ${esc(d.critique.error)}</p>`
+      : '';
+  return `<h1>Human vs AI: ${esc(d.data.title ?? '')}</h1>
+    <h2>🧑 For you to decide</h2><p class="hint">Judgment calls the agent shouldn't make for you. Answer what you can and send them to the agent.</p>${human}
+    <h2>🤖 Answered by AI</h2><p class="hint">Reasoning and evaluation from the agent's session and changes, each checked by a second model.</p>${ai}
+    ${review}`;
+}
 
 /** Markdown with ```mermaid blocks drawn as diagrams (everything else sanitized). */
 function docHtml(markdown) {
@@ -205,24 +266,42 @@ let docView = null; // { agentId, kind }
 function renderDocDialog() {
   if (!docView) return;
   const a = agents.get(docView.agentId);
-  const d = a?.docs?.[docView.kind];
-  const label = DOCS[docView.kind];
+  const d = docOf(a, docView.kind);
+  const label = DOC_TITLES[docView.kind];
+  const plan = docView.kind === 'plan';
   $('#doc-title').textContent = `${label} · ${a?.name ?? ''}`;
   const body = $('#doc-body');
-  if (d?.pending) body.innerHTML = `<p class="hint">Writing the ${label.toLowerCase()} document from the agent's work so far…</p>`;
-  else if (d?.error) body.innerHTML = `<p class="error">Couldn't write it: ${esc(d.error)}</p>`;
+  if (d?.pending) {
+    body.innerHTML = `<p class="hint">${docView.kind === 'humanai' ? 'Splitting the open questions and answering the AI ones, then asking a second model to check…' : `Writing the ${label.toLowerCase()} document from the agent's work so far…`}</p>`;
+    body.dataset.rendered = '';
+  } else if (d?.error) body.innerHTML = `<p class="error">Couldn't write it: ${esc(d.error)}</p>`;
+  else if (plan && !d?.markdown) body.innerHTML = '<p class="hint">The agent is investigating and hasn\'t written its plan yet. You\'ll see it here (and in the inbox) when it has.</p>';
   else if (d?.markdown) {
     if (body.dataset.rendered !== d.at) {
-      body.innerHTML = docHtml(d.markdown);
+      body.innerHTML = d.data ? humanAiHtml(d) : docHtml(d.markdown);
       body.dataset.rendered = d.at;
       renderDiagrams(body);
     }
   }
-  const stale = d?.markdown && a.brief?.updatedAt && d.briefUpdatedAt !== a.brief.updatedAt;
-  $('#doc-meta').textContent = d?.markdown ? `Written ${ago(d.at)}${stale ? ' · the brief has changed since; Regenerate for the latest' : ''}` : '';
+  const stale = !plan && d?.markdown && a.brief?.updatedAt && d.briefUpdatedAt !== a.brief.updatedAt;
+  const by = d?.writer ? ` by ${d.writer}${d.critique ? `, checked by ${d.critique.label}` : ''}` : '';
+  $('#doc-meta').textContent = d?.markdown ? `${plan ? `Plan · ${PLAN_LABEL[a.planReview.status]} · updated` : 'Written'} ${ago(d.at)}${by}${stale ? ' · the brief has changed since; Regenerate for the latest' : ''}` : '';
   for (const id of ['doc-copy', 'doc-download', 'doc-print']) $(`#${id}`).disabled = !d?.markdown;
+  $('#doc-print').hidden = plan;
+  $('#doc-regen').hidden = plan;
   $('#doc-regen').disabled = Boolean(d?.pending);
   $('#doc-bg').hidden = !d?.pending;
+  // Footer: send your answers (Human vs AI), or approve / send back the plan.
+  const foot = $('#doc-foot');
+  const reviewing = plan && ['review', 'changes'].includes(a?.planReview?.status) && d?.markdown;
+  foot.hidden = !(reviewing || (docView.kind === 'humanai' && d?.data));
+  if (foot.dataset.mode !== (plan ? 'plan' : 'humanai')) {
+    foot.dataset.mode = plan ? 'plan' : 'humanai';
+    foot.innerHTML = plan
+      ? `<textarea id="plan-note" rows="2" placeholder="Notes for the agent (required to request changes, optional when approving)"></textarea>
+         <div class="doc-foot-actions"><button type="button" class="small" data-plan="changes">Request changes</button><button type="button" class="small primary" data-plan="approve">Approve and implement</button></div>`
+      : `<span class="hint">Your answers are kept with the agent.</span><div class="doc-foot-actions"><button type="button" class="small" data-ha-act="save">Save</button><button type="button" class="small primary" data-ha-act="send">Send my answers to the agent</button></div>`;
+  }
 }
 
 function openDoc(agentId, kind) {
@@ -230,7 +309,7 @@ function openDoc(agentId, kind) {
   $('#doc-body').dataset.rendered = '';
   $('#doc-dialog').showModal();
   const a = agents.get(agentId);
-  if (!a.docs?.[kind]?.markdown && !a.docs?.[kind]?.pending) generateDoc();
+  if (kind !== 'plan' && !a.docs?.[kind]?.markdown && !a.docs?.[kind]?.pending) generateDoc();
   renderDocDialog();
 }
 
@@ -266,7 +345,7 @@ function watchDocs(a) {
 }
 $('#doc-regen').onclick = () => generateDoc();
 $('#doc-copy').onclick = async () => {
-  const d = agents.get(docView.agentId)?.docs?.[docView.kind];
+  const d = docOf(agents.get(docView.agentId), docView.kind);
   await navigator.clipboard.writeText(d.markdown).then(
     () => toast('Markdown copied; paste into Confluence, Google Docs, Slack or a PR'),
     () => toast('Copy failed: your browser blocked clipboard access'),
@@ -274,11 +353,57 @@ $('#doc-copy').onclick = async () => {
 };
 $('#doc-download').onclick = () => {
   const a = agents.get(docView.agentId);
-  const blob = new Blob([a.docs[docView.kind].markdown], { type: 'text/markdown' });
+  const blob = new Blob([docOf(a, docView.kind).markdown], { type: 'text/markdown' });
   const link = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `${a.slug}-${docView.kind}.md` });
   link.click();
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 };
+const haAnswers = () => Object.fromEntries([...document.querySelectorAll('#doc-body [data-ha]')].map((t) => [t.dataset.ha, t.value]));
+$('#doc-body').addEventListener('click', (e) => {
+  const pick = e.target.closest('[data-ha-pick]');
+  if (!pick) return;
+  const box = $(`#doc-body [data-ha="${pick.dataset.haPick}"]`);
+  box.value = box.value.trim() ? `${box.value.trim()} ${pick.dataset.text}` : pick.dataset.text;
+  box.focus();
+});
+$('#doc-body').addEventListener('change', (e) => {
+  if (e.target.dataset.ha === undefined || !docView) return;
+  api('POST', `/agents/${docView.agentId}/humanai/answers`, { answers: haAnswers() }).then(upsert).catch(() => {});
+});
+$('#doc-foot').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-ha-act], [data-plan]');
+  if (!b || !docView) return;
+  const id = docView.agentId;
+  if (b.dataset.haAct) {
+    const send = b.dataset.haAct === 'send';
+    return act(async () => upsert(await api('POST', `/agents/${id}/humanai/answers`, { answers: haAnswers(), send })), send ? 'Sent to the agent' : 'Saved');
+  }
+  const note = $('#plan-note').value;
+  act(async () => {
+    upsert(await api('POST', `/agents/${id}/plan/${b.dataset.plan}`, { note }));
+    $('#plan-note').value = '';
+    if (b.dataset.plan === 'approve') $('#doc-close').click();
+  }, b.dataset.plan === 'approve' ? 'Approved; the agent is implementing it' : 'Sent back to the agent');
+});
+function openPlan(agentId) {
+  docView = { agentId, kind: 'plan' };
+  $('#doc-body').dataset.rendered = '';
+  $('#doc-dialog').showModal();
+  renderDocDialog();
+}
+
+const PLAN_LABEL = { writing: 'being written', review: 'waiting for your review', changes: 'changes requested', approved: 'approved' };
+/** The plan-review row in the brief card: status, open, approve; or the switch to turn review on. */
+function planRow(a) {
+  if (a.kind === 'general') return '';
+  const p = a.planReview;
+  if (!p) {
+    return a.status === 'done' ? '' : `<div class="plan-row"><button class="small ghost" data-act="plan-on" title="The agent writes an implementation plan and waits for your approval before changing anything">Review its plan first</button></div>`;
+  }
+  return `<div class="plan-row ${p.status}"><b>Plan</b> <span class="tag plan-${p.status}">${PLAN_LABEL[p.status]}</span>
+    <button class="small ${p.status === 'review' ? 'primary' : ''}" data-act="plan-open" ${p.markdown ? '' : 'disabled'}>${p.status === 'review' ? 'Review plan' : 'Open plan'}</button>
+    ${p.status !== 'approved' ? '<button class="small ghost" data-act="plan-skip" title="Stop waiting for review; the agent goes ahead">Skip review</button>' : ''}</div>`;
+}
 $('#doc-print').onclick = () => window.open(`/share.html#${docView.agentId}/${docView.kind}`, '_blank', 'noopener');
 
 /** Why / What / How / Now as four cards. */
@@ -337,6 +462,7 @@ function briefPanel(a) {
   if (!b) {
     return `<div class="card brief">
       <h3>Brief <span class="brief-actions">${ins.button} ${ex.button}</span></h3>
+      ${planRow(a)}
       <div class="share-row"><span class="hint">Share for review:</span> ${docButtons(a)}</div>
       ${resultsCard(a)}
       ${ins.box}
@@ -352,6 +478,7 @@ function briefPanel(a) {
     : '<p class="hint">No checks yet.</p>';
   return `<div class="card brief">
     <h3>Brief <span class="brief-actions"><span title="${esc(b.updatedAt)}">updated ${ago(b.updatedAt)}</span> ${ins.button} ${ex.button}</span></h3>
+    ${planRow(a)}
     <div class="share-row"><span class="hint">Share for review:</span> ${docButtons(a)}</div>
     ${resultsCard(a)}
     ${ins.box}
@@ -432,8 +559,8 @@ const prioChip = (p, { always = false } = {}) =>
 function agentItem(a) {
   const st = statusOf(a);
   return `<li data-id="${a.id}" class="agent pr${a.priority ?? 2} ${a.id === selectedId ? 'selected' : ''}">
-    <div class="line1">${prioChip(a.priority ?? 2)}${a.results?.outcome === 'blocked' ? '<span class="outcome-mark" title="Blocked">⛔</span>' : a.results?.outcome === 'done' ? '<span class="outcome-mark" title="Done">✅</span>' : ''}<span class="name">${esc(a.name)}</span><span class="pill ${st}">${pillText(st)}</span></div>
-    <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${esc(a.intent || 'General session')}</div>
+    <div class="line1">${prioChip(a.priority ?? 2)}${a.results?.outcome === 'blocked' ? '<span class="outcome-mark" title="Blocked">⛔</span>' : a.results?.outcome === 'done' ? '<span class="outcome-mark" title="Done">✅</span>' : ''}<span class="name">${esc(a.name)}</span>${flags(a)}<span class="pill ${st}">${pillText(st)}</span></div>
+    <div class="intent">${a.kind === 'general' ? '<span class="tag">general</span> ' : ''}${a.engine && a.engine !== 'claude' ? `<span class="tag engine">${esc(ENGINE_LABEL[a.engine] ?? a.engine)}</span> ` : ''}${esc(a.intent || 'General session')}</div>
     ${a.status === 'preparing' && a.progress ? `<div class="progress-line">${esc(progressText(a.progress))}</div>` : ''}
     <div class="meta">
       <span class="mono">${a.id}</span>
@@ -603,7 +730,9 @@ function showTab(tab) {
   for (const b of document.querySelectorAll('.side-tab')) b.classList.toggle('active', b.dataset.tab === tab);
   $('#agents-view').hidden = tab !== 'agents';
   $('#backlog-view').hidden = tab !== 'backlog';
+  $('#inbox-view').hidden = tab !== 'inbox';
   renderBacklog();
+  renderInbox();
 }
 for (const b of document.querySelectorAll('.side-tab')) b.onclick = () => showTab(b.dataset.tab);
 
@@ -657,6 +786,345 @@ $('#backlog-view').addEventListener('click', async (e) => {
   }
 });
 
+// ------------------------------------------------------------------ needs you (inbox)
+
+/** Small markers in the agent list: stuck, overlapping, asking, racing, forked. */
+function flags(a) {
+  const q = (a.questions ?? []).filter((x) => !x.answer).length;
+  return [
+    a.stuck?.length ? `<span class="flag warn" title="May be stuck: ${esc(a.stuck[0].title)}">↻</span>` : '',
+    a.conflicts?.length ? `<span class="flag warn" title="Changes the same files as ${esc(a.conflicts.map((c) => c.agent.name).join(', '))}">⚔</span>` : '',
+    q ? `<span class="flag ask" title="${q} open question${q > 1 ? 's' : ''}">?${q > 1 ? q : ''}</span>` : '',
+    a.raceId ? `<span class="flag" title="Race attempt${a.variant?.label ? `: ${esc(a.variant.label)}` : ''}">🏁</span>` : '',
+    a.forkOf ? `<span class="flag" title="Fork of ${esc(a.forkOf.name)}">⑂</span>` : '',
+  ].join('');
+}
+
+const NEED_ORDER = { prompt: 0, plan: 1, question: 1, stuck: 2, conflict: 3 };
+/** What an agent needs from the user. `both`: overlaps on both agents (detail), else only the one that should rebase (inbox). */
+function needsFor(a, { both = false } = {}) {
+  const items = [];
+  if (a.runtime.attention) items.push({ a, kind: 'prompt', key: `prompt:${a.id}` });
+  if (a.planReview?.status === 'review') items.push({ a, kind: 'plan', key: `plan:${a.id}` });
+  for (const q of a.questions ?? []) if (!q.answer) items.push({ a, kind: 'question', key: `q:${a.id}:${q.id}`, q });
+  for (const f of a.stuck ?? []) items.push({ a, kind: 'stuck', key: `stuck:${a.id}:${f.key}`, f });
+  for (const g of a.conflicts ?? []) if (both || g.mergeFirst !== a.id) items.push({ a, kind: 'conflict', key: `conflict:${a.id}:${g.agent.id}`, g });
+  return items;
+}
+function inboxItems() {
+  return [...agents.values()]
+    .flatMap((a) => needsFor(a))
+    .sort((x, y) => NEED_ORDER[x.kind] - NEED_ORDER[y.kind] || (x.a.priority ?? 2) - (y.a.priority ?? 2));
+}
+
+const NEED_LABEL = { prompt: 'Needs input', plan: 'Plan review', question: 'Question', stuck: 'Stuck?', conflict: 'Overlap' };
+function needCard(it, { inDetail = false } = {}) {
+  const { a } = it;
+  const who = inDetail
+    ? ''
+    : `<a href="#${a.id}" class="need-agent" data-goto="${a.id}">${prioChip(a.priority ?? 2)}${esc(a.name)}</a>${a.projectInfo?.name ? ` <span class="hint">${esc(a.projectInfo.name)}</span>` : ''}`;
+  const head = `<div class="need-head"><span class="need-kind ${it.kind}">${NEED_LABEL[it.kind]}</span>${who}</div>`;
+  const draft = (k, fallback = '') => esc(needDrafts.get(`${it.key}:${k}`) ?? fallback);
+  let body = '';
+  if (it.kind === 'prompt') {
+    const p = a.runtime.prompt;
+    body = `<p class="need-title">${esc(p?.question || a.runtime.attention)}</p>
+      <div class="need-actions">
+        ${(p?.choices ?? []).map((c) => `<button class="small ${c.key === '1' ? 'primary' : ''}" data-ib="key" data-key="${c.key}">${c.key}. ${esc(c.label)}</button>`).join('')}
+        <button class="small" data-ib="key" data-key="esc" title="Escape">Esc</button>
+        <button class="small ghost" data-ib="terminal">Open terminal</button>
+      </div>`;
+  } else if (it.kind === 'plan') {
+    const title = a.planReview.markdown?.match(/^#\s+(.+)$/m)?.[1] ?? 'Implementation plan';
+    body = `<p class="need-title">${esc(title)}</p>
+      <p class="hint">Written ${ago(a.planReview.updatedAt)}. The agent waits for your approval before changing anything.</p>
+      <div class="need-actions"><button class="small primary" data-ib="plan-open">Review plan</button><button class="small" data-ib="plan-approve">Approve as is</button></div>`;
+  } else if (it.kind === 'question') {
+    const q = it.q;
+    body = `<p class="need-title">${esc(q.question)}</p>
+      ${q.context ? `<p class="hint">${esc(q.context)}</p>` : ''}
+      ${q.default ? `<p class="hint">Proceeding with <b>${esc(q.default)}</b> until you answer.</p>` : ''}
+      <div class="need-actions">${q.options.map((o) => `<button class="small" data-ib="answer" data-text="${esc(o)}">${esc(o)}</button>`).join('')}</div>
+      <form class="need-reply" data-ib-form="answer" data-q="${q.id}">
+        <input data-draft="${esc(it.key)}:text" placeholder="Or type an answer…" value="${draft('text')}" />
+        <button class="small primary">Send</button>
+      </form>`;
+  } else if (it.kind === 'stuck') {
+    const f = it.f;
+    body = `<p class="need-title">${esc(f.title)} <span class="hint">since ${ago(f.since)}</span></p>
+      <p class="hint">${esc(f.detail)}</p>
+      <form class="need-reply col" data-ib-form="nudge" data-k="${esc(f.key)}">
+        <textarea rows="3" data-draft="${esc(it.key)}:text">${draft('text', f.nudge)}</textarea>
+        <div class="need-actions"><button class="small primary">Send nudge</button><button type="button" class="small ghost" data-ib="dismiss">Dismiss</button></div>
+      </form>`;
+  } else {
+    const g = it.g;
+    const lines = g.files.filter((f) => f.severity === 'lines').length;
+    const first = g.mergeFirst === a.id ? `${esc(a.name)} lands first; ${esc(g.agent.name)} rebases onto it` : `${esc(g.agent.name)} lands first; ${esc(a.name)} rebases onto it`;
+    body = `<p class="need-title">Changes the same ${g.files.length === 1 ? 'file' : 'files'} as <a href="#${g.agent.id}" data-goto="${g.agent.id}">${esc(g.agent.name)}</a>${lines ? ` <span class="tag fail">${lines} on the same lines</span>` : ''}</p>
+      <ul class="need-files">${g.files.slice(0, 8).map((f) => `<li><code>${esc(f.file)}</code>${f.severity === 'lines' ? ' <span class="hint">same lines</span>' : ''}</li>`).join('')}${g.files.length > 8 ? `<li class="hint">…and ${g.files.length - 8} more</li>` : ''}</ul>
+      <p class="hint">Suggested order: ${first}.</p>
+      <div class="need-actions">
+        <button class="small" data-ib="warn" data-with="${g.agent.id}" title="Tell ${esc(a.name)} about the overlap">Tell ${esc(a.name)}</button>
+        <button class="small" data-ib="warn-both" data-with="${g.agent.id}" title="Tell both agents">Tell both</button>
+      </div>`;
+  }
+  return `<div class="need ${it.kind}" data-need="${esc(it.key)}" data-agent="${a.id}">${head}${body}</div>`;
+}
+
+const needDrafts = new Map(); // typed text survives live re-renders
+document.addEventListener('input', (e) => {
+  if (e.target.dataset?.draft) needDrafts.set(e.target.dataset.draft, e.target.value);
+});
+
+function renderInbox() {
+  const items = inboxItems();
+  const urgent = items.filter((i) => i.kind === 'prompt' || i.kind === 'question').length;
+  $('#inbox-count').textContent = items.length ? String(items.length) : '';
+  $('#inbox-count').className = `badge ${urgent ? 'attention' : ''}`;
+  if (sideTab !== 'inbox') return;
+  const view = $('#inbox-view');
+  if (view.contains(document.activeElement) && document.activeElement.dataset.draft) return; // don't yank the field being typed in
+  view.innerHTML = items.length
+    ? `<div class="counts"><span>${items.length} waiting on you</span></div><div class="needs inbox">${items.map((it) => needCard(it)).join('')}</div>`
+    : `<div class="empty"><p>Nothing needs you right now.</p><p>Prompts waiting for an answer, questions agents ask, agents that seem stuck and agents editing the same files show up here.</p></div>`;
+}
+
+async function onNeed(e) {
+  const goto = e.target.closest('[data-goto]');
+  if (goto) {
+    e.preventDefault();
+    showTab('agents');
+    return select(goto.dataset.goto);
+  }
+  const el = e.target.closest('[data-ib]');
+  if (!el) return;
+  e.preventDefault();
+  const card = el.closest('[data-need]');
+  const id = card.dataset.agent;
+  const key = card.dataset.need;
+  switch (el.dataset.ib) {
+    case 'key':
+      return act(() => api('POST', `/agents/${id}/prompt-key`, { key: el.dataset.key }), 'Sent');
+    case 'terminal':
+      showTab('agents');
+      select(id);
+      return term.open(id);
+    case 'answer': {
+      const q = key.split(':')[2];
+      return act(async () => upsert(await api('POST', `/agents/${id}/answer`, { question: q, text: el.dataset.text })), 'Answer sent');
+    }
+    case 'plan-open':
+      return openPlan(id);
+    case 'plan-approve':
+      return act(async () => upsert(await api('POST', `/agents/${id}/plan/approve`, {})), 'Approved; the agent is implementing it');
+    case 'dismiss':
+      return act(async () => upsert(await api('POST', `/agents/${id}/stuck/dismiss`, { key: card.querySelector('[data-k]').dataset.k })));
+    case 'warn':
+      return act(async () => upsert(await api('POST', `/agents/${id}/conflicts/warn`, { with: el.dataset.with })), 'Queued for the agent');
+    case 'warn-both':
+      return act(async () => {
+        upsert(await api('POST', `/agents/${id}/conflicts/warn`, { with: el.dataset.with }));
+        upsert(await api('POST', `/agents/${el.dataset.with}/conflicts/warn`, { with: id }));
+      }, 'Queued for both agents');
+  }
+}
+async function onNeedSubmit(e) {
+  const form = e.target.closest('[data-ib-form]');
+  if (!form) return;
+  e.preventDefault();
+  const card = form.closest('[data-need]');
+  const id = card.dataset.agent;
+  const field = form.querySelector('[data-draft]');
+  const text = field.value.trim();
+  if (!text) return;
+  const done = () => needDrafts.delete(field.dataset.draft);
+  if (form.dataset.ibForm === 'answer') {
+    await act(async () => upsert(await api('POST', `/agents/${id}/answer`, { question: form.dataset.q, text })), 'Answer sent');
+  } else {
+    await act(async () => upsert(await api('POST', `/agents/${id}/stuck/nudge`, { key: form.dataset.k, text })), 'Nudge queued');
+  }
+  done();
+}
+for (const root of [$('#inbox-view'), $('#detail-body')]) {
+  root.addEventListener('click', onNeed);
+  root.addEventListener('submit', onNeedSubmit);
+}
+
+// ------------------------------------------------------------------ checkpoints and forks
+
+function checkpointsCard(a) {
+  if (a.kind === 'general' || !a.git?.branch) return '';
+  const cps = [...(a.checkpoints ?? [])].reverse();
+  const forks = [...agents.values()].filter((x) => x.forkOf?.agentId === a.id);
+  return `<div class="card">
+    <h3>Checkpoints <span>${cps.length || ''}</span> <span class="spacer"></span><button class="small" data-act="checkpoint" title="Save the code and conversation as they are now">Save now</button></h3>
+    <p class="hint">Saved at the end of each turn: the code (including uncommitted work) and the conversation up to that point. Fork from one to try a different direction from there.</p>
+    ${cps.length
+      ? `<ul class="links checkpoints">${cps
+          .slice(0, 12)
+          .map((c) => `<li><span class="mono">#${c.n}</span><span class="grow" title="${esc(c.prompt ?? '')}">${esc(c.prompt ?? 'checkpoint')}</span><span class="hint">${ago(c.at)}</span><button class="small" data-fork-cp="${c.n}">Fork from here</button></li>`)
+          .join('')}</ul>`
+      : '<p class="none">None yet: the first one is saved when the agent finishes a turn.</p>'}
+    ${forks.length ? `<p class="hint">Forks: ${forks.map((f) => `<a href="#${f.id}" data-goto="${f.id}">${esc(f.name)}</a>`).join(', ')}</p>` : ''}
+  </div>`;
+}
+
+$('#detail-body').addEventListener('click', (e) => {
+  const cp = e.target.closest('[data-fork-cp]');
+  if (cp) forkAgent(selectedId, Number(cp.dataset.forkCp));
+  const race = e.target.closest('[data-race-open]');
+  if (race) openRace(race.dataset.raceOpen);
+});
+
+function forkAgent(id, checkpoint) {
+  const how = prompt(
+    `Fork ${agents.get(id)?.name}${checkpoint ? ` from checkpoint ${checkpoint}` : ''}: a new agent with the same code and conversation.\n\nWhat should the fork do differently? (optional, sent as its first message)`,
+    '',
+  );
+  if (how === null) return;
+  act(async () => {
+    const fork = await api('POST', `/agents/${id}/fork`, { checkpoint, instructions: how || undefined });
+    upsert(fork);
+    select(fork.id);
+  }, 'Fork created');
+}
+
+// ------------------------------------------------------------------ races
+
+function raceBanner(a) {
+  if (!a.raceId) return '';
+  const r = races.get(a.raceId);
+  const n = r?.rows.length ?? 0;
+  return `<div class="bl-banner race">🏁 Race attempt${a.variant?.label ? ` <b>${esc(a.variant.label)}</b>` : ''}${n ? ` · ${n} attempts` : ''}${r?.winner === a.id ? ' · <b>winner</b>' : ''}
+    <span class="spacer"></span><button class="small primary" data-race-open="${a.raceId}">Compare</button></div>`;
+}
+
+function openRace(id) {
+  openRaceId = id;
+  raceDiff = null;
+  renderRace();
+  if (!$('#race-dialog').open) $('#race-dialog').showModal();
+  act(async () => races.set(id, await api('GET', `/races/${id}`)));
+}
+
+const fmtCost = (c) => (c ? `$${c.toFixed(2)}` : '—');
+const testCell = (t) =>
+  !t ? '<span class="hint">—</span>' : `<span class="test ${t.status}" title="${esc(t.output ?? '')}">${{ passed: '✓ passed', failed: '✗ failed', running: '… running', queued: 'queued', error: '⚠ error' }[t.status] ?? t.status}${t.seconds != null ? ` <span class="hint">${t.seconds}s</span>` : ''}</span>`;
+
+function renderRace() {
+  const dlg = $('#race-dialog');
+  if (!dlg.open && !openRaceId) return;
+  const r = races.get(openRaceId);
+  if (!r) {
+    $('#race-body').innerHTML = '<p class="hint">Loading…</p>';
+    return;
+  }
+  if ($('#race-body').contains(document.activeElement) && document.activeElement.name === 'testCommand') return;
+  $('#race-title').textContent = `Race: ${r.intent.split('\n')[0].slice(0, 80)}`;
+  // Tag a row only when it is strictly the best of several.
+  const uniqueMin = (vals) => {
+    const v = vals.filter((x) => x != null && x > 0);
+    const m = Math.min(...v);
+    return v.length > 1 && v.filter((x) => x === m).length === 1 ? m : null;
+  };
+  const cheapest = uniqueMin(r.rows.map((x) => x.costUsd));
+  const smallest = uniqueMin(r.rows.map((x) => x.added + x.removed));
+  $('#race-body').innerHTML = `
+    <form class="race-tests" id="race-tests">
+      <label>Test command <input name="testCommand" value="${esc(r.testCommand ?? '')}" placeholder="npm test" /></label>
+      <button class="small primary">Run in every attempt</button>
+    </form>
+    <div class="race-table-wrap"><table class="race-table">
+      <tr><th>Attempt</th><th>Status</th><th>Outcome</th><th>Checks</th><th>Change</th><th>Tests</th><th>Cost</th><th>Time</th><th></th></tr>
+      ${r.rows
+        .map((x) => {
+          const a = agents.get(x.id);
+          const st = a ? statusOf(a) : x.status;
+          return `<tr class="${r.winner === x.id ? 'winner' : ''} ${raceDiff?.agentId === x.id ? 'diffing' : ''}">
+            <td><a href="#${x.id}" data-race-goto="${x.id}"><b>${esc(x.variant?.label ?? x.name)}</b></a>${x.variant?.model ? ` <span class="tag">${esc(x.variant.model)}</span>` : ''}${x.variant?.instructions ? `<div class="hint">${esc(x.variant.instructions)}</div>` : ''}</td>
+            <td><span class="pill ${st}">${pillText(st)}</span></td>
+            <td>${x.outcome ? esc(x.outcome) : '<span class="hint">—</span>'}</td>
+            <td>${x.checks.total ? `✓${x.checks.passed}/${x.checks.total}${x.checks.failed ? ` <span class="fail">✗${x.checks.failed}</span>` : ''}` : '<span class="hint">—</span>'}</td>
+            <td>${x.files ? `${x.files} file${x.files > 1 ? 's' : ''} <span class="add">+${x.added}</span> <span class="del">−${x.removed}</span>${x.added + x.removed === smallest ? ' <span class="tag">smallest</span>' : ''}` : '<span class="hint">no changes</span>'}</td>
+            <td>${testCell(x.tests)}</td>
+            <td>${fmtCost(x.costUsd)}${x.costUsd === cheapest ? ' <span class="tag">cheapest</span>' : ''}</td>
+            <td>${x.minutes != null ? `${x.minutes} min` : '—'}</td>
+            <td class="race-acts">
+              <button class="small" data-race-diff="${x.id}">Diff</button>
+              ${r.winner === x.id ? '<span class="tag open">winner</span>' : `<button class="small" data-race-pick="${x.id}">Pick</button>`}
+            </td>
+          </tr>`;
+        })
+        .join('')}
+    </table></div>
+    ${raceDiff
+      ? `<div class="race-diff"><div class="need-head"><b>Changes in ${esc(r.rows.find((x) => x.id === raceDiff.agentId)?.variant?.label ?? '')}</b><span class="spacer"></span><button class="small ghost" data-race-diff-close>Close diff</button></div>
+         <pre class="diff">${raceDiff.text ? diffHtml(raceDiff.text) : '<span class="hint">No changes yet.</span>'}</pre></div>`
+      : '<p class="hint">Pick a winner when you have seen enough. You can delete the other attempts and their worktrees at the same time.</p>'}`;
+}
+
+function diffHtml(text) {
+  return text
+    .split('\n')
+    .map((l) => {
+      const cls = l.startsWith('+++') || l.startsWith('---') || l.startsWith('diff ') ? 'meta' : l.startsWith('@@') ? 'hunk' : l.startsWith('+') ? 'add' : l.startsWith('-') ? 'del' : '';
+      return `<span class="${cls}">${esc(l)}</span>`;
+    })
+    .join('\n');
+}
+
+$('#race-close').onclick = () => {
+  openRaceId = null;
+  $('#race-dialog').close();
+};
+$('#race-delete').onclick = () => {
+  if (!confirm('Forget this race? Its agents stay; only the comparison is removed.')) return;
+  const id = openRaceId;
+  act(async () => {
+    await api('DELETE', `/races/${id}`);
+    races.delete(id);
+    openRaceId = null;
+    $('#race-dialog').close();
+    render();
+  });
+};
+$('#race-body').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const command = new FormData(e.target).get('testCommand');
+  act(async () => races.set(openRaceId, await api('POST', `/races/${openRaceId}/tests`, { command })), 'Running tests');
+});
+$('#race-body').addEventListener('click', (e) => {
+  const t = e.target;
+  const go = t.closest('[data-race-goto]');
+  if (go) {
+    e.preventDefault();
+    openRaceId = null;
+    $('#race-dialog').close();
+    showTab('agents');
+    return select(go.dataset.raceGoto);
+  }
+  if (t.closest('[data-race-diff-close]')) {
+    raceDiff = null;
+    return renderRace();
+  }
+  const d = t.closest('[data-race-diff]');
+  if (d) {
+    return act(async () => {
+      raceDiff = { agentId: d.dataset.raceDiff, text: (await api('GET', `/races/${openRaceId}/diff/${d.dataset.raceDiff}`)).diff };
+      renderRace();
+    });
+  }
+  const p = t.closest('[data-race-pick]');
+  if (p) {
+    const r = races.get(openRaceId);
+    const label = r.rows.find((x) => x.id === p.dataset.racePick)?.variant?.label;
+    if (!confirm(`Pick "${label}" as the winner?`)) return;
+    const cleanup = r.rows.length > 1 && confirm('Also close and delete the other attempts, including their worktrees? (Cancel keeps them.)');
+    return act(async () => races.set(openRaceId, await api('POST', `/races/${openRaceId}/pick`, { agent: p.dataset.racePick, cleanup })), 'Winner picked');
+  }
+});
+
 // ------------------------------------------------------------------ detail
 
 function prRow(a, p) {
@@ -688,7 +1156,8 @@ function renderDetail() {
 
   // Keep whatever the user is typing across live re-renders.
   const active = document.activeElement;
-  const keep = body.contains(active) && active.dataset.field ? { field: active.dataset.field, value: active.value, pos: active.selectionStart } : null;
+  const keepAttr = active?.dataset?.field ? 'field' : active?.dataset?.draft ? 'draft' : null;
+  const keep = body.contains(active) && keepAttr ? { attr: keepAttr, field: active.dataset[keepAttr], value: active.value, pos: active.selectionStart } : null;
   const drafts = Object.fromEntries([...body.querySelectorAll('[data-field]')].map((el) => [el.dataset.field, el.value]));
 
   const st = statusOf(a);
@@ -721,6 +1190,7 @@ function renderDetail() {
             : `<button data-act="start" ${a.status === 'preparing' ? 'disabled' : ''}>Resume in background</button>`}
         <button data-act="fresh" ${running || a.status === 'preparing' ? 'disabled' : ''} title="Start over with a new session ID (old ones are kept)">New session</button>
         <button data-act="shell" ${a.workdir && a.status !== 'preparing' ? '' : 'disabled'} title="A separate terminal in this agent's folder for running commands by hand">Open shell</button>
+        <button data-act="fork" ${a.workdir && a.git?.branch ? '' : 'disabled'} title="A new agent with this one's code and conversation, in its own worktree, to try another approach">Fork</button>
         <button data-act="refresh" title="Re-scan git, PRs and transcripts">Refresh</button>
         <button class="danger" data-act="delete">Delete</button>
       </div>
@@ -748,6 +1218,13 @@ function renderDetail() {
         </div>`
       : ''}
     ${a.runtime.attention ? `<div class="error-box">${esc(a.runtime.attention)}: the agent is waiting for an answer. Open its terminal to respond.</div>` : ''}
+    ${raceBanner(a)}
+    ${a.forkOf ? `<div class="bl-banner">⑂ Forked from <a href="#${a.forkOf.agentId}" data-goto="${a.forkOf.agentId}">${esc(a.forkOf.name)}</a>${a.forkOf.checkpoint ? ` at checkpoint ${a.forkOf.checkpoint}` : ''} ${ago(a.forkOf.at)}</div>` : ''}
+    ${(() => {
+      const items = needsFor(a, { both: true });
+      return items.length ? `<div class="needs">${items.map((it) => needCard(it, { inDetail: true })).join('')}</div>` : '';
+    })()}
+    ${a.outbox ? `<div class="hint outbox-note">✉ ${a.outbox} message${a.outbox > 1 ? 's' : ''} waiting to be typed into the session when the agent is idle</div>` : ''}
 
     ${briefPanel(a)}
 
@@ -797,7 +1274,7 @@ function renderDetail() {
         <h3>Bugs <span>${a.bugs.length || ''}</span></h3>
         <ul class="links">${a.bugs.length ? a.bugs.map((b) => bugRow(a, b)).join('') : '<li class="none">None detected yet</li>'}</ul>
         <form class="add-link" data-link="bug">
-          <input data-field="bug" placeholder="Bug key or URL, e.g. MB-12345" value="${esc(drafts.bug ?? '')}" />
+          <input data-field="bug" placeholder="Bug key or URL, e.g. PROJ-123" value="${esc(drafts.bug ?? '')}" />
           <button class="small">Add</button>
         </form>
       </div>
@@ -821,6 +1298,8 @@ function renderDetail() {
         </table>
       </div>
 
+      ${checkpointsCard(a)}
+
       <div class="card">
         <h3>Notes</h3>
         <textarea class="notes" data-field="notes" placeholder="Anything worth remembering about this agent">${esc(drafts.notes ?? a.notes ?? '')}</textarea>
@@ -831,7 +1310,7 @@ function renderDetail() {
   markOverflow(body);
 
   if (keep) {
-    const el = body.querySelector(`[data-field="${keep.field}"]`);
+    const el = body.querySelector(`[data-${keep.attr}="${CSS.escape(keep.field)}"]`);
     if (el) {
       el.value = keep.value;
       el.focus();
@@ -843,6 +1322,8 @@ function renderDetail() {
 function render() {
   renderList();
   renderBacklog();
+  renderInbox();
+  renderRace();
   renderDocDialog();
   renderDetail();
   term.syncOverlay();
@@ -857,78 +1338,6 @@ function select(id) {
 
 // ------------------------------------------------------------------ terminal
 
-/**
- * Swipe to scroll on phones and tablets: xterm.js doesn't scroll on touch. In the normal
- * buffer this moves through the scrollback; in the alternate screen (full-screen apps) it
- * sends wheel events so the app scrolls itself. A flick keeps scrolling and slows down.
- */
-function touchScroll(el, xterm) {
-  let lastY = null;
-  let lastT = 0;
-  let carry = 0; // fraction of a line not scrolled yet
-  let velocity = 0; // px per ms
-  let glide = 0;
-  const lineHeight = () => el.querySelector('.xterm-screen')?.clientHeight / xterm.rows || 17;
-  const scrollPx = (dy) => {
-    carry += dy / lineHeight();
-    const lines = Math.trunc(carry);
-    if (!lines) return;
-    carry -= lines;
-    if (xterm.buffer.active.type === 'normal') {
-      xterm.scrollLines(lines);
-    } else {
-      const target = el.querySelector('.xterm-screen');
-      const r = target.getBoundingClientRect();
-      for (let i = 0; i < Math.abs(lines); i++) {
-        target.dispatchEvent(
-          new WheelEvent('wheel', { deltaY: Math.sign(lines) * lineHeight(), deltaMode: 0, clientX: r.left + 10, clientY: r.top + 10, bubbles: true, cancelable: true }),
-        );
-      }
-    }
-  };
-  el.addEventListener(
-    'touchstart',
-    (e) => {
-      cancelAnimationFrame(glide);
-      if (e.touches.length !== 1) return (lastY = null);
-      lastY = e.touches[0].clientY;
-      lastT = e.timeStamp;
-      velocity = 0;
-      carry = 0;
-    },
-    { passive: true },
-  );
-  el.addEventListener(
-    'touchmove',
-    (e) => {
-      if (lastY === null || e.touches.length !== 1) return;
-      const y = e.touches[0].clientY;
-      const dy = lastY - y; // finger up = later content
-      const dt = Math.max(1, e.timeStamp - lastT);
-      velocity = 0.8 * (dy / dt) + 0.2 * velocity;
-      lastY = y;
-      lastT = e.timeStamp;
-      e.preventDefault();
-      scrollPx(dy);
-    },
-    { passive: false },
-  );
-  el.addEventListener('touchend', (e) => {
-    if (lastY === null) return;
-    lastY = null;
-    if (e.timeStamp - lastT > 80 || Math.abs(velocity) < 0.2) return; // finger paused: no flick
-    let prev = performance.now();
-    const step = (now) => {
-      const dt = now - prev;
-      prev = now;
-      velocity *= Math.pow(0.995, dt);
-      if (Math.abs(velocity) < 0.03) return;
-      scrollPx(velocity * dt);
-      glide = requestAnimationFrame(step);
-    };
-    glide = requestAnimationFrame(step);
-  });
-}
 
 const term = {
   agentId: null,
@@ -970,6 +1379,8 @@ const term = {
   shellExited: false,
 
   open(id, kind = 'claude') {
+    if (isBrowser(kind)) return this.openBrowser(id, kind);
+    $('#term-wrap').classList.remove('browsing');
     if (isShell(kind)) kind = `shell:${shellNum(kind)}`;
     history.replaceState(null, '', `#${id}/${isShell(kind) ? kind : 'term'}`);
     $('#term-wrap').hidden = false;
@@ -1025,6 +1436,7 @@ const term = {
   },
 
   syncOverlay() {
+    if (isBrowser(this.kind)) return this.renderTabs();
     const a = this.agentId && agents.get(this.agentId);
     const shell = isShell(this.kind);
     const closed = shell ? this.shellExited : a && !a.runtime.running && a.status !== 'preparing';
@@ -1046,8 +1458,105 @@ const term = {
       .sort((x, y) => x - y)
       .map((n) => `<button class="term-tab" data-kind="shell:${n}" role="tab" title="Shell ${n} in the agent's folder">Shell ${n}<span class="x" data-close="${n}" title="Close this shell">×</span></button>`)
       .join('');
+    $('#browser-tabs').innerHTML = (a?.browsers ?? [])
+      .map((t) => `<button class="term-tab" data-kind="browser:${t.n}" role="tab" title="${esc(t.url)}">🌐 ${esc(browserLabel(t.url))}<span class="x" data-drop-browser="${t.n}" title="Close this browser tab">×</span></button>`)
+      .join('');
     for (const tab of document.querySelectorAll('.term-tab[data-kind]')) tab.classList.toggle('active', tab.dataset.kind === this.kind);
+    $('#browser-new').classList.toggle('active', this.kind === 'browser:new');
     $('#shell-new').disabled = !a?.workdir || a.status === 'preparing';
+    if (isBrowser(this.kind) && this.kind !== 'browser:new' && !a?.browsers?.some((t) => `browser:${t.n}` === this.kind)) {
+      // Closed on another device.
+      this.kind = null;
+      this.open(this.agentId, 'claude');
+    }
+  },
+
+  // Browser tabs: one iframe per tab, kept while the panel is open so switching back doesn't reload it.
+  frames: new Map(), // "<agent>:<n>" -> iframe
+
+  openBrowser(id, kind) {
+    history.replaceState(null, '', `#${id}/${kind}`);
+    $('#term-wrap').hidden = false;
+    $('#detail').classList.add('with-term');
+    $('#term-wrap').classList.add('browsing');
+    this.ensure();
+    if (this.agentId !== id) this.dropFrames();
+    this.disconnect();
+    this.agentId = id;
+    this.kind = kind;
+    $('#term-overlay').hidden = true;
+    this.renderTabs();
+    const tab = agents.get(id)?.browsers?.find((t) => `browser:${t.n}` === kind);
+    for (const [key, f] of this.frames) f.hidden = key !== `${id}:${tab?.n}`;
+    $('#browser-start').hidden = Boolean(tab);
+    $('#browser-cert').hidden = true;
+    const open = tab && this.frames.get(`${id}:${tab.n}`);
+    Object.assign($('#browser-pop'), { href: open?.dataset.src ?? '#', hidden: !open });
+    // Here the tab loads the site itself, so its own "don't frame me" header applies; the relay
+    // used from other devices drops that header.
+    $('#browser-hint').hidden = REMOTE || !tab || /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])[:/]/.test(tab.url);
+    $('#browser-url').value = tab?.url ?? '';
+    $('#term-title').textContent = tab ? tab.url : 'Open a page as this machine sees it';
+    if (!tab) {
+      $('#browser-pop').hidden = true;
+      this.suggest(id);
+      requestAnimationFrame(() => $('#browser-url').focus());
+      return;
+    }
+    this.loadFrame(id, tab);
+  },
+
+  async loadFrame(id, tab, force = false) {
+    const key = `${id}:${tab.n}`;
+    let frame = this.frames.get(key);
+    if (frame && frame.dataset.url === tab.url && !force) return;
+    let src;
+    try {
+      ({ src } = await api('POST', '/preview', { url: tab.url }));
+    } catch (err) {
+      return toast(`Can't open ${tab.url}: ${err.message}`, 5000);
+    }
+    const viewing = () => this.kind === `browser:${tab.n}` && this.agentId === id;
+    if (viewing()) Object.assign($('#browser-pop'), { href: src, hidden: false });
+    // From another device the tab goes through its own relay port. A browser accepts a
+    // self-signed certificate per port and can't ask inside a frame, so check first and
+    // offer to accept it in a tab of its own instead of showing a blank page.
+    if (REMOTE && !(await reachable(src))) {
+      frame?.remove();
+      this.frames.delete(key);
+      if (viewing()) {
+        $('#browser-cert-open').href = src;
+        $('#browser-cert').hidden = false;
+      }
+      return;
+    }
+    if (viewing()) $('#browser-cert').hidden = true;
+    if (!frame) {
+      frame = Object.assign(document.createElement('iframe'), { className: 'browser-frame', title: tab.url });
+      frame.setAttribute('allow', 'clipboard-read; clipboard-write; fullscreen');
+      $('#browser-frames').append(frame);
+      this.frames.set(key, frame);
+    }
+    frame.dataset.url = tab.url;
+    frame.dataset.src = src;
+    frame.hidden = !viewing();
+    frame.src = src;
+  },
+
+  dropFrames(key) {
+    for (const [k, f] of this.frames) {
+      if (key && k !== key) continue;
+      f.remove();
+      this.frames.delete(k);
+    }
+  },
+
+  async suggest(id) {
+    const urls = await api('GET', `/agents/${id}/local-urls`).catch(() => []);
+    if (this.agentId !== id || this.kind !== 'browser:new') return;
+    $('#browser-suggest').innerHTML = urls.length
+      ? `<span class="muted">Seen in this agent's terminals:</span> ${urls.map((u) => `<button type="button" class="small" data-url="${esc(u)}">${esc(u)}</button>`).join(' ')}`
+      : '<span class="muted">Type a port (5173) or an address (localhost:3000/app, example.com). Local addresses the agent prints, like a dev server\'s, show up here.</span>';
   },
 
   /** Upload files to the daemon and paste their paths, the way a native terminal pastes a dropped file. */
@@ -1086,6 +1595,7 @@ const term = {
   close() {
     if (this.agentId) history.replaceState(null, '', `#${this.agentId}`);
     this.disconnect();
+    this.dropFrames();
     this.agentId = null;
     $('#term-wrap').hidden = true;
     $('#detail').classList.remove('with-term');
@@ -1108,6 +1618,20 @@ $('#term-resume').onclick = () => {
 $('.term-tabs').addEventListener('click', async (e) => {
   const id = term.agentId;
   if (!id) return;
+  const dropBrowser = e.target.closest('[data-drop-browser]');
+  if (dropBrowser) {
+    e.stopPropagation();
+    const n = Number(dropBrowser.dataset.dropBrowser);
+    return act(async () => {
+      await api('DELETE', `/agents/${id}/browsers/${n}`);
+      term.dropFrames(`${id}:${n}`);
+      if (term.kind === `browser:${n}`) {
+        term.kind = null;
+        term.open(id, 'claude');
+      }
+    });
+  }
+  if (e.target.closest('#browser-new')) return term.open(id, 'browser:new');
   const close = e.target.closest('[data-close]');
   if (close) {
     e.stopPropagation();
@@ -1134,6 +1658,61 @@ $('.term-tabs').addEventListener('click', async (e) => {
   }
   term.open(id, tab.dataset.kind);
 });
+
+const browserLabel = (url) => {
+  const u = new URL(url);
+  return u.host + (u.pathname === '/' ? '' : u.pathname);
+};
+async function openAddress(url) {
+  const id = term.agentId;
+  if (!id || !url.trim()) return;
+  await act(async () => {
+    if (term.kind === 'browser:new') {
+      const tab = await api('POST', `/agents/${id}/browsers`, { url });
+      upsertBrowsers(id, tab.n, tab.url);
+      const n = tab.n;
+      term.open(id, `browser:${n}`);
+    } else {
+      const n = Number(term.kind.split(':')[1]);
+      const tab = await api('PATCH', `/agents/${id}/browsers/${n}`, { url });
+      upsertBrowsers(id, n, tab.url);
+      term.open(id, term.kind);
+    }
+  });
+}
+// Don't wait for the change event to show a tab that was just opened.
+function upsertBrowsers(id, n, url) {
+  const a = agents.get(id);
+  if (!a) return;
+  const tabs = (a.browsers ?? []).filter((t) => t.n !== n);
+  a.browsers = [...tabs, { n, url }].sort((x, y) => x.n - y.n);
+}
+$('#browser-bar').addEventListener('submit', (e) => {
+  e.preventDefault();
+  openAddress($('#browser-url').value);
+});
+$('#browser-suggest').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-url]');
+  if (b) openAddress(b.dataset.url);
+});
+/** Whether this device can load `src` at all (a no-cors probe fails on an untrusted certificate). */
+async function reachable(src) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 8000);
+  try {
+    await fetch(src, { mode: 'no-cors', credentials: 'include', cache: 'no-store', signal: ctl.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+$('#browser-cert-retry').onclick = () => $('#browser-reload').click();
+$('#browser-reload').onclick = () => {
+  const tab = agents.get(term.agentId)?.browsers?.find((t) => `browser:${t.n}` === term.kind);
+  if (tab) term.loadFrame(term.agentId, tab, true);
+};
 
 // Attachments: the 📎 button, dropping files on the terminal, or pasting a file / screenshot.
 $('#term-attach').onclick = () => $('#term-file').click();
@@ -1290,6 +1869,12 @@ $('#detail-body').addEventListener('click', async (e) => {
       act(async () => upsert(await api('PATCH', `/agents/${a.id}`, { project: name })));
       break;
     }
+    case 'plan-open':
+      return openPlan(a.id);
+    case 'plan-on':
+      return act(async () => upsert(await api('POST', `/agents/${a.id}/plan/review`, { on: true })), 'The agent will write a plan and wait for your review');
+    case 'plan-skip':
+      return act(async () => upsert(await api('POST', `/agents/${a.id}/plan/review`, { on: false })), 'Review skipped; the agent goes ahead');
     case 'insights':
       btn.disabled = true;
       btn.textContent = 'Thinking…';
@@ -1302,6 +1887,12 @@ $('#detail-body').addEventListener('click', async (e) => {
       break;
     case 'shell':
       term.open(a.id, 'shell:1');
+      break;
+    case 'fork':
+      forkAgent(a.id);
+      break;
+    case 'checkpoint':
+      act(async () => upsert(await api('POST', `/agents/${a.id}/checkpoint`)), 'Checkpoint saved');
       break;
     case 'start':
       act(
@@ -1387,9 +1978,10 @@ function openNewDialog(mode = 'now') {
   dialog.querySelector('textarea').focus();
 }
 function syncWhen() {
-  const queue = dialog.querySelector('input[name="when"]:checked').value === 'backlog';
-  dialog.querySelector('.now-only').hidden = queue;
-  dialog.querySelector('button[type=submit]').textContent = queue ? 'Add to backlog' : 'Create agents';
+  const when = dialog.querySelector('input[name="when"]:checked').value;
+  dialog.querySelector('.now-only').hidden = when !== 'now';
+  dialog.querySelector('.race-only').hidden = when !== 'race';
+  dialog.querySelector('button[type=submit]').textContent = when === 'backlog' ? 'Add to backlog' : when === 'race' ? 'Start race' : 'Create agents';
 }
 for (const r of dialog.querySelectorAll('input[name="when"]')) r.addEventListener('change', syncWhen);
 $('#new-btn').onclick = () => openNewDialog('now');
@@ -1401,6 +1993,41 @@ $('#new-form').addEventListener('submit', async (e) => {
     .split('\n')
     .map((s) => s.trim())
     .filter(Boolean);
+  if (f.get('when') === 'race') {
+    // "model", "model | approach" or "| approach", one attempt per line.
+    const variants = String(f.get('variants') || '')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => {
+        const [model, ...rest] = l.split('|');
+        return { model: model.trim() || undefined, instructions: rest.join('|').trim() || undefined };
+      });
+    try {
+      const race = await api('POST', '/races', {
+        intent: intents.join('\n'),
+        variants,
+        testCommand: f.get('testCommand') || undefined,
+        repo: f.get('repo') || undefined,
+        dir: f.get('dir') || undefined,
+        base: f.get('base') || undefined,
+        project: f.get('project') || undefined,
+        permissionMode: f.get('permissionMode') || undefined,
+        model: f.get('model') || undefined,
+        priority: Number(f.get('priority')),
+      });
+      races.set(race.id, race);
+      dialog.close();
+      e.target.reset();
+      syncWhen();
+      openRace(race.id);
+      toast(`Race started: ${race.rows.length} attempts`);
+    } catch (err) {
+      $('#new-error').textContent = err.message;
+      $('#new-error').hidden = false;
+    }
+    return;
+  }
   if (f.get('when') === 'backlog') {
     try {
       const added = await api('POST', '/backlog', {
@@ -1411,8 +2038,10 @@ $('#new-form').addEventListener('submit', async (e) => {
         project: f.get('project') || undefined,
         permissionMode: f.get('permissionMode') || undefined,
         model: f.get('model') || undefined,
+        engine: f.get('engine') || undefined,
         worktree: f.get('worktree') ? true : undefined,
         plan: Boolean(f.get('plan')),
+        planReview: Boolean(f.get('planReview')),
         priority: Number(f.get('priority')),
       });
       dialog.close();
@@ -1433,10 +2062,12 @@ $('#new-form').addEventListener('submit', async (e) => {
       dir: f.get('dir') || undefined,
       permissionMode: f.get('permissionMode') || undefined,
       model: f.get('model') || undefined,
+      engine: f.get('engine') || undefined,
       worktree: f.get('worktree') ? true : undefined,
       base: f.get('base') || undefined,
       project: f.get('project') || undefined,
       plan: Boolean(f.get('plan')),
+      planReview: Boolean(f.get('planReview')),
       start: Boolean(f.get('start')),
     });
     created.forEach((a) => agents.set(a.id, a));
@@ -1498,10 +2129,12 @@ function handleEvent(msg) {
     msg.agents.forEach((a) => agents.set(a.id, a));
     if (msg.backlog) backlogState = msg.backlog;
     if (msg.projects) projectsState = msg.projects;
+    races.clear();
+    for (const r of msg.races ?? []) races.set(r.id, r);
     msg.agents.forEach(watchDocs);
     if (selectedId && !agents.has(selectedId)) selectedId = null;
     if (openTermOnLoad && selectedId) {
-      if (isShell(hashView)) term.open(selectedId, hashView);
+      if (isShell(hashView) || isBrowser(hashView)) term.open(selectedId, hashView);
       else if (agents.get(selectedId).runtime.running) term.open(selectedId);
     }
     openTermOnLoad = false;
@@ -1512,6 +2145,10 @@ function handleEvent(msg) {
   } else if (msg.t === 'removed') {
     agents.delete(msg.id);
     if (selectedId === msg.id) select(null);
+  } else if (msg.t === 'race') {
+    races.set(msg.race.id, msg.race);
+  } else if (msg.t === 'race-removed') {
+    races.delete(msg.id);
   } else if (msg.t === 'backlog') {
     backlogState = msg.backlog;
   } else if (msg.t === 'projects') {
@@ -1668,7 +2305,7 @@ async function loadAlerts() {
   f.channel.value = n.slack.channel ?? '';
   f.webhookUrl.placeholder = n.slack.webhookUrl ?? 'https://hooks.slack.com/services/…';
   f.botToken.placeholder = n.slack.botToken ?? 'xoxb-…';
-  for (const k of Object.keys(n.events)) f[`ev_${k}`].checked = n.events[k];
+  for (const k of Object.keys(n.events)) if (f[`ev_${k}`]) f[`ev_${k}`].checked = n.events[k];
   f.needsInputDelaySec.value = n.needsInputDelaySec;
   f.waitingDelaySec.value = n.waitingDelaySec;
   f.skipWhenWatching.checked = n.skipWhenWatching;
@@ -1692,7 +2329,7 @@ $('#alerts-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
   const body = {
-    events: { needsInput: f.ev_needsInput.checked, review: f.ev_review.checked, error: f.ev_error.checked, waiting: f.ev_waiting.checked, blocked: f.ev_blocked.checked },
+    events: Object.fromEntries([...f.querySelectorAll('input[name^="ev_"]')].map((el) => [el.name.slice(3), el.checked])),
     needsInputDelaySec: Number(f.needsInputDelaySec.value),
     waitingDelaySec: Number(f.waitingDelaySec.value),
     skipWhenWatching: f.skipWhenWatching.checked,
@@ -1731,8 +2368,8 @@ async function sessionOk() {
   }
 }
 
-async function login(token) {
-  const res = await post('/api/login', { token });
+async function login(token, kind = 'token') {
+  const res = await post('/api/login', { [kind]: token });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
 }
 
@@ -1755,6 +2392,17 @@ $('#login-form').addEventListener('submit', async (e) => {
   }
 });
 
+// Engines this machine can run; the New agent form offers a choice once there's more than Claude.
+const ENGINE_LABEL = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity' };
+async function loadEngines() {
+  try {
+    const list = (await api('GET', '/engines')).filter((e) => e.installed && e.id !== 'claude');
+    const sel = document.querySelector('#engine-field select');
+    for (const e of list) sel.append(Object.assign(document.createElement('option'), { value: e.id, textContent: e.label }));
+    $('#engine-field').hidden = !list.length;
+  } catch {}
+}
+
 async function boot() {
   if (REMOTE) {
     document.body.classList.add('remote');
@@ -1766,9 +2414,20 @@ async function boot() {
         return showLogin(err.message);
       }
     }
+    if (ticketHash) {
+      history.replaceState(null, '', location.pathname + (goHash ? `#${goHash}` : '')); // the ticket is single-use anyway
+      if (!(await sessionOk())) {
+        try {
+          await login(ticketHash, 'ticket');
+        } catch (err) {
+          return showLogin(err.message);
+        }
+      }
+    }
     if (!(await sessionOk())) return showLogin();
   }
   connectEvents();
+  loadEngines();
 }
 
 boot();

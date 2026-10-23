@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Agent Manager Hub</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22M8 1l7 7-7 7-7-7z%22 fill=%22%233b5bdb%22/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="/hub.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">◆</span>
+        <h1>Agent Manager <span class="muted">Hub</span></h1>
+        <span id="hub-name" class="muted"></span>
+      </div>
+      <div class="top-actions" id="top-actions" hidden>
+        <span id="conn" class="conn">connecting…</span>
+        <button id="new-btn" class="primary" hidden>New agent</button>
+        <button id="invite-btn">Add machine</button>
+        <button id="logout-btn" class="ghost">Sign out</button>
+      </div>
+    </header>
+
+    <main id="login" class="login" hidden>
+      <form id="login-form" class="card">
+        <h2>Sign in to the hub</h2>
+        <a id="google-btn" class="google-btn" href="/api/auth/google" hidden>Sign in with Google</a>
+        <p id="login-error" class="error" hidden></p>
+        <details id="token-box" open>
+          <summary id="token-summary">Use the access token</summary>
+          <p class="muted">Paste the hub's access token. Where the hub runs, <code>agentmgr hub token</code> prints it.</p>
+          <input id="token" type="password" autocomplete="current-password" placeholder="Access token" required />
+          <button class="primary" type="submit">Sign in</button>
+        </details>
+      </form>
+    </main>
+
+    <main id="app" class="app" hidden>
+      <section class="machines" id="machines" aria-label="Machines"></section>
+
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="inbox" class="active">Needs you <span class="count" id="inbox-count">0</span></button>
+        <button role="tab" data-tab="agents">Agents <span class="count" id="agents-count">0</span></button>
+        <button role="tab" data-tab="backlog">Backlog <span class="count" id="backlog-count">0</span></button>
+        <div class="spacer"></div>
+        <span id="filter-chip" class="chip" hidden></span>
+        <input id="search" type="search" placeholder="Filter by name, intent, project…" aria-label="Filter" />
+      </nav>
+
+      <section id="tab-inbox" class="tab"></section>
+      <section id="tab-agents" class="tab" hidden></section>
+      <section id="tab-backlog" class="tab" hidden></section>
+      <p class="footnote muted" id="footnote">
+        Buttons appear for what each machine allows the hub (the chips on its card); it decides that in the <code>hub</code> section of its <code>config.json</code>.<br />
+        <b>Open</b> goes to the machine's own UI. The first time from a device, sign in there with that machine's remote-access token (<code>agentmgr remote status</code> on it), not the hub's.
+      </p>
+    </main>
+
+    <dialog id="invite-dialog">
+      <form method="dialog" class="dialog">
+        <h2>Add a machine</h2>
+        <p class="muted">On the Mac to add (with Agent Manager installed), run:</p>
+        <div class="cmd"><code id="invite-cmd">…</code><button type="button" id="copy-btn" class="ghost">Copy</button></div>
+        <p class="muted small" id="invite-expiry"></p>
+        <p class="muted small">
+          A new machine shares <b>view</b> only: its agents and what they're waiting on, without code, transcripts or terminals.
+          Each machine decides this itself, in the <code>hub</code> section of its <code>~/.agentmanager/config.json</code>.
+        </p>
+        <div class="dialog-actions"><button class="primary" value="close">Done</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="new-dialog">
+      <form class="dialog" id="new-form">
+        <h2>New agent</h2>
+        <label>Machine <select id="new-machine" required></select></label>
+        <label>Project <select id="new-project" required></select></label>
+        <label>Intent <textarea id="new-intent" rows="4" required placeholder="What should the agent do?"></textarea></label>
+        <div class="row-fields">
+          <label>Priority
+            <select id="new-priority"><option value="0">P0</option><option value="1">P1</option><option value="2" selected>P2</option><option value="3">P3</option></select>
+          </label>
+          <label id="new-engine-field" hidden>Engine
+            <select id="new-engine"></select>
+          </label>
+          <label>Permissions
+            <select id="new-mode"><option value="">Machine default</option><option value="default">Ask</option><option value="acceptEdits">Accept edits</option><option value="plan">Plan first</option></select>
+          </label>
+        </div>
+        <p class="muted small">Only projects registered on that machine and shared with the hub are listed. The hub can't start agents that skip permission prompts.</p>
+        <p class="error" id="new-error" hidden></p>
+        <div class="dialog-actions"><button type="button" class="ghost" id="new-cancel">Cancel</button><button class="primary">Start</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="queue-dialog">
+      <form class="dialog" id="queue-form">
+        <h2>Add to the backlog</h2>
+        <label>Project <select id="queue-project" required></select></label>
+        <label>Work <textarea id="queue-titles" rows="5" required placeholder="One item per line: each becomes one agent"></textarea></label>
+        <label>Needs labels <input id="queue-labels" placeholder="Optional, comma separated: gpu, machine:mac-mini" /></label>
+        <div class="row-fields">
+          <label>Priority
+            <select id="queue-priority"><option value="0">P0</option><option value="1">P1</option><option value="2" selected>P2</option><option value="3">P3</option></select>
+          </label>
+          <label id="queue-engine-field" hidden>Engine
+            <select id="queue-engine"></select>
+          </label>
+          <label>Permissions
+            <select id="queue-mode"><option value="">Machine default</option><option value="default">Ask</option><option value="acceptEdits">Accept edits</option><option value="plan">Plan first</option></select>
+          </label>
+        </div>
+        <p class="muted small">Each item starts on a machine that shares the project, has the labels and has room, preferring one that already has the repo cloned.</p>
+        <p class="error" id="queue-error" hidden></p>
+        <div class="dialog-actions"><button type="button" class="ghost" id="queue-cancel">Cancel</button><button class="primary">Queue</button></div>
+      </form>
+    </dialog>
+
+    <div id="term-overlay" class="term-overlay" hidden>
+      <div class="term-head">
+        <b id="term-title"></b>
+        <span id="term-status" class="term-status"></span>
+        <button id="term-close" class="ghost" title="Close (⌘.)">Close</button>
+      </div>
+      <div id="term" class="term"></div>
+      <div class="term-keys" id="term-keys" aria-label="Terminal keys">
+        <button data-key="esc">Esc</button><button data-key="tab">Tab</button><button data-key="stab" title="Shift+Tab: cycle permission mode">⇧Tab</button>
+        <button data-key="up">↑</button><button data-key="down">↓</button><button data-key="left">←</button><button data-key="right">→</button>
+        <button data-key="enter">⏎</button><button data-key="ctrlc">^C</button>
+        <button data-key="1">1</button><button data-key="2">2</button><button data-key="3">3</button><button data-key="4">4</button>
+      </div>
+      <form class="term-compose" id="term-compose" autocomplete="off">
+        <textarea id="term-text" rows="1" placeholder="Reply to the agent…" enterkeyhint="send"></textarea>
+        <button class="primary">Send</button>
+      </form>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <script src="/hub.js" type="module"></script>
+  </body>
+</html>

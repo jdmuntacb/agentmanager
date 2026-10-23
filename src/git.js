@@ -7,9 +7,9 @@ const ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
 
 const cancelled = () => Object.assign(new Error('Cancelled'), { cancelled: true });
 
-export function run(cmd, args, { cwd, timeout = 60_000, signal } = {}) {
+export function run(cmd, args, { cwd, timeout = 60_000, signal, env } = {}) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { cwd, timeout, signal, env: ENV, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(cmd, args, { cwd, timeout, signal, env: env ? { ...ENV, ...env } : ENV, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         if (signal?.aborted) return reject(cancelled());
         err.message = `${cmd} ${args.join(' ')} failed: ${(stderr || err.message).trim()}`;
@@ -228,4 +228,113 @@ export async function changeSummary(dir, baseSha) {
     commits: commits ? commits.split('\n') : [],
     diffstat: stat.split('\n').slice(-25).join('\n'),
   };
+}
+
+/**
+ * What a worktree changed relative to `baseSha` (commits plus uncommitted and untracked
+ * files): per file, lines added/removed and the base-side line ranges touched.
+ * Returns { files: { path: { added, removed, ranges: [[from, to]], untracked? } } }.
+ */
+export async function changes(dir, baseSha) {
+  if (!baseSha || !(await isGitRepo(dir))) return null;
+  const opts = { cwd: dir, timeout: 30_000 };
+  const [numstat, diff, untracked] = await Promise.all([
+    run('git', ['diff', '--numstat', '--no-renames', baseSha], opts),
+    run('git', ['diff', '-U0', '--no-color', '--no-renames', '--no-ext-diff', baseSha], opts),
+    run('git', ['ls-files', '--others', '--exclude-standard'], opts).catch(() => ''),
+  ]);
+  const files = {};
+  for (const line of numstat.split('\n').filter(Boolean)) {
+    const [add, del, file] = line.split('\t');
+    files[file] = { added: add === '-' ? 0 : Number(add), removed: del === '-' ? 0 : Number(del), ranges: [] };
+  }
+  let cur = null;
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('--- ')) cur = line.slice(4) === '/dev/null' ? null : line.slice(6);
+    else if (line.startsWith('+++ ')) cur = line.slice(4) === '/dev/null' ? cur : line.slice(6);
+    else if (line.startsWith('@@') && cur && files[cur]) {
+      // "@@ -start,len +..." — len 0 is a pure insertion after line `start`.
+      const m = /^@@ -(\d+)(?:,(\d+))?/.exec(line);
+      if (m) {
+        const start = Number(m[1]);
+        const len = m[2] === undefined ? 1 : Number(m[2]);
+        files[cur].ranges.push([start, start + Math.max(len, 1) - 1]);
+      }
+    }
+  }
+  for (const file of untracked.split('\n').filter(Boolean)) {
+    // New files count as all lines added (skipping big or binary ones).
+    let added = 0;
+    try {
+      const full = path.join(dir, file);
+      if (fs.statSync(full).size < 1_000_000) {
+        const buf = fs.readFileSync(full);
+        if (!buf.subarray(0, 8000).includes(0)) added = buf.toString('utf8').split('\n').filter((l, i, all) => l || i < all.length - 1).length;
+      }
+    } catch {}
+    files[file] ??= { added, removed: 0, ranges: [[1, 1e9]], untracked: true };
+  }
+  return { files };
+}
+
+const SNAPSHOT_ENV = {
+  GIT_AUTHOR_NAME: 'Agent Manager',
+  GIT_AUTHOR_EMAIL: 'agentmgr@localhost',
+  GIT_COMMITTER_NAME: 'Agent Manager',
+  GIT_COMMITTER_EMAIL: 'agentmgr@localhost',
+};
+
+/**
+ * A commit holding the folder's whole working state (tracked edits and untracked files),
+ * made without touching its index, branch or files. Returns { sha, tree, head }.
+ */
+export async function snapshot(dir, message = 'agentmgr checkpoint') {
+  const opts = { cwd: dir, timeout: 120_000 };
+  const head = await run('git', ['rev-parse', '--verify', '-q', 'HEAD^{commit}'], opts).catch(() => null);
+  if (!head) return null;
+  // Start from a copy of the real index so unchanged files aren't re-hashed.
+  const indexPath = path.resolve(dir, await run('git', ['rev-parse', '--git-path', 'index'], opts));
+  const tmp = path.join(path.dirname(indexPath), `agentmgr-snap-${process.pid}-${Date.now()}`);
+  try {
+    if (fs.existsSync(indexPath)) fs.copyFileSync(indexPath, tmp);
+    const env = { ...SNAPSHOT_ENV, GIT_INDEX_FILE: tmp };
+    if (!fs.existsSync(indexPath)) await run('git', ['read-tree', head], { ...opts, env });
+    await run('git', ['add', '-A'], { ...opts, env });
+    const tree = await run('git', ['write-tree'], { ...opts, env });
+    const sha = await run('git', ['commit-tree', tree, '-p', head, '-m', message], { ...opts, env });
+    return { sha, tree, head };
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+/** Make the working tree match a snapshot commit (index and branch stay on HEAD). */
+export async function restoreSnapshot(dir, sha) {
+  await run('git', ['restore', `--source=${sha}`, '--worktree', '--', '.'], { cwd: dir, timeout: 120_000 });
+}
+
+export async function setRef(dir, ref, sha) {
+  await run('git', ['update-ref', ref, sha], { cwd: dir });
+}
+
+/** Delete every ref under `prefix` (e.g. refs/agentmgr/<id>/). */
+export async function deleteRefs(dir, prefix) {
+  const refs = (await run('git', ['for-each-ref', '--format=%(refname)', prefix], { cwd: dir }).catch(() => '')).split('\n').filter(Boolean);
+  for (const ref of refs) await run('git', ['update-ref', '-d', ref], { cwd: dir }).catch(() => {});
+}
+
+/** Unified diff of a worktree against `baseSha`, untracked files included, capped at `max` bytes. */
+export async function fullDiff(dir, baseSha, max = 400_000) {
+  const opts = { cwd: dir, timeout: 30_000 };
+  let out = await run('git', ['diff', '--no-color', '--no-ext-diff', baseSha], opts).catch(() => '');
+  const untracked = (await run('git', ['ls-files', '--others', '--exclude-standard'], opts).catch(() => '')).split('\n').filter(Boolean);
+  for (const f of untracked) {
+    if (out.length > max) break;
+    // --no-index exits 1 when the files differ, which is always here.
+    const patch = await new Promise((resolve) =>
+      execFile('git', ['diff', '--no-color', '--no-index', '--', '/dev/null', f], { ...opts, env: ENV, maxBuffer: 10 * 1024 * 1024 }, (_e, stdout) => resolve(stdout ?? '')),
+    );
+    out += `\n${patch}`;
+  }
+  return out.length > max ? `${out.slice(0, max)}\n… (diff truncated)` : out;
 }

@@ -87,7 +87,7 @@ export class Backlog extends EventEmitter {
   // ------------------------------------------------------------ editing
 
   /** Queue one item per title. Options are what an agent would take (repo, dir, base, project, ...). */
-  add(titles, { repo, dir, base, project, worktree, permissionMode, model, plan, priority = 2 } = {}) {
+  add(titles, { repo, dir, base, project, worktree, permissionMode, model, plan, planReview, engine, priority = 2 } = {}) {
     const list = titles.map((t) => String(t ?? '').trim()).filter(Boolean);
     if (!list.length) throw err(400, 'At least one item is required');
     const pr = parsePriority(priority);
@@ -117,7 +117,9 @@ export class Backlog extends EventEmitter {
         worktree: worktree ?? true,
         permissionMode: permissionMode || null,
         model: model || null,
+        engine: engine || null,
         plan: Boolean(plan),
+        planReview: planReview ?? null,
         priority: pr,
         order: order + i,
         status: 'queued',
@@ -214,7 +216,9 @@ export class Backlog extends EventEmitter {
       project: it.project,
       permissionMode: it.permissionMode,
       model: it.model,
+      engine: it.engine ?? undefined,
       plan: it.plan,
+      planReview: it.planReview ?? undefined,
       priority: it.priority,
       name: undefined,
     });

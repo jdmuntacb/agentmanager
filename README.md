@@ -22,6 +22,8 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **Slack alerts.** A message in your channel when an agent needs input, finishes a backlog item, or fails.
 - **Priority.** Mark agents P0–P3. P0 and P1 are highlighted, and lists sort by priority.
 - **Share for review.** One click writes an **Analysis**, **Design**, **Flow** or **Proposal** document from the agent's work. Copy it as Markdown, download it, or print it to PDF with diagrams.
+- **Human vs AI.** It splits the open questions about the work into the top 5 that need your judgment and the ones a model can answer from the evidence. It answers those, then a second model double-checks every answer.
+- **Plan review.** Optionally, the agent writes an implementation plan and waits for your approval before changing anything.
 - **Insights.** Why, What, How and Now for any agent, three memorable points each.
 - **Explain.** One click gives a plain-language explanation of the intent and the insight behind the problem and solution. It comes from a separate tool-less Claude call, so the agent isn't interrupted.
 - **From your phone.** On by default: HTTPS access on your local network at a plain `https://<ip>:<port>`. Sign in with a QR code, and answer Claude's prompts with a key bar and reply box. Nothing to install.
@@ -31,8 +33,17 @@ Run one background [Claude Code](https://claude.com/claude-code) agent per inten
 - **No trust prompt.** Folders agents run in are pre-trusted, so Claude's "trust this folder" prompt doesn't block them.
 - **Survives restarts and reboots.** Agents that were running when the daemon stopped (restart, crash or reboot) are resumed with the same session IDs when it starts again. `agentmgr service install` starts the daemon at login.
 - **Shells next to each agent.** **Open shell** gives a terminal in the agent's folder for running commands by hand. **+ Shell** opens as many more as you need, each in its own tab.
+- **Browser tabs.** **+ Browser** opens a page as this machine sees it, in a tab next to the agent's terminals. That can be the agent's dev server on `localhost:5173`, a site on its network or VPN, or any address. Local addresses the agent prints are offered as suggestions. It works from your phone or laptop too (see below).
 - **Attach files and screenshots.** Drop files on the terminal, paste a screenshot, or use **📎 Attach**. The file is saved on the daemon's machine and its path is pasted into the terminal, which is how Claude Code picks up images and files.
 - **General sessions.** **Ask Claude** starts a session with no repo, folder or intent, for questions. It is tracked and resumable like any other agent.
+
+New in 0.2, for running many agents at once:
+
+- **Decision inbox.** One **Inbox** tab for everything waiting on you, across agents: prompts that need an answer (answer them with one click), questions agents ask without stopping, agents that seem stuck, and overlapping changes. Answers are typed into the agent's session for you.
+- **Conflict radar.** Agents in the same repo that change the same files are flagged while they work, not at merge time, with "same lines" called out and a suggested merge order. **Tell both** lets each agent know.
+- **Stuck detection.** Spots an agent going in circles (the same failure again and again, undoing its own edits, a long stretch with no file changed) and offers a ready-made nudge to send.
+- **Checkpoints and forks.** The code (uncommitted work included) and the conversation are saved at the end of every turn. **Fork** starts a new agent from now or from any checkpoint, in its own worktree, to try another direction without losing the first.
+- **Races.** Send one intent to several agents with different models or approaches. Compare their outcome, checks, size of change, cost and a test command run in each worktree, read their diffs side by side, then pick a winner and delete the rest.
 
 ## Install
 
@@ -71,6 +82,13 @@ agentmgr explain <agent>                      # full briefing: ask, status, plan
 agentmgr remote on | off | status | rotate    # phone / remote access (see below)
 agentmgr backlog add "ask" -r <repo> [-p 1]   # queue work; also: ls, start, accept, reopen, move, limit, pause
 agentmgr notify slack --webhook <url>         # Slack alerts; also: test, status, on, off, event <name> on|off
+agentmgr inbox                                # prompts, questions, stuck agents and overlaps waiting on you
+agentmgr answer <agent> <question-id> "…"     # answer a question from the inbox
+agentmgr tell <agent> "…"                     # send a message into the session (when it's idle)
+agentmgr fork <agent> [-c 3] [-m "…"]         # new agent from now (or checkpoint 3), its own worktree
+agentmgr checkpoints <agent>                  # snapshots saved at the end of each turn
+agentmgr race start "intent" -v opus -v "sonnet|keep it small" -r <repo> -t "npm test"
+agentmgr race show [race] | test <race> | pick <race> <agent> [--cleanup]
 agentmgr flush                                # save session IDs, scrollback, usage and state now
 agentmgr restart                              # flush, stop and start the daemon; agents resume
 agentmgr plan <agent>                         # plan with Claude while the workspace is still being prepared
@@ -198,7 +216,7 @@ Every agent has a priority, **P0** (urgent) to **P3** (low). **P2** is the defau
 - **Backlog.** Items use the same P0–P3 scale and pass it on to their agents.
 - **Slack.** Alerts are tagged `[P0]` / `[P1]`.
 
-## Share for review: Analysis, Design, Flow, Proposal
+## Share for review: Analysis, Design, Flow, Proposal, Human vs AI
 
 The Brief panel's **Share for review** buttons, or `agentmgr doc <agent> <kind>`, write a stakeholder document from the agent's live context: its ask, conversation and actions, repository changes and brief.
 
@@ -208,6 +226,15 @@ The Brief panel's **Share for review** buttons, or `agentmgr doc <agent> <kind>`
 | **Design** | Summary, goals and non-goals, architecture (with a diagram), components and changes, interfaces and data, trade-offs, risks, testing and rollout |
 | **Flow** | Summary, end-to-end flowchart with a step-by-step walk-through, key interactions as a sequence diagram, failure and edge cases |
 | **Proposal** | Summary, problem, recommendation, scope, plan, effort and dependencies, risks, decisions needed |
+| **Human vs AI** | Your top 5 decisions, each with why it needs you, the stakes, options and what the work suggests, plus a box for your answer. Up to 5 questions the AI answers, each with its confidence, evidence and how to check it. A second model's verdict on each. |
+
+**Human vs AI.** This review takes two separate read-only calls.
+1. **The split.** The agent's engine splits the open questions. *For you to decide* covers judgment calls such as intent, priorities, risk appetite and trade-offs. *Answered by AI* covers reasoning and evaluation: correctness, edge cases, test coverage and what's left.
+2. **The second opinion.** Another model reviews that split against the same context. It marks each AI answer *agrees*, *partly* or *disagrees*, with a correction where needed. It marks each of your questions *keep*, *AI could answer* or *reword*, and lists questions both lists missed.
+
+The second model is another installed engine by default (Codex or Antigravity for a Claude agent), because a different provider tends to catch different mistakes. Without one, it's Claude with a different model. Set `"critique": { "engine": "codex", "model": "…" }` in config.json to choose.
+
+Type your answers in the viewer, or tap an option to fill one in. **Send my answers to the agent** passes them on, together with any AI conclusions the second model doubted, so the agent re-checks those.
 
 **How they're written.** Documents name the real files, tickets and docs, separate facts from proposals, and say "To be confirmed" where the context doesn't. They're written for reviewers: no mention of the agent or its tools.
 
@@ -224,6 +251,17 @@ The Brief panel's **Share for review** buttons, or `agentmgr doc <agent> <kind>`
 - **Queueing.** At most `summaryConcurrency` (2) of these one-off Claude calls run at once, Explain and Insights included. The rest queue.
 
 **Behaviour.** Documents are kept per agent and marked out of date when the brief changes. They come from the same separate, tool-less Claude call as Explain, so the agent isn't interrupted. On the phone link, the print page needs sign-in like everything else.
+
+## Plan review
+
+Tick **Review the implementation plan first** in New agent (or the backlog), or press **Review its plan first** on a running agent. The agent investigates, writes `PLAN.md` (goal, approach, steps, files, tests, risks) next to its brief, and stops. It doesn't edit, commit or run anything that changes the repo until you approve.
+
+- **Where it shows.** The plan appears in the inbox as **Plan review** and in the Brief panel, with a notification.
+- **Approve and implement** sends it ahead, optionally with notes.
+- **Request changes** sends your notes back. The agent revises the plan and waits again.
+- **Skip review** stops waiting.
+- **After approval**, edits to the plan count as progress updates and don't ask again. A restarted agent is told its plan was approved.
+- **Default.** Set `"planReview": true` in config.json to turn it on for every new agent.
 
 ## Insights
 
@@ -327,6 +365,73 @@ Queue asks instead of starting them. Use **+ Add** in the Backlog tab, **Queue i
 
 The backlog is saved with the rest of the state.
 
+## Decision inbox
+
+The **Inbox** tab (and `agentmgr inbox`) lists what needs you, across all agents:
+
+| Kind | What it is | How you answer |
+| --- | --- | --- |
+| Needs input | A permission prompt or question menu is open in the agent's terminal | Click a choice (1, 2, 3, Esc); no need to open the terminal |
+| Question | The agent asked something without stopping | Click an option or type an answer |
+| Stuck? | The agent seems to be going in circles | Send the suggested nudge (edit it first if you like) or dismiss |
+| Overlap | It changes the same files as another agent | Tell one or both agents; see the suggested merge order |
+
+**Questions without stopping.** Task agents are told to write questions that don't block all their work to `QUESTIONS.md` next to their brief, with options and the default they'll assume meanwhile, and then keep going:
+
+```markdown
+## Postgres or SQLite for the cache?
+Options: Postgres | SQLite
+Default: SQLite
+The data set is small.
+```
+
+**How answers reach the agent.** Answers, nudges and overlap warnings go into a per-agent queue. Each message is typed into the session as if you sent it, once the agent is idle: not mid-turn, and with no prompt open. A closed agent is resumed first. `agentmgr tell <agent> "…"` uses the same queue.
+
+## Conflict radar
+
+For each agent with its own branch, Agent Manager works out which files and line ranges its branch changed since it branched, including uncommitted and new files. Agents working in the same repository (the same shared clone or source folder) that touch the same file are flagged:
+
+- **same lines**: both edit the same region, within a few lines (likely a merge conflict). Only judged when both branched from the same commit.
+- **same file**: both edit the file, in different places.
+
+The suggested merge order puts an agent whose PR is merged or open first; otherwise the smaller change lands first, so the other has less to rebase. **Tell** sends an agent a short note naming the other agent, the files and the order. Attempts in one race, and a fork and its source, are expected to overlap, so they aren't flagged.
+
+## Stuck detection
+
+From the transcript, while an agent runs:
+
+| Finding | Rule (defaults) |
+| --- | --- |
+| Same failure N× in a row | One command failing with the same output 3 times running |
+| Undoing its own edits | 2 edits that put back what an earlier edit removed, or 10 edits to one file, within 45 minutes |
+| N min without changing a file | 25+ actions over 20+ minutes since the last edit, while still active |
+
+Each finding comes with a suggested nudge. Sending it also dismisses the finding; a dismissed finding comes back only if the agent gets stuck again. Tune the thresholds with `"stuck": { "repeatFailures": 3, "thrashReverts": 2, "thrashEdits": 10, "driftMinutes": 20, "driftActions": 25 }` in `config.json`.
+
+## Checkpoints and forks
+
+At the end of each turn, Agent Manager snapshots the agent's working tree as a commit under `refs/agentmgr/<agent>/<n>`. This doesn't touch the agent's branch, index or files. It records how far the conversation had got alongside. The last 40 are kept (`maxCheckpoints`); deleting the agent removes them.
+
+**Fork** (or `agentmgr fork <agent> [-c n]`) creates a new agent:
+
+- **Code:** a new worktree and branch at the same commit, with the same uncommitted changes as the source had at that point.
+- **Conversation:** a copy of the transcript up to that point, under the fork's own session ID. The fork resumes it, so it knows everything the source knew.
+- **Direction:** an optional first message, such as "try a different approach: …".
+
+The source agent keeps running untouched.
+
+## Races
+
+**+ New agents → Race variants** (or `agentmgr race start`) creates one agent per variant. Each runs in its own worktree. A variant is a model, an approach, or both: `opus`, `sonnet | keep the change minimal`, `| use a cache`. **Compare** opens the scoreboard:
+
+- **Status and outcome**, from each agent's brief, plus its checks
+- **Change**: files and lines added and removed, with the smallest marked
+- **Tests**: the race's test command, run in every attempt's worktree two at a time (15-minute limit each)
+- **Cost and time**
+- **Diff**: each attempt's full changes against where it started
+
+**Pick** marks the winner and can close and delete the other attempts, worktrees included.
+
 ## Slack alerts
 
 **Three ways to connect Slack:**
@@ -357,6 +462,9 @@ Or use **Alerts** in the header (on this computer only). Settings, including the
 | error | on | Workspace setup or launch failed |
 | waiting | off | The agent finished its turn and has been idle 2 min |
 | blocked | on | The agent reports it is blocked (brief status or Results outcome) |
+| stuck | on | The agent seems to be going in circles (see Stuck detection) |
+| conflict | on | It changes the same files as another agent in the same repo (sent once per pair) |
+| question | on | It asked a question in the decision inbox |
 
 **Message behaviour:**
 
@@ -396,6 +504,73 @@ Or use **Remote access** in the header of the UI on this computer.
 - **Firewall.** If the macOS firewall is off, the port is open to your whole network while remote access is on. Turn it off when you don't need it.
 - **Streaming.** The phone UI streams with Server-Sent Events plus plain HTTPS requests. iOS Safari doesn't apply an accepted self-signed certificate to WebSockets.
 
+## Engines: Claude Code, Codex and Antigravity
+
+Agents run Claude Code by default. With OpenAI's Codex CLI installed (`npm i -g @openai/codex`, signed in), an agent can run Codex instead: `agentmgr add --engine codex …`, or the **Engine** picker in New agent (shown once a second engine is installed). Everything else works the same way: worktrees, the brief and questions, the inbox (Codex's approval menus included), token usage, stuck detection, PR tracking, Explain, the backlog and the hub. Codex records no cost, and planning while a repo clones and forks are Claude-only for now. Set `"engine": "codex"` in config.json to make it the default; `engines.codex.bin` points at another binary. On the hub, each machine reports the engines it has (`engine:codex`), so shared backlog work can ask for one. See [docs/engines.md](docs/engines.md).
+
+Google's **Antigravity CLI** (`agy`, signed in with your Google account) works the same way: `--engine antigravity`. It replaced Gemini CLI for personal Google accounts in June 2026. Agent Manager adopts the conversation agy starts, resumes it with `--conversation`, reads token usage, commands and file writes from its transcript, shows its permission menus (commands, file changes, access outside the folder) in the inbox, pre-trusts agent folders in agy's settings, and runs Explain in agy's print mode. agy asks before writing the brief too, unless the agent runs in `acceptEdits` mode. `engines.antigravity.bin` points at another binary.
+
+## Several machines: the hub
+
+With agents on more than one Mac, a **hub** shows all of them in one place: every machine's agents and one inbox of what needs you. Where a machine allows it, you can also act from the hub: answer, message, start and stop agents, start new ones, and open live terminals. Each Mac keeps running its own daemon. It connects out to the hub, so no ports need opening on it, and the hub's requests travel back over that same connection.
+
+```sh
+# Where the hub runs (any Mac that stays on, or later Railway):
+agentmgr hub serve --host <this-mac-tailscale-ip>   # prints a sign-in link
+agentmgr hub invite                                  # one-time code, valid 10 minutes
+
+# On each Mac to add:
+agentmgr join http://<hub-tailscale-ip>:4720 ABCD-EFGH-JKLM --name laptop
+
+agentmgr fleet           # agents on every machine, and what needs you
+agentmgr fleet answer laptop/3f2a1c q1 "Postgres"
+agentmgr fleet tell laptop/3f2a1c "Also update the docs"
+agentmgr fleet start laptop/3f2a1c          # or stop
+agentmgr fleet new laptop web "Add a dark mode toggle"
+agentmgr fleet backlog add web "Fix the footer links" "Add a sitemap"   # runs where there's room
+agentmgr fleet backlog   # shared backlog: where each item runs, what waits and why
+agentmgr hub machines    # online/offline, versions, what each allows
+agentmgr hub status      # this Mac's link to its hub
+agentmgr leave           # the hub forgets this Mac
+```
+
+**Addresses.** Use `https://` for the hub, or plain `http://` only on this machine or over Tailscale, which already encrypts traffic. **Open** links go to each Mac's remote-access address, its Tailscale one first, so remote access must be on there (`agentmgr remote on`).
+
+**Each Mac decides what the hub may do.** A new machine shares `view` only. More is opt-in, per machine, in its `~/.agentmanager/config.json` (restart its daemon after changing it):
+
+```json
+{ "hub": { "allow": ["view", "inbox", "control", "create", "terminal"], "projects": ["cc", "web"], "labels": ["gpu"], "maxAgents": 4, "perProject": 2 } }
+```
+
+| Permission | The hub may |
+| --- | --- |
+| `view` | See agents (name, status, intent, branch, PRs, cost) and inbox items. Never code, transcripts or local paths. |
+| `inbox` | Answer questions, pick a prompt's choice (this can approve a tool), send stuck nudges, warn about overlaps |
+| `control` | Message an agent, start, stop, checkpoint, change priority |
+| `create` | Start new agents in this machine's registered projects. Never with permission prompts skipped. |
+| `terminal` | Open the live Claude terminal |
+| `shell` | Open shells in an agent's folder. These run any command, so grant with care. |
+| `signin` | Open this machine's own page already signed in: **Open on <machine>** asks for a one-time link (single use, valid for a minute) instead of the access token. That page has full control, beyond the rest of this policy, so grant it only on a hub that only you can sign in to. |
+
+`projects` (names or shortcuts) limits all of it to those projects: other agents aren't shown and can't be touched. `"allow": []` stops sharing but stays joined. The machine checks every request itself, even if the hub thinks it's allowed, matches agents by exact ID, and only runs a fixed list of actions (deleting agents isn't one). Each request, and every refusal, is written to `~/.agentmanager/hub-audit.log`; the hub keeps its own `audit.log` too.
+
+**The shared backlog.** Work you queue on the hub (the **Backlog** tab, or `agentmgr fleet backlog add`) starts on whichever machine can take it, one agent per item. Each item has to land on a machine that is online, allows `create` and shares the project, and that has every label the item asks for. Among those, it goes to one with room, preferring a machine that already has the repo cloned, then the least busy.
+
+- **Projects across machines.** A project matches across machines by its repo, even under different shortcuts; projects without a remote repo match by name.
+- **Room.** Each machine sets its own limits: `hub.maxAgents` in total (default `backlogMaxActive`, 4) and `hub.perProject` (default `backlogParallel`, 2). Items from its own local backlog count against them too.
+- **Labels.** `os:mac` and `arch:arm64` come automatically, `machine:<name>` pins an item to one machine, and anything else comes from that machine's `hub.labels`, for example `["gpu", "fast-net"]`.
+- **Review.** As with the local backlog, an agent whose brief says done moves to **review**: **Accept** finishes it, and **Reopen** sends a note back to the same agent (this needs `control` on that machine). An item waiting for room says why, for example `laptop is full (2/2 in this project)`.
+- **When a machine drops mid-item.** Its item shows as **stalled** and isn't restarted elsewhere on its own, because the work in that machine's worktree would be lost or duplicated. Wait for the machine, or **Requeue** to start over on a different one.
+- **Pausing.** `agentmgr fleet backlog pause` (or **Auto-start** off) stops new starts; **Start now** runs one item past the limits.
+
+**How machines prove who they are.** Joining makes an Ed25519 key pair on the Mac. The private key stays in `~/.agentmanager/hub-link.json` (mode 600), and the hub keeps only the public key. Each connection signs a fresh challenge from the hub. Invite codes work once. **Remove** on the hub (or `agentmgr hub remove <machine>`) disconnects a machine, and it stops retrying until it joins again.
+
+**Signing in with Google.** Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` (a Web application OAuth client whose redirect URI is `<hub address>/api/auth/google/callback`) and `AGENTMGR_HUB_GOOGLE_EMAILS` (comma-separated accounts allowed in). The sign-in page then offers **Sign in with Google**, with the access token folded away below it. It uses the authorization code flow with PKCE, state and nonce, and accepts only verified emails on that list. Without the list, Google sign-in stays off.
+
+**Signing in to the hub.** The hub has one access token: `AGENTMGR_HUB_TOKEN`, or one it generates and prints as a sign-in link (`agentmgr hub token` shows it again). Browsers get a 30-day session cookie. The CLI sends the token: on the hub's own Mac it is read from the hub's state, elsewhere set `AGENTMGR_HUB_TOKEN` and `AGENTMGR_HUB_URL`, or rely on the hub this Mac joined.
+
+**On Railway (later).** `hub/Dockerfile` builds the hub alone, with no node-pty and no Claude. Set `RAILWAY_DOCKERFILE_PATH=hub/Dockerfile`, `AGENTMGR_HUB_TOKEN`, `AGENTMGR_HUB_URL` (its https address) and, for Google sign-in, the three variables above; add a volume at `/data` so enrollments survive redeploys, and join with the `https://…up.railway.app` address.
+
 ## Saving state: flush and restart
 
 - **What's saved immediately.** Agent records (session IDs, settings, links) are written to `state.json` on every change, fsynced, then atomically replaced. Claude writes each conversation to its own transcript as it goes.
@@ -420,6 +595,11 @@ Usage comes from the session transcripts and is refreshed every few seconds whil
 ## Shell and general sessions
 
 - **Open shell** (or `agentmgr shell <agent>`) starts `$SHELL -l` in the agent's working folder. It shows as a **Shell 1** tab next to the **Claude** tab in the terminal pane; **+ Shell** (or `agentmgr shell <agent> -n 2`) opens more, and **×** on a tab closes that shell. Shells live as long as the daemon and don't start Claude.
+- **+ Browser** opens a tab on an address: a port (`5173`), a local address (`localhost:3000/app`), something on the machine's network (`10.0.0.7:8080`, `staging.internal`) or any site (`example.com`, which defaults to https). Tabs are kept with the agent, so every device sees them, and **×** closes one.
+  - **On this computer** the tab loads the address directly. Many public sites refuse to appear inside another page, so use **↗** for those.
+  - **From another device** (remote access), Agent Manager gives each site its own HTTPS port. That port relays to the site as the machine sees it, so you can check from your phone what the agent built or what the machine can reach. Absolute links, redirects and hot-reload WebSockets on the same site keep working, and the site's "don't show me in a frame" headers are dropped. A link or redirect to a different site leaves the relay.
+  - **Safety:** the relay serves only signed-in devices. It never relays to Agent Manager's own ports on any of the machine's addresses, and it removes Agent Manager's sign-in cookie before forwarding. Sites other than localhost must present a valid certificate. The relays close when remote access is turned off.
+  - If a tab stays blank on a device, open it once with **↗** and accept the certificate there.
 - **Ask Claude** (or `agentmgr ask`) creates a `general` agent. All general sessions share `~/.agentmanager/general`, so Claude's folder-trust prompt only appears the first time.
 
 ## Configuration
@@ -444,7 +624,13 @@ State lives in `~/.agentmanager/` (`state.json`, `daemon.log`, `repos/` for shar
   "reviewConventions": true,
   "handoffIdleSec": 5,
   "cloneFilter": "blob:none",
-  "shell": "/bin/zsh"
+  "shell": "/bin/zsh",
+  "inbox": true,
+  "maxCheckpoints": 40,
+  "raceTestTimeoutSec": 900,
+  "conflictRefreshSec": 60,
+  "stuck": { "repeatFailures": 3, "thrashReverts": 2, "thrashEdits": 10, "driftMinutes": 20, "driftActions": 25 },
+  "hub": { "allow": ["view"], "projects": ["*"] }
 }
 ```
 
